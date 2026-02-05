@@ -1,0 +1,518 @@
+//! Message interceptor for Codex app-server
+//!
+//! Starts app-server as a subprocess and intercepts all JSONL communication.
+
+use crate::memory::{PersistentMemory, GugugagaNotebook};
+use crate::moonissues::MoonissuesIntegration;
+use crate::protocol::{self, notifications};
+use crate::rules::ViolationDetector;
+use crate::gugugaga_agent::{EvaluationResult, GugugagaAgent};
+use crate::{Result, GugugagaConfig, GugugagaError};
+use serde_json::Value;
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, error, info, warn};
+
+/// Message interceptor that wraps Codex app-server
+pub struct Interceptor {
+    config: GugugagaConfig,
+    memory: Arc<RwLock<PersistentMemory>>,
+    gugugaga_agent: Arc<GugugagaAgent>,
+}
+
+/// Action to take after intercepting a message
+#[derive(Debug)]
+pub enum InterceptAction {
+    /// Forward the message unchanged
+    Forward,
+    /// Drop the message (don't forward)
+    Drop,
+    /// Replace with a different message
+    Replace(String),
+    /// Inject additional message(s) before forwarding
+    InjectBefore(Vec<String>),
+    /// Inject additional message(s) after forwarding
+    InjectAfter(Vec<String>),
+    /// Interrupt the agent with a correction (show to user)
+    Interrupt(String),
+    /// Send correction directly to Codex (as a new user message)
+    CorrectAgent(String),
+}
+
+impl Interceptor {
+    /// Create a new interceptor
+    pub async fn new(config: GugugagaConfig) -> Result<Self> {
+        // Initialize persistent memory
+        let memory = PersistentMemory::new(config.memory_file.clone()).await?;
+        let memory = Arc::new(RwLock::new(memory));
+
+        // Initialize notebook (separate from memory, never compacted)
+        let notebook_path = config.memory_file.with_extension("notebook.json");
+        let notebook = GugugagaNotebook::new(notebook_path).await?;
+        let notebook = Arc::new(RwLock::new(notebook));
+
+        // Initialize gugugaga agent
+        let gugugaga_agent = GugugagaAgent::new(&config.codex_home, memory.clone(), notebook).await?;
+        let gugugaga_agent = Arc::new(gugugaga_agent);
+
+        // Ensure moonissues is initialized
+        MoonissuesIntegration::ensure_initialized(&config.cwd)?;
+
+        Ok(Self {
+            config,
+            memory,
+            gugugaga_agent,
+        })
+    }
+
+    /// Start the interceptor, spawning app-server and handling messages
+    pub async fn run(
+        &self,
+        mut user_input_rx: mpsc::Receiver<String>,
+        output_tx: mpsc::Sender<String>,
+    ) -> Result<()> {
+        // Start app-server subprocess
+        let mut child = self.spawn_app_server().await?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| GugugagaError::AppServerStart("Failed to get stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| GugugagaError::AppServerStart("Failed to get stdout".to_string()))?;
+
+        let mut stdin = tokio::io::BufWriter::new(stdin);
+        let mut stdout_reader = BufReader::new(stdout).lines();
+
+        // Channel for messages to send to app-server
+        let (to_server_tx, mut to_server_rx) = mpsc::channel::<String>(32);
+        
+        // Notify TUI that gugugaga is active
+        let _ = output_tx.send(serde_json::json!({
+            "method": "gugugaga/status",
+            "params": {
+                "message": "Gugugaga active. Monitoring Codex behavior.",
+                "strictMode": self.config.strict_mode
+            }
+        }).to_string()).await;
+
+        // Spawn task to read from app-server stdout
+        let output_tx_clone = output_tx.clone();
+        let to_server_tx_clone = to_server_tx.clone();
+        let memory = self.memory.clone();
+        let gugugaga_agent = self.gugugaga_agent.clone();
+        let config = self.config.clone();
+
+        let stdout_task = tokio::spawn(async move {
+            let violation_detector = ViolationDetector::new();
+            // Accumulate agent message content for the current turn
+            let mut current_turn_content = String::new();
+            // Track current thread ID for corrections
+            let mut current_thread_id: Option<String> = None;
+            // Channel to send corrections to Codex
+            let correction_tx = to_server_tx_clone;
+
+            while let Ok(Some(line)) = stdout_reader.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                debug!("From app-server: {}", &line[..line.len().min(100)]);
+
+                // Parse and process the message
+                match serde_json::from_str::<Value>(&line) {
+                    Ok(msg) => {
+                        // Track threadId from thread/start or thread/resume response
+                        // Format: { "result": { "thread": { "id": "xxx" } } }
+                        if let Some(thread_id) = msg
+                            .get("result")
+                            .and_then(|r| r.get("thread"))
+                            .and_then(|t| t.get("id"))
+                            .and_then(|id| id.as_str())
+                        {
+                            current_thread_id = Some(thread_id.to_string());
+                            debug!("Tracking threadId: {}", thread_id);
+                        }
+                        
+                        // Accumulate agent message content
+                        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        match method {
+                            "turn/started" => {
+                                // Reset accumulator at turn start
+                                current_turn_content.clear();
+                            }
+                            "item/agentMessage/delta" => {
+                                // Accumulate agent output
+                                if let Some(delta) = msg.get("params").and_then(|p| p.get("delta")).and_then(|d| d.as_str()) {
+                                    current_turn_content.push_str(delta);
+                                }
+                            }
+                            _ => {}
+                        }
+                        
+                        let action = Self::process_server_message(
+                            &msg,
+                            &memory,
+                            &gugugaga_agent,
+                            &violation_detector,
+                            &config,
+                            &current_turn_content,
+                        )
+                        .await;
+
+                        match action {
+                            InterceptAction::Forward => {
+                                if output_tx_clone.send(line).await.is_err() {
+                                    break;
+                                }
+                            }
+                            InterceptAction::Drop => {
+                                debug!("Dropping message");
+                            }
+                            InterceptAction::Replace(new_msg) => {
+                                if output_tx_clone.send(new_msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                            InterceptAction::InjectBefore(msgs) => {
+                                for m in msgs {
+                                    if output_tx_clone.send(m).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                if output_tx_clone.send(line).await.is_err() {
+                                    break;
+                                }
+                            }
+                            InterceptAction::InjectAfter(msgs) => {
+                                // Forward original first
+                                if output_tx_clone.send(line).await.is_err() {
+                                    break;
+                                }
+                                // Then inject additional messages
+                                for m in msgs {
+                                    if output_tx_clone.send(m).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            InterceptAction::Interrupt(correction) => {
+                                // Send correction to user for display
+                                let correction_msg = serde_json::json!({
+                                    "method": "gugugaga/correction",
+                                    "params": {
+                                        "message": correction
+                                    }
+                                });
+                                let _ = output_tx_clone
+                                    .send(serde_json::to_string(&correction_msg).unwrap_or_default())
+                                    .await;
+                            }
+                            InterceptAction::CorrectAgent(correction) => {
+                                // Forward the original message first
+                                if output_tx_clone.send(line).await.is_err() {
+                                    break;
+                                }
+                                
+                                // Need threadId to send correction
+                                if let Some(thread_id) = &current_thread_id {
+                                    // Send correction directly to Codex as a user message
+                                    let correction_turn = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "turn/start",
+                                        "params": {
+                                            "threadId": thread_id,
+                                            "input": [{
+                                                "type": "text",
+                                                "text": correction,
+                                                "textElements": []
+                                            }]
+                                        },
+                                        "id": 9999
+                                    });
+                                    let _ = correction_tx.send(correction_turn.to_string()).await;
+                                    // Also notify TUI briefly
+                                    let notify = serde_json::json!({
+                                        "method": "gugugaga/correction",
+                                        "params": {
+                                            "message": format!("🛡️ Corrected: {}", correction)
+                                        }
+                                    });
+                                    let _ = output_tx_clone.send(notify.to_string()).await;
+                                } else {
+                                    // No threadId - just notify TUI
+                                    let notify = serde_json::json!({
+                                        "method": "gugugaga/correction",
+                                        "params": {
+                                            "message": format!("🛡️ Issue detected but cannot send correction（no threadId）: {}", correction)
+                                        }
+                                    });
+                                    let _ = output_tx_clone.send(notify.to_string()).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse server message: {}", e);
+                        // Forward unparseable messages as-is
+                        if output_tx_clone.send(line).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Spawn task to write to app-server stdin
+        let stdin_task = tokio::spawn(async move {
+            while let Some(msg) = to_server_rx.recv().await {
+                if stdin.write_all(msg.as_bytes()).await.is_err() {
+                    break;
+                }
+                if stdin.write_all(b"\n").await.is_err() {
+                    break;
+                }
+                if stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Main loop: receive user input and forward to app-server
+        let to_server_tx_clone = to_server_tx.clone();
+        let memory = self.memory.clone();
+
+        while let Some(input) = user_input_rx.recv().await {
+            // Process user input
+            match serde_json::from_str::<Value>(&input) {
+                Ok(msg) => {
+                    // Record user message to memory if it's a turn start
+                    if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                        if method == protocol::methods::TURN_START {
+                            if let Some(params) = msg.get("params") {
+                                if let Some(input_arr) = params.get("input").and_then(|i| i.as_array()) {
+                                    let mut mem = memory.write().await;
+                                    for item in input_arr {
+                                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                            // Record to conversation history
+                                            let _ = mem.add_turn(
+                                                crate::memory::TurnRole::User,
+                                                text.to_string()
+                                            ).await;
+                                            // Also record as instruction if applicable
+                                            let _ = mem.record_user_instruction(text).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Forward to app-server
+                    if to_server_tx_clone.send(input).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to parse user input: {}", e);
+                    // Forward anyway
+                    if to_server_tx_clone.send(input).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Cleanup
+        drop(to_server_tx);
+        let _ = stdout_task.await;
+        let _ = stdin_task.await;
+        let _ = child.kill().await;
+
+        Ok(())
+    }
+
+    /// Spawn the app-server subprocess
+    async fn spawn_app_server(&self) -> Result<Child> {
+        info!("Starting codex app-server...");
+
+        let child = Command::new("codex")
+            .args(["app-server"])
+            .current_dir(&self.config.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| GugugagaError::AppServerStart(e.to_string()))?;
+
+        info!("codex app-server started with pid {:?}", child.id());
+        Ok(child)
+    }
+
+    /// Process a message from the server
+    async fn process_server_message(
+        msg: &Value,
+        memory: &Arc<RwLock<PersistentMemory>>,
+        gugugaga_agent: &Arc<GugugagaAgent>,
+        violation_detector: &ViolationDetector,
+        config: &GugugagaConfig,
+        current_turn_content: &str,
+    ) -> InterceptAction {
+        let method = msg
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+
+        match method {
+            // Check for plan updates (violation: should use moonissues)
+            m if protocol::is_plan_update(m) => {
+                if config.strict_mode {
+                    return InterceptAction::Interrupt(
+                        "Forbidden to use builtin plan feature。Please use  moonissues for task management。".to_string(),
+                    );
+                }
+                InterceptAction::Forward
+            }
+
+            // Check agent messages for violations
+            notifications::ITEM_AGENT_MESSAGE_DELTA => {
+                if let Some(params) = msg.get("params") {
+                    if let Some(text) = protocol::extract_agent_message_text(params) {
+                        // Quick pattern check
+                        let violations = violation_detector.check(&text);
+                        if !violations.is_empty() {
+                            let violation = &violations[0];
+                            if config.strict_mode {
+                                return InterceptAction::Interrupt(violation.correction.clone());
+                            }
+                            // In non-strict mode, notify user but don't interrupt
+                            let mut mem = memory.write().await;
+                            let _ = mem
+                                .record_behavior(&format!("Violation: {}", violation.description), false)
+                                .await;
+                            
+                            // Send violation notification so TUI can display it
+                            return InterceptAction::InjectBefore(vec![
+                                serde_json::json!({
+                                    "method": "gugugaga/violation",
+                                    "params": {
+                                        "message": violation.description.clone()
+                                    }
+                                }).to_string()
+                            ]);
+                        }
+                    }
+                }
+                InterceptAction::Forward
+            }
+
+            // Monitor turn completion - perform LLM-based evaluation (NO FALLBACK)
+            "turn/completed" => {
+                // Only evaluate if there's actual content (avoid empty evaluations)
+                if current_turn_content.trim().len() < 20 {
+                    // Too short to evaluate meaningfully
+                    return InterceptAction::Forward;
+                }
+
+                // Record Codex output to conversation history
+                {
+                    let mut mem = memory.write().await;
+                    let _ = mem.add_turn(
+                        crate::memory::TurnRole::Codex,
+                        current_turn_content.to_string()
+                    ).await;
+                }
+                
+                // Perform LLM evaluation with actual turn content (silently)
+                let eval_result = gugugaga_agent.detect_violation(current_turn_content).await;
+                
+                match eval_result {
+                    Ok(result) => {
+                        if let Some(violation) = result.violation {
+                            // Record mistake to notebook
+                            {
+                                let mut mem = memory.write().await;
+                                let _ = mem.record_mistake(
+                                    &violation.description,
+                                    &violation.correction
+                                ).await;
+                            }
+                            // Found a violation - send correction directly to Codex
+                            // Use LLM's correction as-is, no template wrapper
+                            return InterceptAction::CorrectAgent(violation.correction);
+                        } else {
+                            // No violation - show what was analyzed
+                            let mut params = serde_json::json!({
+                                "status": "ok",
+                                "message": result.summary
+                            });
+                            // Include thinking if present
+                            if let Some(thinking) = result.thinking {
+                                params["thinking"] = serde_json::Value::String(thinking);
+                            }
+                            let msg = serde_json::json!({
+                                "method": "gugugaga/check",
+                                "params": params
+                            }).to_string();
+                            return InterceptAction::InjectAfter(vec![msg]);
+                        }
+                    }
+                    Err(e) => {
+                        // LLM evaluation failed
+                        error!("LLM evaluation failed: {}", e);
+                        let msg = serde_json::json!({
+                            "method": "gugugaga/check",
+                            "params": { "status": "error", "message": format!("Evaluation failed: {}", e) }
+                        }).to_string();
+                        return InterceptAction::InjectAfter(vec![msg]);
+                    }
+                }
+            }
+
+            // Smart filter for user input requests
+            notifications::REQUEST_USER_INPUT => {
+                if let Some(params) = msg.get("params") {
+                    let request_str = serde_json::to_string(params).unwrap_or_default();
+
+                    // Evaluate with gugugaga agent
+                    match gugugaga_agent.evaluate_request(&request_str).await {
+                        Ok(EvaluationResult::AutoReply(reply)) => {
+                            info!("Auto-replying to request: {}", reply);
+                            // TODO: Send auto-reply back to app-server
+                            // For now, forward to user with a hint
+                            InterceptAction::Forward
+                        }
+                        Ok(EvaluationResult::Correct(correction)) => {
+                            InterceptAction::Interrupt(correction)
+                        }
+                        Ok(EvaluationResult::ForwardToUser) => InterceptAction::Forward,
+                        Err(e) => {
+                            warn!("Evaluation failed: {}", e);
+                            InterceptAction::Forward
+                        }
+                    }
+                } else {
+                    InterceptAction::Forward
+                }
+            }
+
+            // Forward everything else
+            _ => InterceptAction::Forward,
+        }
+    }
+
+    /// Get reference to memory
+    pub fn memory(&self) -> Arc<RwLock<PersistentMemory>> {
+        self.memory.clone()
+    }
+
+    /// Get reference to gugugaga agent
+    pub fn gugugaga_agent(&self) -> Arc<GugugagaAgent> {
+        self.gugugaga_agent.clone()
+    }
+}

@@ -1,0 +1,61 @@
+[package]
+name = "gugugaga"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Gugugaga - intelligent supervisor agent for Codex CLI"
+repository = "https://github.com/user/gugugaga"
+
+[[bin]]
+name = "gugugaga"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "process"] }
+tokio-stream = "0.1"
+async-channel = "2"
+futures = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Regex for pattern matching
+regex = "1"
+
+# Glob pattern matching for file search
+glob = "0.3"
+
+# HTTP client for LLM API calls
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Home directory
+dirs = "6"
+
+# TOML parsing for config
+toml = "0.8"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+pretty_assertions = "1"
+tokio-test = "0.4"
