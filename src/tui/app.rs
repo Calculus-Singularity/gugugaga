@@ -1404,6 +1404,48 @@ Make it comprehensive but concise."#;
                                 let review = item.get("review").and_then(|r| r.as_str()).unwrap_or("changes");
                                 self.messages.push(Message::system(&format!("📋 Reviewing: {}", review)));
                             }
+                            "collabAgentToolCall" => {
+                                let tool = item.get("details")
+                                    .and_then(|d| d.get("tool"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("unknown");
+                                let sender = item.get("details")
+                                    .and_then(|d| d.get("senderThreadId"))
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("?");
+                                match tool {
+                                    "spawnAgent" => {
+                                        let prompt = item.get("details")
+                                            .and_then(|d| d.get("prompt"))
+                                            .and_then(|p| p.as_str())
+                                            .unwrap_or("");
+                                        let preview = if prompt.len() > 80 {
+                                            format!("{}...", &prompt[..80])
+                                        } else {
+                                            prompt.to_string()
+                                        };
+                                        self.messages.push(Message::system(&format!(
+                                            "🔀 Spawning sub-agent: {}", preview
+                                        )));
+                                    }
+                                    "sendInput" => {
+                                        self.messages.push(Message::system(&format!(
+                                            "📨 Sending input to agent (from {})", sender
+                                        )));
+                                    }
+                                    "wait" => {
+                                        self.messages.push(Message::system("⏳ Waiting for sub-agent..."));
+                                    }
+                                    "closeAgent" => {
+                                        self.messages.push(Message::system("🔚 Closing sub-agent"));
+                                    }
+                                    _ => {
+                                        self.messages.push(Message::system(&format!(
+                                            "🤖 Collab: {} (from {})", tool, sender
+                                        )));
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                         self.is_processing = true;
@@ -1438,6 +1480,59 @@ Make it comprehensive but concise."#;
                             }
                             "contextCompaction" => {
                                 self.messages.push(Message::system("Context compacted."));
+                            }
+                            "collabAgentToolCall" => {
+                                let tool = item.get("details")
+                                    .and_then(|d| d.get("tool"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("unknown");
+                                let status = item.get("details")
+                                    .and_then(|d| d.get("status"))
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("completed");
+                                // Show agent states if available
+                                if let Some(agents) = item.get("details")
+                                    .and_then(|d| d.get("agentsStates"))
+                                    .and_then(|a| a.as_object())
+                                {
+                                    for (agent_id, state) in agents {
+                                        let agent_status = state.get("status")
+                                            .and_then(|s| s.as_str())
+                                            .unwrap_or("unknown");
+                                        let msg = state.get("message")
+                                            .and_then(|m| m.as_str());
+                                        let icon = match agent_status {
+                                            "completed" => "✅",
+                                            "running" => "🔄",
+                                            "errored" => "❌",
+                                            "shutdown" => "⏹️",
+                                            _ => "🤖"
+                                        };
+                                        let short_id = if agent_id.len() > 8 {
+                                            &agent_id[..8]
+                                        } else {
+                                            agent_id
+                                        };
+                                        if let Some(msg) = msg {
+                                            let preview = if msg.len() > 100 {
+                                                format!("{}...", &msg[..100])
+                                            } else {
+                                                msg.to_string()
+                                            };
+                                            self.messages.push(Message::system(&format!(
+                                                "{} Agent {}.. {}: {}", icon, short_id, agent_status, preview
+                                            )));
+                                        } else {
+                                            self.messages.push(Message::system(&format!(
+                                                "{} Agent {}.. {}", icon, short_id, agent_status
+                                            )));
+                                        }
+                                    }
+                                } else {
+                                    self.messages.push(Message::system(&format!(
+                                        "🤖 Collab {} {}", tool, status
+                                    )));
+                                }
                             }
                             _ => {}
                         }

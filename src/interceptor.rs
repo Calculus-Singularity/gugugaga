@@ -9,6 +9,7 @@ use crate::rules::ViolationDetector;
 use crate::gugugaga_agent::{EvaluationResult, GugugagaAgent};
 use crate::{Result, GugugagaConfig, GugugagaError};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -110,10 +111,14 @@ impl Interceptor {
 
         let stdout_task = tokio::spawn(async move {
             let violation_detector = ViolationDetector::new();
-            // Accumulate agent message content for the current turn
-            let mut current_turn_content = String::new();
-            // Track current thread ID for corrections
+            // Accumulate agent message content per thread
+            let mut thread_turn_content: HashMap<String, String> = HashMap::new();
+            // Track current (main) thread ID for corrections
             let mut current_thread_id: Option<String> = None;
+            // Track all active threads (main + sub-agents)
+            let mut active_threads: HashMap<String, String> = HashMap::new(); // id -> source/label
+            // Legacy: single accumulator for when we don't know the thread
+            let mut current_turn_content = String::new();
             // Channel to send corrections to Codex
             let correction_tx = to_server_tx_clone;
 
@@ -136,32 +141,82 @@ impl Interceptor {
                             .and_then(|id| id.as_str())
                         {
                             current_thread_id = Some(thread_id.to_string());
+                            active_threads.insert(thread_id.to_string(), "main".to_string());
                             debug!("Tracking threadId: {}", thread_id);
                         }
+
+                        // Extract per-notification threadId (many notifications include it)
+                        let notif_thread_id = msg
+                            .get("params")
+                            .and_then(|p| p.get("threadId"))
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string());
                         
                         // Accumulate agent message content
                         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
                         match method {
                             "turn/started" => {
-                                // Reset accumulator at turn start
-                                current_turn_content.clear();
+                                // Reset accumulator at turn start (per-thread)
+                                if let Some(tid) = &notif_thread_id {
+                                    thread_turn_content.insert(tid.clone(), String::new());
+                                } else {
+                                    current_turn_content.clear();
+                                }
                             }
                             "item/agentMessage/delta" => {
-                                // Accumulate agent output
+                                // Accumulate agent output (per-thread)
                                 if let Some(delta) = msg.get("params").and_then(|p| p.get("delta")).and_then(|d| d.as_str()) {
+                                    if let Some(tid) = &notif_thread_id {
+                                        thread_turn_content.entry(tid.clone()).or_default().push_str(delta);
+                                    }
                                     current_turn_content.push_str(delta);
+                                }
+                            }
+                            // Track sub-agent spawns via item/completed with collabAgentToolCall
+                            "item/completed" => {
+                                if let Some(item) = msg.get("params").and_then(|p| p.get("item")) {
+                                    if let Some(details) = item.get("details") {
+                                        // Check for collab agent tool call
+                                        if let Some(tool) = details.get("tool").and_then(|t| t.as_str()) {
+                                            if tool == "spawnAgent" {
+                                                if let Some(ids) = details.get("receiverThreadIds").and_then(|r| r.as_array()) {
+                                                    for id in ids {
+                                                        if let Some(tid) = id.as_str() {
+                                                            active_threads.insert(tid.to_string(), "sub-agent".to_string());
+                                                            debug!("Sub-agent spawned: {}", tid);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Track thread lifecycle
+                            "thread/started" => {
+                                if let Some(tid) = &notif_thread_id {
+                                    if !active_threads.contains_key(tid.as_str()) {
+                                        active_threads.insert(tid.clone(), "thread".to_string());
+                                    }
                                 }
                             }
                             _ => {}
                         }
                         
+                        // Resolve per-thread content: prefer thread-specific, fallback to global
+                        let effective_content = notif_thread_id
+                            .as_ref()
+                            .and_then(|tid| thread_turn_content.get(tid))
+                            .map(|s| s.as_str())
+                            .unwrap_or(&current_turn_content);
+
                         let action = Self::process_server_message(
                             &msg,
                             &memory,
                             &gugugaga_agent,
                             &violation_detector,
                             &config,
-                            &current_turn_content,
+                            effective_content,
                         )
                         .await;
 
