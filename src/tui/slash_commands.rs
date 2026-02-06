@@ -462,8 +462,6 @@ impl SlashPopup {
     }
 }
 
-// Re-export for backwards compatibility
-pub use CodexCommand as SlashCommand;
 
 #[cfg(test)]
 mod tests {

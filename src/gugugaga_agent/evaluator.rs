@@ -439,6 +439,7 @@ impl Evaluator {
 /// Matches Codex's auth.json format exactly
 /// See: codex-rs/core/src/auth/storage.rs
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AuthDotJson {
     /// Auth mode indicator (optional)
     #[serde(default)]
@@ -455,6 +456,7 @@ struct AuthDotJson {
 
 /// Token data for ChatGPT OAuth authentication
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TokenData {
     /// The access token used for API calls
     access_token: String,
@@ -483,6 +485,7 @@ struct ConfigToml {
 
 /// Model provider configuration
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ModelProviderConfig {
     /// Provider name
     name: Option<String>,

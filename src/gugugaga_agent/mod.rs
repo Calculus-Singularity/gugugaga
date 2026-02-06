@@ -101,7 +101,7 @@ impl GugugagaAgent {
     /// Detect violations in agent output with tool call support
     pub async fn detect_violation(&self, agent_message: &str) -> Result<CheckResult> {
         let mut tool_results: Vec<String> = Vec::new();
-        let mut last_thinking: Option<String> = None;
+        let mut last_thinking: Option<String>;
 
         loop {
             let prompt = {

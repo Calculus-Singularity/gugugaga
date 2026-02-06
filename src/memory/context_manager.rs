@@ -3,7 +3,6 @@
 //! Manages conversation history with intelligent compaction,
 //! following Codex's context management patterns.
 
-use crate::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

@@ -26,12 +26,13 @@ use super::picker::{Picker, PickerItem};
 use super::slash_commands::{parse_command, CodexCommand, ParsedCommand, SlashPopup, GugugagaCommand};
 use super::theme::Theme;
 use super::widgets::{
-    render_message_lines, HeaderBar, HelpBar, InputBox, Message, MessageRole, StatsPanel, StatusBar,
+    render_message_lines, HeaderBar, HelpBar, InputBox, Message, MessageRole, StatusBar,
     ContextPanel,
 };
 
 /// Current picker mode
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 enum PickerMode {
     None,
     Resume,
@@ -49,6 +50,7 @@ enum PendingRequestType {
 
 /// Pending approval request from server
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct PendingApproval {
     request_id: u64,
     approval_type: ApprovalType,
@@ -1694,7 +1696,7 @@ Make it comprehensive but concise."#;
                     )));
                 }
             }
-            PendingRequestType::ThreadResume(thread_id) => {
+            PendingRequestType::ThreadResume(_thread_id) => {
                 // Handle thread/resume response
                 if let Some(result) = json.get("result") {
                     // Extract thread ID from response and update our state
@@ -1718,7 +1720,7 @@ Make it comprehensive but concise."#;
                     )));
                 }
             }
-            PendingRequestType::ThreadRead(thread_id) => {
+            PendingRequestType::ThreadRead(_thread_id) => {
                 // Handle thread/read response - display history
                 if let Some(result) = json.get("result") {
                     if let Some(thread) = result.get("thread") {
@@ -1824,7 +1826,7 @@ Make it comprehensive but concise."#;
         let scroll_offset = self.scroll_offset;
         let violations = self.violations_detected;
         let corrections = self.corrections_made;
-        let auto_replies = self.auto_replies;
+        let _auto_replies = self.auto_replies;
         let slash_popup = &self.slash_popup;
         let is_paused = self.is_paused;
         let picker = &self.picker;

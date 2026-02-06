@@ -77,14 +77,18 @@ impl AnimatedDots {
         Self::FRAMES[self.frame % Self::FRAMES.len()]
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn next(&mut self) {
         self.frame = self.frame.wrapping_add(1);
     }
 }
 
 /// Progress bar characters
+#[allow(dead_code)]
 pub struct ProgressBar;
 
+#[allow(dead_code)]
 impl ProgressBar {
     const FULL: char = '█';
     const EMPTY: char = '░';

@@ -201,6 +201,7 @@ pub struct HeaderBar<'a> {
     pub title: &'a str,
     pub project: &'a str,
     pub is_processing: bool,
+    #[allow(dead_code)]
     pub spinner_frame: usize,
 }
 
@@ -261,6 +262,7 @@ impl Widget for StatusBar {
 }
 
 /// Stats panel showing gugugaga metrics
+#[allow(dead_code)]
 pub struct StatsPanel {
     pub violations: usize,
     pub corrections: usize,
@@ -337,6 +339,7 @@ pub struct ContextPanel {
     pub mistakes_count: usize,
     /// Stats
     pub violations: usize,
+    #[allow(dead_code)]
     pub corrections: usize,
     /// Monitoring status
     pub is_monitoring: bool,
@@ -478,6 +481,7 @@ impl Widget for ContextPanel {
 /// Input box widget
 pub struct InputBox<'a> {
     pub content: &'a str,
+    #[allow(dead_code)]
     pub cursor: usize,
     pub focused: bool,
 }

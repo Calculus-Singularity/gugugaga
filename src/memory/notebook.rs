@@ -12,7 +12,7 @@
 use crate::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -334,7 +334,7 @@ impl GugugagaNotebook {
     }
 
     /// Load from file
-    async fn load(mut self) -> Result<Self> {
+    async fn load(self) -> Result<Self> {
         let path = self.file_path.clone();
         if let Some(file_path) = &path {
             let content = fs::read_to_string(file_path).await?;

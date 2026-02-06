@@ -5,7 +5,7 @@
 
 use crate::gugugaga_agent::Evaluator;
 use crate::Result;
-use super::context_manager::{ContextManager, ConversationItem};
+use super::context_manager::ContextManager;
 use tracing::{info, warn};
 
 /// Prompt sent to LLM to generate a handoff summary
@@ -123,11 +123,13 @@ impl Compactor {
 }
 
 /// Check if a message is a summary message
+#[allow(dead_code)]
 pub fn is_summary_message(content: &str) -> bool {
     content.starts_with(SUMMARY_PREFIX) || content.starts_with("=== CONTEXT CHECKPOINT ===")
 }
 
 /// Extract the actual summary content from a summary message
+#[allow(dead_code)]
 pub fn extract_summary_content(content: &str) -> &str {
     if let Some(pos) = content.find("\n\n") {
         // Skip the prefix

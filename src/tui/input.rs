@@ -16,6 +16,7 @@ pub enum InputAction {
     /// Scroll down in messages
     ScrollDown,
     /// Switch focus between panels
+    #[allow(dead_code)]
     SwitchFocus,
     /// Character input
     Input(char),
@@ -34,6 +35,7 @@ pub enum InputAction {
     /// Move cursor to end
     CursorEnd,
     /// Paste from clipboard
+    #[allow(dead_code)]
     Paste,
     /// Previous history item
     HistoryPrev,
@@ -60,6 +62,7 @@ pub struct InputState {
     /// Current history index (-1 means current input)
     pub history_index: isize,
     /// Saved current input when browsing history
+    #[allow(dead_code)]
     pub saved_input: String,
 }
 
@@ -219,11 +222,13 @@ impl InputState {
     }
 
     /// Check if buffer starts with a slash (potential command)
+    #[allow(dead_code)]
     pub fn is_slash_command(&self) -> bool {
         self.buffer.starts_with('/')
     }
 
     /// Get the current slash command prefix (text after / for filtering)
+    #[allow(dead_code)]
     pub fn slash_prefix(&self) -> Option<&str> {
         if self.buffer.starts_with('/') {
             // Get text after / up to first space or end
@@ -263,6 +268,7 @@ impl InputState {
         }
     }
 
+    #[allow(dead_code)]
     fn history_prev(&mut self) {
         if self.history.is_empty() {
             return;
@@ -280,6 +286,7 @@ impl InputState {
         }
     }
 
+    #[allow(dead_code)]
     fn history_next(&mut self) {
         if self.history_index > 0 {
             self.history_index -= 1;
