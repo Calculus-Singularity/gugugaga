@@ -11,9 +11,6 @@ pub enum ViolationType {
     /// Agent ignored explicit user instructions
     IgnoredInstruction,
 
-    /// Agent used built-in todo/plan instead of moonissues
-    UsedBuiltinTodo,
-
     /// Agent made changes not requested by user
     UnauthorizedChange,
 }
@@ -23,7 +20,6 @@ impl std::fmt::Display for ViolationType {
         match self {
             ViolationType::Fallback => write!(f, "FALLBACK"),
             ViolationType::IgnoredInstruction => write!(f, "IGNORED_INSTRUCTION"),
-            ViolationType::UsedBuiltinTodo => write!(f, "USED_BUILTIN_TODO"),
             ViolationType::UnauthorizedChange => write!(f, "UNAUTHORIZED_CHANGE"),
         }
     }
@@ -45,8 +41,6 @@ pub struct ViolationDetector {
     /// Patterns that indicate fallback behavior
     fallback_patterns: Vec<Regex>,
 
-    /// Patterns that indicate built-in todo usage
-    builtin_todo_patterns: Vec<Regex>,
 }
 
 impl ViolationDetector {
@@ -54,7 +48,6 @@ impl ViolationDetector {
         Self {
             user_instructions: Vec::new(),
             fallback_patterns: Self::compile_fallback_patterns(),
-            builtin_todo_patterns: Self::compile_builtin_todo_patterns(),
         }
     }
 
@@ -83,14 +76,6 @@ impl ViolationDetector {
         ]
     }
 
-    fn compile_builtin_todo_patterns() -> Vec<Regex> {
-        vec![
-            // Detect update_plan tool usage
-            Regex::new(r"(?i)update_plan").unwrap(),
-            Regex::new(r#"(?i)"?tool"?\s*:\s*"?update_plan"?"#).unwrap(),
-        ]
-    }
-
     /// Check agent output for violations
     pub fn check(&self, agent_output: &str) -> Vec<Violation> {
         let mut violations = Vec::new();
@@ -104,20 +89,6 @@ impl ViolationDetector {
                     correction: String::new(), // LLM will provide
                 });
                 break;
-            }
-        }
-
-        // Check for built-in todo usage (but not if moonissues is mentioned)
-        if !agent_output.contains("moonissues") {
-            for pattern in &self.builtin_todo_patterns {
-                if pattern.is_match(agent_output) {
-                    violations.push(Violation {
-                        violation_type: ViolationType::UsedBuiltinTodo,
-                        description: "Used update_plan".to_string(),
-                        correction: String::new(),
-                    });
-                    break;
-                }
             }
         }
 
@@ -159,13 +130,6 @@ impl ViolationDetector {
         false
     }
 
-    /// Quick check for builtin todo usage
-    pub fn detect_builtin_plan_usage(agent_message: &str) -> bool {
-        let has_update_plan = agent_message.contains("update_plan");
-        let has_moonissues = agent_message.contains("moonissues");
-
-        has_update_plan && !has_moonissues
-    }
 }
 
 impl Default for ViolationDetector {
@@ -199,23 +163,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_builtin_todo_detection() {
-        let detector = ViolationDetector::new();
-
-        // Should detect
-        let violations = detector.check(r#"{"tool": "update_plan"}"#);
-        assert!(violations.iter().any(|v| v.violation_type == ViolationType::UsedBuiltinTodo));
-
-        // Should not detect when moonissues is mentioned
-        let violations = detector.check("I'll use moonissues instead of update_plan");
-        assert!(!violations.iter().any(|v| v.violation_type == ViolationType::UsedBuiltinTodo));
-    }
-
-    #[test]
-    fn test_detect_builtin_plan_usage() {
-        assert!(ViolationDetector::detect_builtin_plan_usage("update_plan"));
-        assert!(!ViolationDetector::detect_builtin_plan_usage("moonissues create task"));
-        assert!(!ViolationDetector::detect_builtin_plan_usage("use moonissues not update_plan"));
-    }
 }

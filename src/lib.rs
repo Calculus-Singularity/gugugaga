@@ -3,12 +3,10 @@
 //! An independent agent that wraps Codex app-server to:
 //! - Monitor and correct Codex behavior
 //! - Maintain persistent memory across context compaction
-//! - Enforce moonissues usage instead of built-in todo/plan
 //! - Intelligently filter user interaction requests
 
 pub mod interceptor;
 pub mod memory;
-pub mod moonissues;
 pub mod protocol;
 pub mod rules;
 pub mod gugugaga_agent;
@@ -16,7 +14,6 @@ pub mod tui;
 
 pub use interceptor::Interceptor;
 pub use memory::PersistentMemory;
-pub use moonissues::{Issue, MoonissuesIntegration};
 pub use rules::{Violation, ViolationDetector, ViolationType};
 pub use gugugaga_agent::{EvaluationResult, GugugagaAgent, UserInputAnalysis};
 
@@ -86,9 +83,6 @@ pub enum GugugagaError {
 
     #[error("LLM evaluation error: {0}")]
     LlmEvaluation(String),
-
-    #[error("Moonissues error: {0}")]
-    Moonissues(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

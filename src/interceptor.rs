@@ -3,7 +3,6 @@
 //! Starts app-server as a subprocess and intercepts all JSONL communication.
 
 use crate::memory::{PersistentMemory, GugugagaNotebook};
-use crate::moonissues::MoonissuesIntegration;
 use crate::protocol::{self, notifications};
 use crate::rules::ViolationDetector;
 use crate::gugugaga_agent::{EvaluationResult, GugugagaAgent};
@@ -58,9 +57,6 @@ impl Interceptor {
         // Initialize gugugaga agent
         let gugugaga_agent = GugugagaAgent::new(&config.codex_home, memory.clone(), notebook).await?;
         let gugugaga_agent = Arc::new(gugugaga_agent);
-
-        // Ensure moonissues is initialized
-        MoonissuesIntegration::ensure_initialized(&config.cwd)?;
 
         Ok(Self {
             config,
@@ -424,13 +420,8 @@ impl Interceptor {
             .unwrap_or("");
 
         match method {
-            // Check for plan updates (violation: should use moonissues)
+            // Check for plan updates
             m if protocol::is_plan_update(m) => {
-                if config.strict_mode {
-                    return InterceptAction::Interrupt(
-                        "Forbidden to use builtin plan feature。Please use  moonissues for task management。".to_string(),
-                    );
-                }
                 InterceptAction::Forward
             }
 

@@ -53,7 +53,6 @@ impl Responder {
                 "FALLBACK" => ViolationType::Fallback,
                 "IGNORED_INSTRUCTION" => ViolationType::IgnoredInstruction,
                 "UNAUTHORIZED_CHANGE" => ViolationType::UnauthorizedChange,
-                "USED_BUILTIN_TODO" => ViolationType::UsedBuiltinTodo,
                 _ => ViolationType::Fallback,
             };
 

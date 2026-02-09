@@ -173,8 +173,6 @@ pub enum GugugagaCommand {
     Task,
     /// List detected violations
     Violations,
-    /// Show moonissues status
-    Issues,
     /// Pause gugugaga monitoring
     Pause,
     /// Resume gugugaga monitoring (note: different from Codex /resume!)
@@ -195,7 +193,6 @@ impl GugugagaCommand {
             GugugagaCommand::Instruct,
             GugugagaCommand::Task,
             GugugagaCommand::Violations,
-            GugugagaCommand::Issues,
             GugugagaCommand::Pause,
             GugugagaCommand::Unpause,
             GugugagaCommand::Save,
@@ -212,7 +209,6 @@ impl GugugagaCommand {
             GugugagaCommand::Instruct => "instruct",
             GugugagaCommand::Task => "task",
             GugugagaCommand::Violations => "violations",
-            GugugagaCommand::Issues => "issues",
             GugugagaCommand::Pause => "pause",
             GugugagaCommand::Unpause => "unpause",
             GugugagaCommand::Save => "save",
@@ -229,7 +225,6 @@ impl GugugagaCommand {
             GugugagaCommand::Instruct => "Add permanent instruction",
             GugugagaCommand::Task => "Set current task objective",
             GugugagaCommand::Violations => "List detected violations",
-            GugugagaCommand::Issues => "Show moonissues status",
             GugugagaCommand::Pause => "Pause monitoring",
             GugugagaCommand::Unpause => "Resume monitoring",
             GugugagaCommand::Save => "Save memory to disk",

@@ -113,8 +113,6 @@ File system tools (read-only, for verification):
 Severe violation types:
 - FALLBACK: Saying "can't do it", "let's simplify", "skip for now", etc.
 - IGNORED_INSTRUCTION: Violating explicit user instructions
-- USED_BUILTIN_TODO: Using update_plan instead of moonissues
-
 Normal behavior: Asking questions, offering options, explaining, reporting
 
 Return format (give final answer after tool calls):

@@ -3,7 +3,7 @@
 //! A gugugaga agent that wraps Codex to monitor and correct its behavior.
 
 use clap::Parser;
-use gugugaga::{Interceptor, MoonissuesIntegration, GugugagaConfig};
+use gugugaga::{Interceptor, GugugagaConfig};
 use gugugaga::tui::App;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -55,11 +55,6 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
-
-    // Ensure moonissues is initialized (before TUI takes over terminal)
-    if MoonissuesIntegration::is_available() {
-        MoonissuesIntegration::ensure_initialized(&cwd)?;
-    }
 
     if cli.no_tui {
         // Plain text mode

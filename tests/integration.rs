@@ -1,7 +1,6 @@
 //! Integration tests for the Codex Supervisor
 
 use gugugaga::memory::PersistentMemory;
-use gugugaga::moonissues::MoonissuesIntegration;
 use gugugaga::rules::{ViolationDetector, ViolationType};
 use gugugaga::gugugaga_agent::Responder;
 use gugugaga::GugugagaConfig;
@@ -114,7 +113,7 @@ fn test_no_false_positives() {
         "I've implemented the authentication module with JWT support.",
         "The tests are now passing.",
         "I've added error handling for all edge cases.",
-        "Using moonissues to track tasks.",
+        "Using issue tracker to manage tasks.",
     ];
 
     for msg in normal_messages {
@@ -125,23 +124,6 @@ fn test_no_false_positives() {
             msg
         );
     }
-}
-
-/// Test builtin plan detection
-#[test]
-fn test_detect_builtin_plan_usage() {
-    assert!(ViolationDetector::detect_builtin_plan_usage(
-        r#"{"tool": "update_plan"}"#
-    ));
-    assert!(ViolationDetector::detect_builtin_plan_usage("update_plan"));
-
-    // Should not detect when moonissues is mentioned
-    assert!(!ViolationDetector::detect_builtin_plan_usage(
-        "use moonissues not update_plan"
-    ));
-    assert!(!ViolationDetector::detect_builtin_plan_usage(
-        "moonissues create task"
-    ));
 }
 
 /// Test responder parsing
@@ -194,42 +176,6 @@ fn test_supervisor_config() {
     assert!(config.strict_mode);
     assert!(config.verbose);
     assert!(config.memory_file.to_string_lossy().contains("gugugaga"));
-}
-
-/// Test moonissues issue formatting
-#[test]
-fn test_moonissues_format_issues() {
-    use gugugaga::Issue;
-
-    let issues = vec![
-        Issue {
-            id: "1".to_string(),
-            title: "Implement login".to_string(),
-            status: "open".to_string(),
-            priority: Some(1),
-            notes: None,
-        },
-        Issue {
-            id: "2".to_string(),
-            title: "Add tests".to_string(),
-            status: "in_progress".to_string(),
-            priority: Some(2),
-            notes: Some("Need unit tests".to_string()),
-        },
-    ];
-
-    let output = MoonissuesIntegration::format_issues_for_context(&issues);
-    assert!(output.contains("[1] Implement login"));
-    assert!(output.contains("[2] Add tests"));
-    assert!(output.contains("in_progress"));
-    assert!(output.contains("Need unit tests"));
-}
-
-/// Test empty issues formatting
-#[test]
-fn test_moonissues_empty_issues() {
-    let output = MoonissuesIntegration::format_issues_for_context(&[]);
-    assert!(output.contains("No active issues"));
 }
 
 /// Test behavior logging

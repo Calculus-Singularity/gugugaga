@@ -1085,11 +1085,6 @@ Make it comprehensive but concise."#;
                     self.violations_detected
                 )));
             }
-            GugugagaCommand::Issues => {
-                self.messages
-                    .push(Message::system("Checking moonissues status..."));
-                // TODO: Run moonissues list
-            }
             GugugagaCommand::Pause => {
                 self.is_paused = true;
                 self.messages
