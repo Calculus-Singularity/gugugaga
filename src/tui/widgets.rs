@@ -7,71 +7,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
-use regex::Regex;
 use unicode_width::UnicodeWidthStr;
 
 use super::shimmer::shimmer_spans;
 use super::theme::Theme;
-
-/// Parse simple Markdown formatting and return styled spans
-/// Supports: **bold**, *italic*, `code`, ***bold italic***
-fn parse_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut remaining = text.to_string();
-    
-    // Regex patterns for markdown
-    let bold_italic = Regex::new(r"\*\*\*(.+?)\*\*\*").unwrap();
-    let bold = Regex::new(r"\*\*(.+?)\*\*").unwrap();
-    let italic = Regex::new(r"\*([^*]+?)\*").unwrap();
-    let code = Regex::new(r"`([^`]+?)`").unwrap();
-    
-    // Process patterns in order of priority
-    let patterns: Vec<(&Regex, Style)> = vec![
-        (&bold_italic, base_style.add_modifier(Modifier::BOLD | Modifier::ITALIC)),
-        (&bold, base_style.add_modifier(Modifier::BOLD)),
-        (&code, Style::default().fg(Color::Yellow)),
-        (&italic, base_style.add_modifier(Modifier::ITALIC)),
-    ];
-    
-    // Simple approach: find first match, split, recurse
-    fn find_first_match<'a>(text: &str, patterns: &[(&'a Regex, Style)]) -> Option<(usize, usize, String, Style)> {
-        let mut best: Option<(usize, usize, String, Style)> = None;
-        for (regex, style) in patterns {
-            if let Some(m) = regex.find(text) {
-                if best.is_none() || m.start() < best.as_ref().unwrap().0 {
-                    if let Some(caps) = regex.captures(text) {
-                        let inner = caps.get(1).map(|c| c.as_str().to_string()).unwrap_or_default();
-                        best = Some((m.start(), m.end(), inner, *style));
-                    }
-                }
-            }
-        }
-        best
-    }
-    
-    while !remaining.is_empty() {
-        if let Some((start, end, inner, style)) = find_first_match(&remaining, &patterns) {
-            // Add text before match
-            if start > 0 {
-                spans.push(Span::styled(remaining[..start].to_string(), base_style));
-            }
-            // Add styled match
-            spans.push(Span::styled(inner, style));
-            // Continue with rest
-            remaining = remaining[end..].to_string();
-        } else {
-            // No more matches
-            spans.push(Span::styled(remaining.clone(), base_style));
-            break;
-        }
-    }
-    
-    if spans.is_empty() {
-        spans.push(Span::styled(text.to_string(), base_style));
-    }
-    
-    spans
-}
 
 /// Truncate a string to fit within `max_display_width` display columns,
 /// appending "..." if truncated. Safe for multi-byte UTF-8 and wide chars.
@@ -536,6 +475,37 @@ impl Widget for HelpBar {
     }
 }
 
+/// Sanitize text for terminal display:
+/// - Expand tabs to spaces (4-space tab stops)
+/// - Remove carriage returns
+/// - Replace other control chars with space
+fn sanitize_for_display(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut col = 0usize;
+    for c in text.chars() {
+        match c {
+            '\t' => {
+                // Expand to next 4-column tab stop
+                let spaces = 4 - (col % 4);
+                for _ in 0..spaces {
+                    out.push(' ');
+                }
+                col += spaces;
+            }
+            '\r' => {} // skip
+            c if c.is_control() => {
+                out.push(' ');
+                col += 1;
+            }
+            c => {
+                out.push(c);
+                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            }
+        }
+    }
+    out
+}
+
 /// Render a single message to lines for display
 /// max_width: the usable inner width of the chat area in display columns
 pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static>> {
@@ -546,6 +516,9 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
     let indent_w: usize = indent.width();
     // Width available for actual text content after indent
     let text_avail = max_width.saturating_sub(indent_w);
+
+    // Sanitize content: expand tabs, remove control chars
+    let content = sanitize_for_display(&msg.content);
 
     // Role badge (use ASCII-safe badges to avoid emoji width issues)
     let (badge_text, badge_style) = match msg.role {
@@ -587,26 +560,76 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
         result
     }
 
-    /// Helper: add wrapped + optionally markdown-parsed content lines
-    fn add_content(
+    /// Helper: add plain text content with wrapping (no markdown)
+    fn add_plain(
         lines: &mut Vec<Line<'static>>,
         content: &str,
         style: Style,
         avail: usize,
         indent: &str,
-        use_markdown: bool,
     ) {
         for raw_line in content.lines() {
             for wrapped in wrap_content(raw_line, avail) {
-                if use_markdown {
-                    let mut spans = vec![Span::raw(indent.to_string())];
-                    spans.extend(parse_markdown(&wrapped, style));
-                    lines.push(Line::from(spans));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw(indent.to_string()),
-                        Span::styled(wrapped, style),
-                    ]));
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(wrapped, style),
+                ]));
+            }
+        }
+    }
+
+    /// Helper: render markdown content using tui_markdown, then add indent
+    fn add_markdown(
+        lines: &mut Vec<Line<'static>>,
+        content: &str,
+        avail: usize,
+        indent: &str,
+    ) {
+        // tui_markdown::from_str returns ratatui::text::Text with full markdown rendering
+        let text = tui_markdown::from_str(content);
+        for line in text.lines {
+            // Wrap: compute total display width of the line's spans
+            let total_w: usize = line.spans.iter().map(|s| s.content.as_ref().width()).sum();
+            if total_w <= avail {
+                // Fits in one line — just prepend indent
+                let mut spans = vec![Span::raw(indent.to_string())];
+                spans.extend(line.spans.into_iter().map(|s| Span::styled(s.content.into_owned(), s.style)));
+                lines.push(Line::from(spans));
+            } else {
+                // Need to wrap: flatten spans into chars with styles, then re-wrap
+                let mut chars_with_style: Vec<(char, Style)> = Vec::new();
+                for span in &line.spans {
+                    for c in span.content.chars() {
+                        chars_with_style.push((c, span.style));
+                    }
+                }
+
+                let mut current_spans: Vec<Span<'static>> = vec![Span::raw(indent.to_string())];
+                let mut w = 0usize;
+
+                for (c, sty) in chars_with_style {
+                    let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+                    if w + cw > avail && w > 0 {
+                        lines.push(Line::from(current_spans));
+                        current_spans = vec![Span::raw(indent.to_string())];
+                        w = 0;
+                    }
+                    // Try to merge with last span if same style
+                    if let Some(last) = current_spans.last_mut() {
+                        if last.style == sty {
+                            let mut s = last.content.to_string();
+                            s.push(c);
+                            *last = Span::styled(s, sty);
+                        } else {
+                            current_spans.push(Span::styled(c.to_string(), sty));
+                        }
+                    } else {
+                        current_spans.push(Span::styled(c.to_string(), sty));
+                    }
+                    w += cw;
+                }
+                if current_spans.len() > 1 || (current_spans.len() == 1 && current_spans[0].content != indent) {
+                    lines.push(Line::from(current_spans));
                 }
             }
         }
@@ -615,7 +638,7 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
     if msg.role == MessageRole::System {
         // System messages — dim italic, no badge header
         let style = Theme::dim().add_modifier(Modifier::ITALIC);
-        add_content(&mut lines, &msg.content, style, text_avail, indent, false);
+        add_plain(&mut lines, &content, style, text_avail, indent);
     } else {
         // Badge header line
         lines.push(Line::from(vec![
@@ -626,16 +649,15 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
         // Content
         match msg.role {
             MessageRole::Thinking => {
-                let style = Theme::thinking();
-                add_content(&mut lines, &msg.content, style, text_avail, indent, true);
+                add_markdown(&mut lines, &content, text_avail, indent);
             }
             MessageRole::CommandExec => {
                 let style = Style::default().fg(Color::DarkGray);
-                add_content(&mut lines, &msg.content, style, text_avail, indent, false);
+                add_plain(&mut lines, &content, style, text_avail, indent);
             }
             MessageRole::FileChange => {
                 // Diff lines — wrap them too so they don't break the border
-                for raw_line in msg.content.lines() {
+                for raw_line in content.lines() {
                     let style = if raw_line.starts_with('+') {
                         Style::default().fg(Color::Green)
                     } else if raw_line.starts_with('-') {
@@ -654,14 +676,16 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                 }
             }
             MessageRole::Correction => {
-                let style = Theme::warning();
-                add_content(&mut lines, &msg.content, style, text_avail, indent, true);
+                add_markdown(&mut lines, &content, text_avail, indent);
             }
             _ => {
-                // User, Codex, Gugugaga
-                let style = Theme::text();
-                let use_md = matches!(msg.role, MessageRole::Codex | MessageRole::Gugugaga);
-                add_content(&mut lines, &msg.content, style, text_avail, indent, use_md);
+                // User, Codex, Gugugaga — use markdown for agent messages
+                if matches!(msg.role, MessageRole::Codex | MessageRole::Gugugaga) {
+                    add_markdown(&mut lines, &content, text_avail, indent);
+                } else {
+                    let style = Theme::text();
+                    add_plain(&mut lines, &content, style, text_avail, indent);
+                }
             }
         }
     }

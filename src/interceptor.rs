@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 pub struct Interceptor {
     config: GugugagaConfig,
     memory: Arc<RwLock<PersistentMemory>>,
+    notebook: Arc<RwLock<GugugagaNotebook>>,
     gugugaga_agent: Arc<GugugagaAgent>,
 }
 
@@ -43,6 +44,11 @@ pub enum InterceptAction {
 }
 
 impl Interceptor {
+    /// Get a reference to the notebook for sharing with other components (e.g. TUI)
+    pub fn notebook(&self) -> Arc<RwLock<GugugagaNotebook>> {
+        self.notebook.clone()
+    }
+
     /// Create a new interceptor
     pub async fn new(config: GugugagaConfig) -> Result<Self> {
         // Initialize persistent memory
@@ -55,12 +61,13 @@ impl Interceptor {
         let notebook = Arc::new(RwLock::new(notebook));
 
         // Initialize gugugaga agent
-        let gugugaga_agent = GugugagaAgent::new(&config.codex_home, memory.clone(), notebook).await?;
+        let gugugaga_agent = GugugagaAgent::new(&config.codex_home, memory.clone(), notebook.clone()).await?;
         let gugugaga_agent = Arc::new(gugugaga_agent);
 
         Ok(Self {
             config,
             memory,
+            notebook,
             gugugaga_agent,
         })
     }

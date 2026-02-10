@@ -94,6 +94,10 @@ async fn run_tui_mode(
     // Create interceptor
     let interceptor = Interceptor::new(config).await?;
 
+    // Share notebook with TUI so the right-side panel updates live
+    let notebook = interceptor.notebook();
+    app.set_notebook(notebook);
+
     // Run interceptor in background
     let interceptor_handle = tokio::spawn(async move {
         let _ = interceptor.run(user_input_rx, output_tx).await;

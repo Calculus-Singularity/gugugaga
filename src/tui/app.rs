@@ -75,7 +75,11 @@ struct PendingApproval {
     approval_type: ApprovalType,
     command: Option<String>,
     cwd: Option<String>,
+    reason: Option<String>,
     changes: Vec<String>,
+    /// For command exec: proposed execpolicy amendment prefix (e.g. ["echo"])
+    /// When present, the user can choose "don't ask again for similar commands"
+    proposed_execpolicy_amendment: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,8 +122,16 @@ pub struct App {
     request_counter: u64,
     /// Current thread ID (from thread/start response)
     thread_id: Option<String>,
+    /// Current turn ID (from turn/started notification, needed for interrupt)
+    current_turn_id: Option<String>,
+    /// Ctrl+C double-press quit: armed when first Ctrl+C is pressed
+    quit_armed: bool,
+    /// Timestamp of first Ctrl+C press for double-press timeout
+    quit_armed_at: Option<std::time::Instant>,
     /// Pending approval request (waiting for user response)
     pending_approval: Option<PendingApproval>,
+    /// Scroll offset for approval overlay content
+    approval_scroll: usize,
     /// Gugugaga notebook reference (for TUI display)
     notebook: Option<Arc<RwLock<GugugagaNotebook>>>,
     /// Cached notebook data for rendering (updated periodically)
@@ -167,7 +179,11 @@ impl App {
             pending_request_type: PendingRequestType::None,
             request_counter: 100, // Start after other request IDs
             thread_id: None,
+            current_turn_id: None,
+            quit_armed: false,
+            quit_armed_at: None,
             pending_approval: None,
+            approval_scroll: 0,
             notebook: None,
             notebook_current_activity: None,
             notebook_completed_count: 0,
@@ -251,19 +267,72 @@ impl App {
     }
     
     async fn handle_input(&mut self, key: event::KeyEvent) {
-        // Handle approval dialog first (highest priority)
+        // Handle approval dialog first (highest priority — modal overlay)
         if let Some(approval) = self.pending_approval.take() {
             match key.code {
+                // y / Enter — Accept (approve this time)
                 crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') |
                 crossterm::event::KeyCode::Enter => {
-                    self.respond_to_approval(approval.request_id, &approval.approval_type, true).await;
-                    self.messages.push(Message::system("✓ Approved"));
+                    let cmd_display = approval.command.as_deref().unwrap_or("command");
+                    self.messages.push(Message::system(&format!("✓ Approved: {}", cmd_display)));
+                    self.respond_to_approval_decision(&approval, "accept").await;
                     return;
                 }
+                // p — Accept and don't ask again for similar commands (exec only, needs amendment)
+                crossterm::event::KeyCode::Char('p') | crossterm::event::KeyCode::Char('P')
+                    if matches!(approval.approval_type, ApprovalType::CommandExecution)
+                        && approval.proposed_execpolicy_amendment.is_some() =>
+                {
+                    let amendment = approval.proposed_execpolicy_amendment.clone().unwrap();
+                    let prefix = amendment.join(" ");
+                    self.messages.push(Message::system(&format!(
+                        "✓ Approved (won't ask again for `{}`)", prefix
+                    )));
+                    self.respond_to_approval_with_amendment(&approval, &amendment).await;
+                    return;
+                }
+                // a — Accept for session (file changes: don't ask again for these files)
+                crossterm::event::KeyCode::Char('a') | crossterm::event::KeyCode::Char('A')
+                    if matches!(approval.approval_type, ApprovalType::FileChange) =>
+                {
+                    self.messages.push(Message::system("✓ Approved (for session)"));
+                    self.respond_to_approval_decision(&approval, "acceptForSession").await;
+                    return;
+                }
+                // n / Esc — Cancel (reject + interrupt turn)
                 crossterm::event::KeyCode::Char('n') | crossterm::event::KeyCode::Char('N') |
                 crossterm::event::KeyCode::Esc => {
-                    self.respond_to_approval(approval.request_id, &approval.approval_type, false).await;
-                    self.messages.push(Message::system("✗ Declined"));
+                    self.messages.push(Message::system("✗ Cancelled"));
+                    self.respond_to_approval_decision(&approval, "cancel").await;
+                    return;
+                }
+                // Ctrl+C during approval — also cancel (same as Codex)
+                crossterm::event::KeyCode::Char('c')
+                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    self.messages.push(Message::system("✗ Cancelled"));
+                    self.respond_to_approval_decision(&approval, "cancel").await;
+                    return;
+                }
+                // Up/Down/PageUp/PageDown — scroll approval content
+                crossterm::event::KeyCode::Up => {
+                    self.approval_scroll = self.approval_scroll.saturating_sub(1);
+                    self.pending_approval = Some(approval);
+                    return;
+                }
+                crossterm::event::KeyCode::Down => {
+                    self.approval_scroll = self.approval_scroll.saturating_add(1);
+                    self.pending_approval = Some(approval);
+                    return;
+                }
+                crossterm::event::KeyCode::PageUp => {
+                    self.approval_scroll = self.approval_scroll.saturating_sub(5);
+                    self.pending_approval = Some(approval);
+                    return;
+                }
+                crossterm::event::KeyCode::PageDown => {
+                    self.approval_scroll = self.approval_scroll.saturating_add(5);
+                    self.pending_approval = Some(approval);
                     return;
                 }
                 _ => {
@@ -325,9 +394,34 @@ impl App {
             }
         }
 
+        // Reset quit_armed if timeout exceeded (2 seconds)
+        if self.quit_armed {
+            if let Some(armed_at) = self.quit_armed_at {
+                if armed_at.elapsed() > std::time::Duration::from_secs(2) {
+                    self.quit_armed = false;
+                    self.quit_armed_at = None;
+                }
+            }
+        }
+
         match self.input.handle_key(key) {
             InputAction::Quit => {
-                self.should_quit = true;
+                // Ctrl+C: double-press mechanism
+                if self.is_processing && self.current_turn_id.is_some() {
+                    // Interrupt the running turn
+                    self.send_turn_interrupt().await;
+                } else if self.quit_armed {
+                    // Second press within timeout — actually quit
+                    self.should_quit = true;
+                } else {
+                    // First press — arm the quit
+                    self.quit_armed = true;
+                    self.quit_armed_at = Some(std::time::Instant::now());
+                    self.messages.push(Message::system(
+                        "Press Ctrl+C again to quit."
+                    ));
+                    self.scroll_to_bottom();
+                }
             }
             InputAction::Submit(text) => {
                 self.slash_popup.close();
@@ -385,7 +479,13 @@ impl App {
                 self.handle_tab_completion();
             }
             InputAction::Escape => {
-                self.slash_popup.close();
+                // Priority: slash_popup > running turn > nothing
+                if self.slash_popup.visible {
+                    self.slash_popup.close();
+                } else if self.is_processing && self.current_turn_id.is_some() {
+                    self.send_turn_interrupt().await;
+                }
+                // Otherwise ignore
             }
             InputAction::Input('/') => {
                 // Check for // (gugugaga) or / (codex)
@@ -1180,38 +1280,34 @@ Make it comprehensive but concise."#;
         }
     }
     
-    async fn respond_to_approval(&mut self, request_id: u64, approval_type: &ApprovalType, accept: bool) {
+    /// Send a simple approval decision (accept / acceptForSession / cancel)
+    async fn respond_to_approval_decision(&mut self, approval: &PendingApproval, decision: &str) {
         if let Some(tx) = &self.input_tx {
-            let decision = if accept { "accept" } else { "decline" };
-            
-            let response = match approval_type {
-                ApprovalType::CommandExecution => {
-                    if accept {
-                        serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "result": {
-                                "decision": decision,
-                                "acceptSettings": { "forSession": false }
-                            }
-                        })
-                    } else {
-                        serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "result": { "decision": decision }
-                        })
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": approval.request_id,
+                "result": {
+                    "decision": decision
+                }
+            });
+            let _ = tx.send(response.to_string()).await;
+        }
+    }
+
+    /// Send acceptWithExecpolicyAmendment decision (command exec only)
+    async fn respond_to_approval_with_amendment(&mut self, approval: &PendingApproval, amendment: &[String]) {
+        if let Some(tx) = &self.input_tx {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": approval.request_id,
+                "result": {
+                    "decision": {
+                        "acceptWithExecpolicyAmendment": {
+                            "execpolicy_amendment": amendment
+                        }
                     }
                 }
-                ApprovalType::FileChange => {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": { "decision": decision }
-                    })
-                }
-            };
-            
+            });
             let _ = tx.send(response.to_string()).await;
         }
     }
@@ -1333,43 +1429,44 @@ Make it comprehensive but concise."#;
                         let params = json.get("params").cloned().unwrap_or_default();
                         let command = params.get("command").and_then(|c| c.as_str()).map(String::from);
                         let cwd = params.get("cwd").and_then(|c| c.as_str()).map(String::from);
+                        let reason = params.get("reason").and_then(|r| r.as_str()).map(String::from);
+                        // Extract proposed execpolicy amendment (array of command prefix strings)
+                        let proposed_amendment = params.get("proposedExecpolicyAmendment")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect::<Vec<_>>());
                         
                         self.pending_approval = Some(PendingApproval {
                             request_id: id,
                             approval_type: ApprovalType::CommandExecution,
                             command: command.clone(),
                             cwd: cwd.clone(),
+                            reason: reason.clone(),
                             changes: vec![],
+                            proposed_execpolicy_amendment: proposed_amendment,
                         });
+                        self.approval_scroll = 0;
                         
-                        // Show approval request to user (NOT a correction - this is Codex asking)
-                        let cmd_display = command.unwrap_or_else(|| "unknown".to_string());
-                        let cwd_display = cwd.map(|c| format!(" (in {})", c)).unwrap_or_default();
-                        self.messages.push(Message::system(&format!(
-                            "⚡ Command approval [Y/n]\n$ {}{}",
-                            cmd_display, cwd_display
-                        )));
+                        // No chat message needed — the overlay will show everything
                         self.scroll_to_bottom();
                         return;
                     }
                     "item/fileChange/requestApproval" => {
                         // File change approval request
                         let params = json.get("params").cloned().unwrap_or_default();
+                        let reason = params.get("reason").and_then(|r| r.as_str()).map(String::from);
                         
                         self.pending_approval = Some(PendingApproval {
                             request_id: id,
                             approval_type: ApprovalType::FileChange,
                             command: None,
                             cwd: None,
+                            reason: reason.clone(),
                             changes: vec![],
+                            proposed_execpolicy_amendment: None,
                         });
+                        self.approval_scroll = 0;
                         
-                        // Show approval request to user (NOT a correction)
-                        let reason = params.get("reason").and_then(|r| r.as_str()).unwrap_or("File changes");
-                        self.messages.push(Message::system(&format!(
-                            "📝 File change approval [Y/n]\n{}",
-                            reason
-                        )));
+                        // No chat message needed — the overlay will show everything
                         self.scroll_to_bottom();
                         return;
                     }
@@ -1774,10 +1871,47 @@ Make it comprehensive but concise."#;
                 "turn/started" => {
                     self.is_processing = true;
                     self.current_turn_violations = 0;
+                    // Capture turn_id for interrupt support
+                    if let Some(turn_id) = json
+                        .get("params")
+                        .and_then(|p| p.get("turn"))
+                        .and_then(|t| t.get("id"))
+                        .and_then(|i| i.as_str())
+                    {
+                        self.current_turn_id = Some(turn_id.to_string());
+                    }
                 }
                 "turn/completed" => {
+                    let turn_status = json
+                        .get("params")
+                        .and_then(|p| p.get("turn"))
+                        .and_then(|t| t.get("status"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("completed");
+
+                    match turn_status {
+                        "interrupted" => {
+                            self.messages.push(Message::system(
+                                "Turn interrupted — tell the model what to do differently."
+                            ));
+                        }
+                        "failed" => {
+                            let error_msg = json
+                                .get("params")
+                                .and_then(|p| p.get("turn"))
+                                .and_then(|t| t.get("error"))
+                                .and_then(|e| e.get("message"))
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("Unknown error");
+                            self.messages.push(Message::system(
+                                &format!("Turn failed: {}", error_msg)
+                            ));
+                        }
+                        _ => {} // "completed" — normal
+                    }
+
                     self.is_processing = false;
-                    // Stats panel will show supervision status, no blocking message needed
+                    self.current_turn_id = None;
                     self.scroll_to_bottom();
                 }
                 "thread/started" => {
@@ -2446,6 +2580,25 @@ Make it comprehensive but concise."#;
         .to_string()
     }
 
+    /// Send turn/interrupt RPC to cancel the current turn
+    async fn send_turn_interrupt(&mut self) {
+        if let (Some(ref turn_id), Some(ref tx)) = (&self.current_turn_id, &self.input_tx) {
+            let thread_id = self.thread_id.as_deref().unwrap_or("main");
+            self.request_counter += 1;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "turn/interrupt",
+                "id": self.request_counter,
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id
+                }
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+        }
+    }
+
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
@@ -2463,7 +2616,8 @@ Make it comprehensive but concise."#;
         let slash_popup = &self.slash_popup;
         let is_paused = self.is_paused;
         let picker = &self.picker;
-        let has_pending_approval = self.pending_approval.is_some();
+        let pending_approval = &self.pending_approval;
+        let approval_scroll = self.approval_scroll;
         let notebook_current_activity = &self.notebook_current_activity;
         let notebook_completed_count = &self.notebook_completed_count;
         let notebook_attention_items = &self.notebook_attention_items;
@@ -2502,7 +2656,7 @@ Make it comprehensive but concise."#;
                 is_processing,
                 spinner_frame,
                 status_text: if is_processing {
-                    "Thinking...".to_string()
+                    "Thinking... (Esc to interrupt)".to_string()
                 } else if is_paused {
                     "Monitoring paused".to_string()
                 } else {
@@ -2553,13 +2707,13 @@ Make it comprehensive but concise."#;
                 cursor_y,
             ));
 
-            // Help bar (or approval prompt)
-            if has_pending_approval {
-                // Show approval prompt
-                let approval_bar = ratatui::widgets::Paragraph::new(
-                    " ⚠️ APPROVAL REQUIRED: [Y/Enter] Accept  [N/Esc] Decline "
+            // Help bar
+            if pending_approval.is_some() {
+                // When approval overlay is shown, show minimal hint in help bar
+                let hint = ratatui::widgets::Paragraph::new(
+                    " Approval pending — see overlay above "
                 ).style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow).bg(ratatui::style::Color::DarkGray));
-                f.render_widget(approval_bar, main_chunks[4]);
+                f.render_widget(hint, main_chunks[4]);
             } else {
                 f.render_widget(HelpBar, main_chunks[4]);
             }
@@ -2567,6 +2721,11 @@ Make it comprehensive but concise."#;
             // Render picker overlay (on top of everything)
             if picker.visible {
                 picker.render(size, f.buffer_mut());
+            }
+
+            // Render approval overlay (on top of everything, highest z-order)
+            if let Some(approval) = pending_approval {
+                Self::render_approval_overlay(f, size, approval, approval_scroll);
             }
         })?;
 
@@ -2626,6 +2785,200 @@ Make it comprehensive but concise."#;
             .block(block)
             .wrap(Wrap { trim: false });
         f.render_widget(paragraph, popup_area);
+    }
+
+    fn render_approval_overlay(f: &mut Frame, area: Rect, approval: &PendingApproval, scroll: usize) {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+
+        let opt_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let desc_style = Style::default().fg(Color::White);
+
+        // --- Build footer lines (options) — these are ALWAYS visible ---
+        let mut footer_lines: Vec<Line> = Vec::new();
+        footer_lines.push(Line::from(vec![
+            Span::styled("  [y] ", opt_style),
+            Span::styled("Yes, proceed", desc_style),
+        ]));
+
+        match approval.approval_type {
+            ApprovalType::CommandExecution => {
+                if let Some(ref amendment) = approval.proposed_execpolicy_amendment {
+                    let prefix = amendment.join(" ");
+                    footer_lines.push(Line::from(vec![
+                        Span::styled("  [p] ", opt_style),
+                        Span::styled(
+                            format!("Yes, don't ask again for `{}`", prefix),
+                            desc_style,
+                        ),
+                    ]));
+                }
+            }
+            ApprovalType::FileChange => {
+                footer_lines.push(Line::from(vec![
+                    Span::styled("  [a] ", opt_style),
+                    Span::styled("Yes, don't ask again for these files", desc_style),
+                ]));
+            }
+        }
+
+        footer_lines.push(Line::from(vec![
+            Span::styled("  [n] ", opt_style),
+            Span::styled("No, cancel  ", desc_style),
+            Span::styled("Esc", Style::default().fg(Color::DarkGray)),
+            Span::styled(" also cancels", Style::default().fg(Color::DarkGray)),
+        ]));
+
+        let footer_height = footer_lines.len() as u16;
+
+        // --- Build content lines (title + reason + command) ---
+        let mut content_lines: Vec<Line> = Vec::new();
+
+        let title_text = match approval.approval_type {
+            ApprovalType::CommandExecution => "Would you like to run the following command?",
+            ApprovalType::FileChange => "Would you like to make the following edits?",
+        };
+        content_lines.push(Line::from(Span::styled(
+            title_text,
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        content_lines.push(Line::from(""));
+
+        if let Some(ref reason) = approval.reason {
+            content_lines.push(Line::from(vec![
+                Span::styled("Reason: ", Style::default().fg(Color::Gray)),
+                Span::styled(reason.as_str(), Style::default().fg(Color::White).add_modifier(Modifier::ITALIC)),
+            ]));
+            content_lines.push(Line::from(""));
+        }
+
+        match approval.approval_type {
+            ApprovalType::CommandExecution => {
+                let cmd = approval.command.as_deref().unwrap_or("(unknown)");
+                content_lines.push(Line::from(vec![
+                    Span::styled("  $ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(cmd.to_string(), Style::default().fg(Color::White)),
+                ]));
+                if let Some(ref cwd) = approval.cwd {
+                    content_lines.push(Line::from(Span::styled(
+                        format!("    in {}", cwd),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            ApprovalType::FileChange => {
+                content_lines.push(Line::from(Span::styled(
+                    "  (file modifications pending)",
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+        }
+
+        // --- Layout: calculate overlay size ---
+        // border(2) + content + separator(1) + footer
+        let ideal_height = 2 + content_lines.len() as u16 + 1 + footer_height;
+        let overlay_height = ideal_height.min(area.height.saturating_sub(4));
+        let overlay_width = 64.min(area.width.saturating_sub(4));
+
+        let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
+        let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
+        let overlay_area = Rect { x, y, width: overlay_width, height: overlay_height };
+
+        f.render_widget(Clear, overlay_area);
+
+        // Outer border
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title_top(Line::styled(
+                " ⚡ APPROVAL REQUIRED ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(overlay_area);
+        f.render_widget(block, overlay_area);
+
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        // Split inner into: content area (flexible) + separator (1 line) + footer (fixed)
+        let sep_and_footer = 1 + footer_height;
+        let content_height = inner.height.saturating_sub(sep_and_footer);
+
+        let content_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: content_height,
+        };
+        let sep_area = Rect {
+            x: inner.x,
+            y: inner.y + content_height,
+            width: inner.width,
+            height: 1.min(inner.height.saturating_sub(content_height)),
+        };
+        let footer_area = Rect {
+            x: inner.x,
+            y: inner.y + content_height + sep_area.height,
+            width: inner.width,
+            height: footer_height.min(inner.height.saturating_sub(content_height + sep_area.height)),
+        };
+
+        // Render content with scroll support
+        let content_h = content_area.height as usize;
+        let total_content = content_lines.len();
+        let max_scroll = total_content.saturating_sub(content_h);
+        let actual_scroll = scroll.min(max_scroll);
+
+        let visible_content: Vec<Line> = content_lines
+            .into_iter()
+            .skip(actual_scroll)
+            .take(content_h)
+            .collect();
+
+        let content_para = Paragraph::new(visible_content)
+            .wrap(Wrap { trim: false });
+        f.render_widget(content_para, content_area);
+
+        // Scroll indicator (if content is scrollable)
+        if total_content > content_h {
+            let indicator = if actual_scroll > 0 && actual_scroll < max_scroll {
+                format!("↑↓ {}/{}", actual_scroll + 1, total_content)
+            } else if actual_scroll > 0 {
+                format!("↑ {}/{}", actual_scroll + 1, total_content)
+            } else {
+                format!("↓ {}/{}", actual_scroll + 1, total_content)
+            };
+            // Draw indicator at top-right of content area
+            let ind_len = indicator.len() as u16;
+            if content_area.width > ind_len + 1 {
+                let ind_area = Rect {
+                    x: content_area.x + content_area.width - ind_len - 1,
+                    y: content_area.y,
+                    width: ind_len,
+                    height: 1,
+                };
+                let ind_widget = Paragraph::new(Span::styled(
+                    indicator,
+                    Style::default().fg(Color::DarkGray),
+                ));
+                f.render_widget(ind_widget, ind_area);
+            }
+        }
+
+        // Render separator line
+        if sep_area.height > 0 {
+            let sep_line = "─".repeat(inner.width as usize);
+            let sep = Paragraph::new(Line::from(Span::styled(
+                sep_line,
+                Style::default().fg(Color::DarkGray),
+            )));
+            f.render_widget(sep, sep_area);
+        }
+
+        // Render footer (options) — always visible at bottom
+        let footer_para = Paragraph::new(footer_lines);
+        f.render_widget(footer_para, footer_area);
     }
 
     fn render_messages(f: &mut Frame, area: Rect, messages: &[Message], scroll_offset: usize) {
