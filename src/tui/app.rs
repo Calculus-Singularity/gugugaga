@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Stylize,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, RwLock};
@@ -2622,7 +2622,9 @@ Make it comprehensive but concise."#;
             })
             .title_top(Line::styled(title, Theme::title()));
 
-        let paragraph = Paragraph::new(lines).block(block);
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         f.render_widget(paragraph, popup_area);
     }
 
@@ -2658,7 +2660,8 @@ Make it comprehensive but concise."#;
             .take(visible_height)
             .collect();
 
-        let paragraph = Paragraph::new(visible);
+        let paragraph = Paragraph::new(visible)
+            .wrap(Wrap { trim: false });
         f.render_widget(paragraph, inner);
 
         // Scrollbar

@@ -5,8 +5,9 @@ use ratatui::{
     layout::Rect,
     style::Stylize,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::theme::Theme;
 
@@ -139,10 +140,13 @@ impl Picker {
         // Build content
         let inner_height = height.saturating_sub(2) as usize;
         
+        // inner_width accounts for border (2 cols) 
+        let inner_width = width.saturating_sub(2) as usize;
+
         let lines: Vec<Line> = if self.loading {
             vec![Line::styled("Loading...", Theme::muted())]
         } else if self.items.is_empty() {
-            vec![Line::styled("No sessions found.", Theme::muted())]
+            vec![Line::styled("No items found.", Theme::muted())]
         } else {
             self.items
                 .iter()
@@ -151,24 +155,52 @@ impl Picker {
                 .take(inner_height)
                 .map(|(i, item)| {
                     let is_selected = i == self.selected;
-                    let prefix = if is_selected { "▸ " } else { "  " };
+                    let prefix = if is_selected { "> " } else { "  " };
                     let style = if is_selected {
                         Theme::accent()
                     } else {
                         Theme::text()
                     };
 
-                    Line::from(vec![
-                        Span::styled(prefix, style),
-                        Span::styled(&item.title, style.bold()),
-                        Span::styled(format!(" - {}", item.subtitle), Theme::muted()),
-                    ])
+                    // Truncate to fit: prefix(2) + title + " - " + subtitle
+                    let prefix_w = prefix.width();
+                    let sep = " - ";
+                    let sep_w = sep.width();
+                    let avail_for_text = inner_width.saturating_sub(prefix_w);
+
+                    let title_w = item.title.width();
+                    let sub_w = item.subtitle.width();
+
+                    if title_w + sep_w + sub_w <= avail_for_text {
+                        // Fits
+                        Line::from(vec![
+                            Span::styled(prefix, style),
+                            Span::styled(item.title.clone(), style.bold()),
+                            Span::styled(format!("{}{}", sep, item.subtitle), Theme::muted()),
+                        ])
+                    } else if title_w + sep_w + 3 <= avail_for_text {
+                        // Truncate subtitle
+                        let sub_avail = avail_for_text.saturating_sub(title_w + sep_w);
+                        let truncated_sub = super::widgets::truncate_to_width_str(&item.subtitle, sub_avail);
+                        Line::from(vec![
+                            Span::styled(prefix, style),
+                            Span::styled(item.title.clone(), style.bold()),
+                            Span::styled(format!("{}{}", sep, truncated_sub), Theme::muted()),
+                        ])
+                    } else {
+                        // Just show truncated title
+                        let truncated_title = super::widgets::truncate_to_width_str(&item.title, avail_for_text);
+                        Line::from(vec![
+                            Span::styled(prefix, style),
+                            Span::styled(truncated_title, style.bold()),
+                        ])
+                    }
                 })
                 .collect()
         };
 
         let title = format!(" {} ", self.title);
-        let help = " ↑↓ Select │ Enter Confirm │ Esc Cancel ";
+        let help = " Up/Down Enter Esc ";
         
         let block = Block::default()
             .borders(Borders::ALL)
@@ -176,7 +208,9 @@ impl Picker {
             .title_top(Line::styled(title, Theme::title()))
             .title_bottom(Line::styled(help, Theme::muted()));
 
-        let paragraph = Paragraph::new(lines).block(block);
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         paragraph.render(picker_area, buf);
     }
 }

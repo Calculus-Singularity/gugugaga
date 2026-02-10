@@ -73,41 +73,36 @@ fn parse_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
     spans
 }
 
-/// Wrap a long string into multiple lines, respecting unicode width
-fn wrap_text(text: &str, max_width: usize, indent: &str) -> Vec<String> {
-    if max_width == 0 {
-        return vec![text.to_string()];
+/// Truncate a string to fit within `max_display_width` display columns,
+/// appending "..." if truncated. Safe for multi-byte UTF-8 and wide chars.
+/// Public alias for use from other modules.
+pub fn truncate_to_width_str(text: &str, max_display_width: usize) -> String {
+    truncate_to_width(text, max_display_width)
+}
+
+fn truncate_to_width(text: &str, max_display_width: usize) -> String {
+    if text.width() <= max_display_width {
+        return text.to_string();
     }
     
-    let indent_width = indent.width();
-    let content_width = max_width.saturating_sub(indent_width);
+    let suffix = "...";
+    let suffix_width = suffix.width();
+    let target_width = max_display_width.saturating_sub(suffix_width);
     
-    if content_width == 0 || text.width() <= content_width {
-        return vec![text.to_string()];
-    }
-    
-    let mut lines = Vec::new();
-    let mut current_line = String::new();
+    let mut result = String::new();
     let mut current_width = 0;
     
     for c in text.chars() {
         let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
-        
-        if current_width + char_width > content_width && !current_line.is_empty() {
-            lines.push(current_line);
-            current_line = String::new();
-            current_width = 0;
+        if current_width + char_width > target_width {
+            break;
         }
-        
-        current_line.push(c);
+        result.push(c);
         current_width += char_width;
     }
     
-    if !current_line.is_empty() {
-        lines.push(current_line);
-    }
-    
-    lines
+    result.push_str(suffix);
+    result
 }
 
 /// A message in the conversation
@@ -226,12 +221,12 @@ impl Widget for HeaderBar<'_> {
         let title_line = Line::from(title_spans);
         buf.set_line(area.x + 1, area.y, &title_line, area.width.saturating_sub(2));
 
-        // Project name on the right
-        let project_str = format!("📁 {} ", self.project);
-        let project_len = project_str.chars().count() as u16;
-        let project_x = area.x + area.width.saturating_sub(project_len + 1);
+        // Project name on the right — use display width, not char count
+        let project_str = format!("[{}]", self.project);
+        let project_display_w = project_str.width() as u16;
+        let project_x = area.x + area.width.saturating_sub(project_display_w + 1);
         let project_span = Span::styled(project_str, Theme::muted());
-        buf.set_span(project_x, area.y, &project_span, project_len + 1);
+        buf.set_span(project_x, area.y, &project_span, project_display_w + 1);
     }
 }
 
@@ -382,12 +377,12 @@ impl Widget for ContextPanel {
         }
 
         let mut y_offset = 0u16;
-        let width = inner.width as usize;
+        let w = inner.width as usize;
 
         // Monitoring status
         let status_line = if self.is_monitoring {
             Line::from(vec![
-                Span::styled("🛡️ ", Style::default()),
+                Span::styled("● ", Theme::success()),
                 Span::styled("Monitoring", Theme::success()),
             ])
         } else {
@@ -399,16 +394,15 @@ impl Widget for ContextPanel {
         buf.set_line(inner.x, inner.y + y_offset, &status_line, inner.width);
         y_offset += 1;
 
-        // Current activity
+        // Current activity — prefix ">> " is 3 chars wide
         if let Some(activity) = self.current_activity {
             if y_offset < inner.height {
-                let truncated = if activity.len() > width.saturating_sub(4) {
-                    format!("{}...", &activity[..width.saturating_sub(7)])
-                } else {
-                    activity.to_string()
-                };
+                let prefix = ">> ";
+                let prefix_w: usize = prefix.width();
+                let avail = w.saturating_sub(prefix_w);
+                let truncated = truncate_to_width(&activity, avail);
                 let line = Line::from(vec![
-                    Span::styled("📍 ", Style::default()),
+                    Span::styled(prefix, Theme::accent()),
                     Span::styled(truncated, Theme::info()),
                 ]);
                 buf.set_line(inner.x, inner.y + y_offset, &line, inner.width);
@@ -427,9 +421,7 @@ impl Widget for ContextPanel {
             .collect();
         
         if !high_priority.is_empty() && y_offset < inner.height {
-            let line = Line::from(vec![
-                Span::styled("⚠️ Watch:", Theme::warning()),
-            ]);
+            let line = Line::from(Span::styled("! Watch:", Theme::warning()));
             buf.set_line(inner.x, inner.y + y_offset, &line, inner.width);
             y_offset += 1;
 
@@ -437,12 +429,13 @@ impl Widget for ContextPanel {
                 if y_offset >= inner.height {
                     break;
                 }
-                let truncated = if content.len() > width.saturating_sub(4) {
-                    format!("  {}...", &content[..width.saturating_sub(7)])
-                } else {
-                    format!("  {}", content)
-                };
-                let line = Line::from(Span::styled(truncated, Theme::dim()));
+                let prefix = "  ";
+                let avail = w.saturating_sub(prefix.width());
+                let truncated = truncate_to_width(content, avail);
+                let line = Line::from(vec![
+                    Span::styled(prefix, Theme::dim()),
+                    Span::styled(truncated, Theme::dim()),
+                ]);
                 buf.set_line(inner.x, inner.y + y_offset, &line, inner.width);
                 y_offset += 1;
             }
@@ -453,26 +446,20 @@ impl Widget for ContextPanel {
             y_offset += 1;
         }
 
-        // Stats summary
+        // Stats summary — use simple ASCII, no emoji
         if y_offset < inner.height {
-            let line = Line::from(vec![
-                Span::styled("📊 ", Style::default()),
-                Span::styled(format!("{} done", self.completed_count), Theme::success()),
-                Span::styled(" | ", Theme::dim()),
-                Span::styled(
-                    format!("{} violations", self.violations),
-                    if self.violations > 0 { Theme::warning() } else { Theme::dim() }
-                ),
-            ]);
+            let stats_text = format!("{} done | {} viol", self.completed_count, self.violations);
+            let truncated = truncate_to_width(&stats_text, w);
+            let style = if self.violations > 0 { Theme::warning() } else { Theme::dim() };
+            let line = Line::from(Span::styled(truncated, style));
             buf.set_line(inner.x, inner.y + y_offset, &line, inner.width);
             y_offset += 1;
         }
 
         if y_offset < inner.height && self.mistakes_count > 0 {
-            let line = Line::from(vec![
-                Span::styled("   ", Style::default()),
-                Span::styled(format!("{} mistakes logged", self.mistakes_count), Theme::dim()),
-            ]);
+            let mistakes_text = format!("{} mistakes", self.mistakes_count);
+            let truncated = truncate_to_width(&mistakes_text, w);
+            let line = Line::from(Span::styled(truncated, Theme::dim()));
             buf.set_line(inner.x, inner.y + y_offset, &line, inner.width);
         }
     }
@@ -550,112 +537,136 @@ impl Widget for HelpBar {
 }
 
 /// Render a single message to lines for display
-/// max_width: terminal width for text wrapping (0 = no wrapping)
+/// max_width: the usable inner width of the chat area in display columns
 pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let content_width = max_width.saturating_sub(4); // Account for "  " indent and some margin
 
-    // Role badge
+    // Indent used for content lines: 2 spaces
+    let indent: &str = "  ";
+    let indent_w: usize = indent.width();
+    // Width available for actual text content after indent
+    let text_avail = max_width.saturating_sub(indent_w);
+
+    // Role badge (use ASCII-safe badges to avoid emoji width issues)
     let (badge_text, badge_style) = match msg.role {
         MessageRole::User => (" You ", Theme::user_badge()),
         MessageRole::Codex => (" Codex ", Theme::codex_badge()),
-        MessageRole::Thinking => (" 💭 Thinking ", Theme::muted()),
-        MessageRole::CommandExec => (" ⚡ Command ", Style::default().fg(Color::Yellow)),
-        MessageRole::FileChange => (" 📝 File ", Style::default().fg(Color::Cyan)),
+        MessageRole::Thinking => (" Thinking ", Theme::muted()),
+        MessageRole::CommandExec => (" $ Command ", Style::default().fg(Color::Yellow)),
+        MessageRole::FileChange => (" ~ File ", Style::default().fg(Color::Cyan)),
         MessageRole::Gugugaga => (" Gugugaga ", Theme::gugugaga_badge()),
-        MessageRole::Correction => (" ⚠ Correction ", Theme::correction_badge()),
+        MessageRole::Correction => (" ! Correction ", Theme::correction_badge()),
         MessageRole::System => ("", Theme::system_badge()),
     };
 
-    // Helper to add wrapped content lines with markdown support
-    let add_wrapped_lines = |lines: &mut Vec<Line<'static>>, content: &str, style: Style, width: usize, use_markdown: bool| {
-        for content_line in content.lines() {
-            let wrapped = wrap_text(content_line, width, "  ");
-            for (i, wrapped_line) in wrapped.into_iter().enumerate() {
-                let indent = if i == 0 { "  " } else { "    " };
+    /// Helper: wrap one physical line of text to fit `avail` display columns,
+    /// returning multiple lines if needed.
+    fn wrap_content(text: &str, avail: usize) -> Vec<String> {
+        if avail == 0 {
+            return vec![text.to_string()];
+        }
+        if text.width() <= avail {
+            return vec![text.to_string()];
+        }
+        let mut result = Vec::new();
+        let mut line = String::new();
+        let mut w = 0usize;
+        for c in text.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            if w + cw > avail && !line.is_empty() {
+                result.push(line);
+                line = String::new();
+                w = 0;
+            }
+            line.push(c);
+            w += cw;
+        }
+        if !line.is_empty() {
+            result.push(line);
+        }
+        result
+    }
+
+    /// Helper: add wrapped + optionally markdown-parsed content lines
+    fn add_content(
+        lines: &mut Vec<Line<'static>>,
+        content: &str,
+        style: Style,
+        avail: usize,
+        indent: &str,
+        use_markdown: bool,
+    ) {
+        for raw_line in content.lines() {
+            for wrapped in wrap_content(raw_line, avail) {
                 if use_markdown {
                     let mut spans = vec![Span::raw(indent.to_string())];
-                    spans.extend(parse_markdown(&wrapped_line, style));
+                    spans.extend(parse_markdown(&wrapped, style));
                     lines.push(Line::from(spans));
                 } else {
                     lines.push(Line::from(vec![
                         Span::raw(indent.to_string()),
-                        Span::styled(wrapped_line, style),
+                        Span::styled(wrapped, style),
                     ]));
                 }
             }
         }
-    };
-
-    if msg.role == MessageRole::System {
-        // System messages - wrap long system messages too
-        let style = Theme::dim().add_modifier(Modifier::ITALIC);
-        let wrapped = wrap_text(&msg.content, content_width, "  ");
-        for wrapped_line in wrapped {
-            lines.push(Line::from(vec![
-                Span::styled("  ", Theme::dim()),
-                Span::styled(wrapped_line, style),
-            ]));
-        }
-    } else if msg.role == MessageRole::Thinking {
-        // Thinking messages - visible but distinct from main output
-        lines.push(Line::from(vec![
-            Span::styled(badge_text, badge_style),
-            Span::styled(format!(" {}", msg.timestamp), Theme::muted()),
-        ]));
-
-        let style = Theme::thinking();
-        add_wrapped_lines(&mut lines, &msg.content, style, content_width, true);
-    } else if msg.role == MessageRole::CommandExec {
-        // Command execution output - monospace style
-        lines.push(Line::from(vec![
-            Span::styled(badge_text, badge_style),
-            Span::styled(format!(" {}", msg.timestamp), Theme::muted()),
-        ]));
-
-        let style = Style::default().fg(Color::DarkGray);
-        add_wrapped_lines(&mut lines, &msg.content, style, content_width, false);
-    } else if msg.role == MessageRole::FileChange {
-        // File change - colored diff style (don't wrap diffs, they need to stay aligned)
-        lines.push(Line::from(vec![
-            Span::styled(badge_text, badge_style),
-            Span::styled(format!(" {}", msg.timestamp), Theme::muted()),
-        ]));
-
-        for content_line in msg.content.lines() {
-            let style = if content_line.starts_with('+') {
-                Style::default().fg(Color::Green)
-            } else if content_line.starts_with('-') {
-                Style::default().fg(Color::Red)
-            } else if content_line.starts_with('@') {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Theme::dim()
-            };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(content_line.to_string(), style),
-            ]));
-        }
-    } else {
-        // Header line with badge and timestamp
-        lines.push(Line::from(vec![
-            Span::styled(badge_text, badge_style),
-            Span::styled(format!(" {}", msg.timestamp), Theme::muted()),
-        ]));
-
-        // Content lines with left margin - enable markdown for Codex/Gugugaga messages
-        let content_style = match msg.role {
-            MessageRole::Correction => Theme::warning(),
-            _ => Theme::text(),
-        };
-        let use_markdown = matches!(msg.role, MessageRole::Codex | MessageRole::Gugugaga | MessageRole::Correction);
-
-        add_wrapped_lines(&mut lines, &msg.content, content_style, content_width, use_markdown);
     }
 
-    // Add empty line for spacing
-    lines.push(Line::from(""));
+    if msg.role == MessageRole::System {
+        // System messages — dim italic, no badge header
+        let style = Theme::dim().add_modifier(Modifier::ITALIC);
+        add_content(&mut lines, &msg.content, style, text_avail, indent, false);
+    } else {
+        // Badge header line
+        lines.push(Line::from(vec![
+            Span::styled(badge_text, badge_style),
+            Span::styled(format!(" {}", msg.timestamp), Theme::muted()),
+        ]));
 
+        // Content
+        match msg.role {
+            MessageRole::Thinking => {
+                let style = Theme::thinking();
+                add_content(&mut lines, &msg.content, style, text_avail, indent, true);
+            }
+            MessageRole::CommandExec => {
+                let style = Style::default().fg(Color::DarkGray);
+                add_content(&mut lines, &msg.content, style, text_avail, indent, false);
+            }
+            MessageRole::FileChange => {
+                // Diff lines — wrap them too so they don't break the border
+                for raw_line in msg.content.lines() {
+                    let style = if raw_line.starts_with('+') {
+                        Style::default().fg(Color::Green)
+                    } else if raw_line.starts_with('-') {
+                        Style::default().fg(Color::Red)
+                    } else if raw_line.starts_with('@') {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Theme::dim()
+                    };
+                    for wrapped in wrap_content(raw_line, text_avail) {
+                        lines.push(Line::from(vec![
+                            Span::raw(indent.to_string()),
+                            Span::styled(wrapped, style),
+                        ]));
+                    }
+                }
+            }
+            MessageRole::Correction => {
+                let style = Theme::warning();
+                add_content(&mut lines, &msg.content, style, text_avail, indent, true);
+            }
+            _ => {
+                // User, Codex, Gugugaga
+                let style = Theme::text();
+                let use_md = matches!(msg.role, MessageRole::Codex | MessageRole::Gugugaga);
+                add_content(&mut lines, &msg.content, style, text_avail, indent, use_md);
+            }
+        }
+    }
+
+    // Spacing line
+    lines.push(Line::from(""));
     lines
 }
