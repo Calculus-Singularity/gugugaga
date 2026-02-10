@@ -11,6 +11,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+mod trust;
+
 /// Gugugaga - Monitor and correct Codex behavior
 #[derive(Parser, Debug)]
 #[command(name = "gugugaga")]
@@ -71,6 +73,11 @@ async fn run_tui_mode(
     codex_home: PathBuf,
     project_name: String,
 ) -> anyhow::Result<()> {
+    // ── Trust directory onboarding (aligned with Codex) ──
+    // If the project has no trust_level in ~/.codex/config.toml, ask the user
+    // before spawning app-server, exactly like Codex does.
+    trust::ensure_trust_decision(&codex_home, &cwd)?;
+
     // Create config
     let mut config = GugugagaConfig::new(cwd.clone(), codex_home)
         .with_strict_mode(cli.strict)
