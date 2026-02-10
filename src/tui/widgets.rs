@@ -578,61 +578,279 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
         }
     }
 
-    /// Helper: render markdown content using tui_markdown, then add indent
+    /// Render markdown content using pulldown-cmark, with styles aligned to Codex.
+    ///
+    /// Styles (matching Codex's `markdown_render.rs`):
+    ///   inline code  → Cyan
+    ///   bold         → Bold
+    ///   italic       → Italic
+    ///   strikethrough→ CrossedOut
+    ///   heading H1   → Bold + Underlined, prefixed with `# `
+    ///   heading H2   → Bold, prefixed with `## `
+    ///   heading H3   → Bold + Italic, prefixed with `### `
+    ///   heading H4-6 → Italic
+    ///   link text    → Cyan + Underlined
+    ///   blockquote   → Green, prefixed with `> `
+    ///   list markers → ordered: LightBlue, unordered: `- `
+    ///   code blocks  → no wrapping, blank line before/after
+    ///   hr           → `———`
     fn add_markdown(
         lines: &mut Vec<Line<'static>>,
         content: &str,
         avail: usize,
         indent: &str,
     ) {
-        // tui_markdown::from_str returns ratatui::text::Text with full markdown rendering
-        let text = tui_markdown::from_str(content);
-        for line in text.lines {
-            // Wrap: compute total display width of the line's spans
-            let total_w: usize = line.spans.iter().map(|s| s.content.as_ref().width()).sum();
-            if total_w <= avail {
-                // Fits in one line — just prepend indent
-                let mut spans = vec![Span::raw(indent.to_string())];
-                spans.extend(line.spans.into_iter().map(|s| Span::styled(s.content.into_owned(), s.style)));
-                lines.push(Line::from(spans));
+        use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, HeadingLevel};
+
+        // ── Codex-aligned styles ──
+        let style_code = Style::default().fg(Color::Cyan);
+        let style_bold = Style::default().add_modifier(Modifier::BOLD);
+        let style_italic = Style::default().add_modifier(Modifier::ITALIC);
+        let style_strikethrough = Style::default().add_modifier(Modifier::CROSSED_OUT);
+        let style_link = Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
+        let style_blockquote = Style::default().fg(Color::Green);
+        let style_ol_marker = Style::default().fg(Color::LightBlue);
+
+        fn heading_style(level: HeadingLevel) -> Style {
+            match level {
+                HeadingLevel::H1 => Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                HeadingLevel::H2 => Style::default().add_modifier(Modifier::BOLD),
+                HeadingLevel::H3 => Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                _ => Style::default().add_modifier(Modifier::ITALIC),
+            }
+        }
+
+        // ── State ──
+        let mut style_stack: Vec<Style> = Vec::new();
+        let mut current_spans: Vec<Span<'static>> = Vec::new();
+        let mut in_code_block = false;
+        let mut in_blockquote = false;
+        let mut list_indices: Vec<Option<u64>> = Vec::new();
+        let mut needs_blank = false;
+        let mut link_url: Option<String> = None;
+
+        let current_style = |stack: &[Style]| -> Style {
+            stack.last().copied().unwrap_or_default()
+        };
+
+        // Flush current_spans into `lines`, with wrapping for non-code-block content.
+        let flush = |lines: &mut Vec<Line<'static>>,
+                     spans: &mut Vec<Span<'static>>,
+                     avail: usize,
+                     indent: &str,
+                     is_code_block: bool| {
+            if spans.is_empty() {
+                return;
+            }
+            let built = std::mem::take(spans);
+            // Compute total display width
+            let total_w: usize = built.iter().map(|s| s.content.as_ref().width()).sum();
+
+            if is_code_block || total_w <= avail {
+                let mut out = vec![Span::raw(indent.to_string())];
+                out.extend(built);
+                lines.push(Line::from(out));
             } else {
-                // Need to wrap: flatten spans into chars with styles, then re-wrap
-                let mut chars_with_style: Vec<(char, Style)> = Vec::new();
-                for span in &line.spans {
-                    for c in span.content.chars() {
-                        chars_with_style.push((c, span.style));
+                // Style-preserving character-level wrapping
+                let mut chars_styles: Vec<(char, Style)> = Vec::new();
+                for s in &built {
+                    for c in s.content.chars() {
+                        chars_styles.push((c, s.style));
                     }
                 }
-
-                let mut current_spans: Vec<Span<'static>> = vec![Span::raw(indent.to_string())];
+                let mut cur: Vec<Span<'static>> = vec![Span::raw(indent.to_string())];
                 let mut w = 0usize;
-
-                for (c, sty) in chars_with_style {
+                for (c, sty) in chars_styles {
                     let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
                     if w + cw > avail && w > 0 {
-                        lines.push(Line::from(current_spans));
-                        current_spans = vec![Span::raw(indent.to_string())];
+                        lines.push(Line::from(std::mem::take(&mut cur)));
+                        cur = vec![Span::raw(indent.to_string())];
                         w = 0;
                     }
-                    // Try to merge with last span if same style
-                    if let Some(last) = current_spans.last_mut() {
+                    if let Some(last) = cur.last_mut() {
                         if last.style == sty {
                             let mut s = last.content.to_string();
                             s.push(c);
                             *last = Span::styled(s, sty);
                         } else {
-                            current_spans.push(Span::styled(c.to_string(), sty));
+                            cur.push(Span::styled(c.to_string(), sty));
                         }
                     } else {
-                        current_spans.push(Span::styled(c.to_string(), sty));
+                        cur.push(Span::styled(c.to_string(), sty));
                     }
                     w += cw;
                 }
-                if current_spans.len() > 1 || (current_spans.len() == 1 && current_spans[0].content != indent) {
-                    lines.push(Line::from(current_spans));
+                if cur.len() > 1 || (cur.len() == 1 && cur[0].content != indent) {
+                    lines.push(Line::from(cur));
                 }
             }
+        };
+
+        let push_blank = |lines: &mut Vec<Line<'static>>, indent: &str| {
+            lines.push(Line::from(Span::raw(indent.to_string())));
+        };
+
+        let mut opts = Options::empty();
+        opts.insert(Options::ENABLE_STRIKETHROUGH);
+        let parser = Parser::new_ext(content, opts);
+
+        for event in parser {
+            match event {
+                // ── Block starts ──
+                Event::Start(Tag::Paragraph) => {
+                    if needs_blank {
+                        push_blank(lines, indent);
+                    }
+                    needs_blank = false;
+                }
+                Event::Start(Tag::Heading { level, .. }) => {
+                    if needs_blank {
+                        push_blank(lines, indent);
+                    }
+                    needs_blank = false;
+                    let hs = heading_style(level);
+                    let prefix = format!("{} ", "#".repeat(level as usize));
+                    current_spans.push(Span::styled(prefix, hs));
+                    style_stack.push(hs);
+                }
+                Event::Start(Tag::BlockQuote(_)) => {
+                    if needs_blank {
+                        push_blank(lines, indent);
+                    }
+                    in_blockquote = true;
+                    needs_blank = false;
+                }
+                Event::Start(Tag::CodeBlock(_kind)) => {
+                    flush(lines, &mut current_spans, avail, indent, in_code_block);
+                    if needs_blank || !lines.is_empty() {
+                        push_blank(lines, indent);
+                    }
+                    in_code_block = true;
+                    needs_blank = false;
+                }
+                Event::Start(Tag::List(start)) => {
+                    if list_indices.is_empty() && needs_blank {
+                        push_blank(lines, indent);
+                    }
+                    list_indices.push(start);
+                    needs_blank = false;
+                }
+                Event::Start(Tag::Item) => {
+                    flush(lines, &mut current_spans, avail, indent, in_code_block);
+                    let depth = list_indices.len();
+                    let pad = "  ".repeat(depth.saturating_sub(1));
+                    if let Some(Some(idx)) = list_indices.last_mut() {
+                        current_spans.push(Span::styled(
+                            format!("{}{}. ", pad, idx),
+                            style_ol_marker,
+                        ));
+                        *idx += 1;
+                    } else {
+                        current_spans.push(Span::raw(format!("{}- ", pad)));
+                    }
+                }
+                Event::Start(Tag::Emphasis) => {
+                    let merged = current_style(&style_stack).patch(style_italic);
+                    style_stack.push(merged);
+                }
+                Event::Start(Tag::Strong) => {
+                    let merged = current_style(&style_stack).patch(style_bold);
+                    style_stack.push(merged);
+                }
+                Event::Start(Tag::Strikethrough) => {
+                    let merged = current_style(&style_stack).patch(style_strikethrough);
+                    style_stack.push(merged);
+                }
+                Event::Start(Tag::Link { dest_url, .. }) => {
+                    link_url = Some(dest_url.to_string());
+                    let merged = current_style(&style_stack).patch(style_link);
+                    style_stack.push(merged);
+                }
+
+                // ── Block ends ──
+                Event::End(TagEnd::Paragraph) => {
+                    flush(lines, &mut current_spans, avail, indent, in_code_block);
+                    needs_blank = true;
+                }
+                Event::End(TagEnd::Heading(_)) => {
+                    flush(lines, &mut current_spans, avail, indent, in_code_block);
+                    style_stack.pop();
+                    needs_blank = true;
+                }
+                Event::End(TagEnd::BlockQuote(_)) => {
+                    flush(lines, &mut current_spans, avail, indent, in_code_block);
+                    in_blockquote = false;
+                    needs_blank = true;
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    flush(lines, &mut current_spans, avail, indent, true);
+                    in_code_block = false;
+                    needs_blank = true;
+                }
+                Event::End(TagEnd::List(_)) => {
+                    list_indices.pop();
+                    needs_blank = true;
+                }
+                Event::End(TagEnd::Item) => {
+                    flush(lines, &mut current_spans, avail, indent, in_code_block);
+                }
+                Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {
+                    style_stack.pop();
+                }
+                Event::End(TagEnd::Link) => {
+                    style_stack.pop();
+                    if let Some(url) = link_url.take() {
+                        current_spans.push(Span::raw(" ("));
+                        current_spans.push(Span::styled(url, style_link));
+                        current_spans.push(Span::raw(")"));
+                    }
+                }
+
+                // ── Inline content ──
+                Event::Text(text) => {
+                    let sty = if in_blockquote {
+                        current_style(&style_stack).patch(style_blockquote)
+                    } else {
+                        current_style(&style_stack)
+                    };
+                    // Handle multi-line text (e.g. in code blocks)
+                    for (i, line_text) in text.lines().enumerate() {
+                        if i > 0 || (in_code_block && !current_spans.is_empty()) {
+                            flush(lines, &mut current_spans, avail, indent, in_code_block);
+                        }
+                        if in_blockquote && current_spans.is_empty() {
+                            current_spans.push(Span::styled("> ", style_blockquote));
+                        }
+                        current_spans.push(Span::styled(line_text.to_string(), sty));
+                    }
+                }
+                Event::Code(code) => {
+                    // Inline code → Cyan (matching Codex)
+                    current_spans.push(Span::styled(code.to_string(), style_code));
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    flush(lines, &mut current_spans, avail, indent, in_code_block);
+                }
+                Event::Rule => {
+                    flush(lines, &mut current_spans, avail, indent, in_code_block);
+                    if needs_blank {
+                        push_blank(lines, indent);
+                    }
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.to_string()),
+                        Span::raw("———"),
+                    ]));
+                    needs_blank = true;
+                }
+                // Table / HTML / footnotes — render as plain text
+                Event::Html(html) | Event::InlineHtml(html) => {
+                    current_spans.push(Span::raw(html.to_string()));
+                }
+                _ => {}
+            }
         }
+        // Final flush
+        flush(lines, &mut current_spans, avail, indent, in_code_block);
     }
 
     if msg.role == MessageRole::System {
