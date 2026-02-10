@@ -32,11 +32,18 @@ use super::widgets::{
 
 /// Current picker mode
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 enum PickerMode {
     None,
     Resume,
     Model,
+    SkillsMenu,       // First-level: "List skills" / "Enable/Disable"
+    SkillsSelect,     // Second-level: select a skill to insert as $mention
+    SkillsManage,     // Second-level: toggle individual skills on/off
+    Approvals,
+    Permissions,
+    Personality,
+    Collab,
+    Agent,
 }
 
 /// Type of pending request
@@ -44,8 +51,20 @@ enum PickerMode {
 enum PendingRequestType {
     None,
     ThreadList,
-    ThreadResume(String),  // Contains thread_id being resumed
-    ThreadRead(String),    // Contains thread_id being read
+    ThreadResume(String),
+    ThreadRead(String),
+    ModelList,
+    SkillsList,
+    CollabModeList,
+    AgentThreadList,
+    McpServerList,
+    AppsList,
+    ConfigRead,
+    FeedbackUpload,
+    NewThread,
+    ForkThread,
+    RenameThread,
+    Logout,
 }
 
 /// Pending approval request from server
@@ -340,8 +359,8 @@ impl App {
                     self.scroll_to_bottom();
                     self.is_processing = true;
 
+                    let msg = self.create_turn_message(&text);
                     if let Some(tx) = &self.input_tx {
-                        let msg = self.create_turn_message(&text);
                         let _ = tx.send(msg).await;
                     }
                 }
@@ -477,7 +496,7 @@ impl App {
                 self.request_model_list().await;
             }
             CodexCommand::Skills => {
-                self.request_skills_list().await;
+                self.open_skills_menu().await;
             }
             CodexCommand::Review => {
                 self.request_review().await;
@@ -499,7 +518,7 @@ impl App {
                 self.request_feedback().await;
             }
             CodexCommand::Mcp => {
-                self.show_mcp_tools();
+                self.show_mcp_tools().await;
             }
             CodexCommand::Apps => {
                 self.request_apps_list().await;
@@ -549,6 +568,8 @@ impl App {
     async fn request_new_thread(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::NewThread;
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "thread/start",
@@ -557,6 +578,7 @@ impl App {
             })
             .to_string();
             let _ = tx.send(msg).await;
+            self.messages.clear();
             self.messages.push(Message::system("Starting new session..."));
         }
     }
@@ -599,24 +621,60 @@ impl App {
         }
     }
 
-    /// Show background processes
+    /// Show background processes - lists recent command executions from message history
     fn show_background_processes(&mut self) {
-        // TODO: Implement background process tracking
-        self.messages.push(Message::system("No background processes running"));
+        let running: Vec<&str> = self.messages.iter()
+            .filter(|m| m.role == MessageRole::CommandExec)
+            .map(|m| m.content.as_str())
+            .collect();
+
+        if running.is_empty() {
+            self.messages.push(Message::system("No command executions in this session."));
+        } else {
+            let last_n = running.len().min(10);
+            let display: Vec<String> = running[running.len() - last_n..]
+                .iter()
+                .enumerate()
+                .map(|(i, cmd)| {
+                    let preview = if cmd.len() > 60 { &cmd[..60] } else { cmd };
+                    format!("  [{}] {}", i + 1, preview)
+                })
+                .collect();
+            self.messages.push(Message::system(&format!(
+                "Recent command executions ({}):\n{}",
+                running.len(),
+                display.join("\n")
+            )));
+        }
     }
 
-    /// Request compact/summarize
+    /// Request compact/summarize - sends a summarization prompt to compact context
     async fn request_compact(&mut self) {
-        self.messages.push(Message::system("Compacting conversation..."));
-        // This is handled by the agent's memory system
-        // For now just acknowledge
-        self.messages.push(Message::system("Context compaction is automatic in Gugugaga"));
+        // The app-server does not expose a dedicated compact RPC.
+        // Codex's native TUI uses Op::Compact internally. We approximate by
+        // sending a turn with a compact/summarize instruction.
+        let msg = self.create_turn_message(
+            "Please summarize the conversation so far into a compact summary, \
+             preserving all important context, decisions, and pending tasks. \
+             This will help keep the context window manageable."
+        );
+        if let Some(tx) = &self.input_tx {
+            let _ = tx.send(msg).await;
+            self.messages.push(Message::system("Compacting conversation..."));
+            self.is_processing = true;
+        }
     }
 
     /// Request model list
     async fn request_model_list(&mut self) {
+        self.picker_mode = PickerMode::Model;
+        self.picker.title = "Select Model".to_string();
+        self.picker.open_loading();
+
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::ModelList;
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "model/list",
@@ -625,39 +683,88 @@ impl App {
             })
             .to_string();
             let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Fetching models..."));
         }
     }
 
-    /// Request skills list
-    async fn request_skills_list(&mut self) {
+    /// Open skills menu - first level picker
+    async fn open_skills_menu(&mut self) {
+        self.picker_mode = PickerMode::SkillsMenu;
+        self.picker.title = "Skills".to_string();
+        let items = vec![
+            PickerItem { id: "list".to_string(), title: "List skills".to_string(), subtitle: "Show all available skills".to_string() },
+            PickerItem { id: "manage".to_string(), title: "Enable/Disable skills".to_string(), subtitle: "Toggle individual skills on/off".to_string() },
+        ];
+        self.picker.open(items);
+    }
+
+    /// Fetch skills list from Codex (used by both list and manage flows)
+    async fn fetch_skills_list(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::SkillsList;
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "skills/list",
                 "id": self.request_counter,
-                "params": {}
+                "params": {
+                    "cwds": [self.cwd.clone()]
+                }
             })
             .to_string();
             let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Fetching skills..."));
+        }
+    }
+
+    /// Toggle a skill's enabled state via skills/config/write
+    /// skill_id is formatted as "enabled:path" or "disabled:path"
+    async fn toggle_skill(&mut self, skill_path: &str, currently_enabled: bool) {
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "skills/config/write",
+                "id": self.request_counter,
+                "params": {
+                    "path": skill_path,
+                    "enabled": !currently_enabled
+                }
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+            let action = if currently_enabled { "Disabled" } else { "Enabled" };
+            // Extract just the skill name from the path for display
+            let display_name = std::path::Path::new(skill_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(skill_path);
+            self.messages.push(Message::system(&format!("{} skill: {}", action, display_name)));
         }
     }
 
     /// Request code review
     async fn request_review(&mut self) {
-        if let Some(tx) = &self.input_tx {
-            self.request_counter += 1;
-            let msg = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "review/start",
-                "id": self.request_counter,
-                "params": {}
-            })
-            .to_string();
-            let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Starting code review..."));
+        if let Some(thread_id) = &self.thread_id {
+            if let Some(tx) = &self.input_tx {
+                self.request_counter += 1;
+                let msg = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "review/start",
+                    "id": self.request_counter,
+                    "params": {
+                        "threadId": thread_id,
+                        "target": {
+                            "type": "uncommittedChanges"
+                        }
+                    }
+                })
+                .to_string();
+                let _ = tx.send(msg).await;
+                self.messages.push(Message::system("Starting code review (uncommitted changes)..."));
+                self.is_processing = true;
+            }
+        } else {
+            self.messages.push(Message::system("No active thread. Start a conversation first."));
         }
     }
 
@@ -666,6 +773,8 @@ impl App {
         if let Some(thread_id) = &self.thread_id {
             if let Some(tx) = &self.input_tx {
                 self.request_counter += 1;
+                self.pending_request_id = Some(self.request_counter);
+                self.pending_request_type = PendingRequestType::RenameThread;
                 let msg = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "thread/name/set",
@@ -689,6 +798,8 @@ impl App {
         if let Some(thread_id) = &self.thread_id {
             if let Some(tx) = &self.input_tx {
                 self.request_counter += 1;
+                self.pending_request_id = Some(self.request_counter);
+                self.pending_request_type = PendingRequestType::ForkThread;
                 let msg = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "thread/fork",
@@ -710,6 +821,8 @@ impl App {
     async fn request_logout(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::Logout;
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "account/logout",
@@ -726,11 +839,18 @@ impl App {
     async fn request_feedback(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::FeedbackUpload;
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "feedback/upload",
                 "id": self.request_counter,
-                "params": {}
+                "params": {
+                    "classification": "general",
+                    "reason": null,
+                    "threadId": self.thread_id,
+                    "includeLogs": true
+                }
             })
             .to_string();
             let _ = tx.send(msg).await;
@@ -738,16 +858,30 @@ impl App {
         }
     }
 
-    /// Show MCP tools
-    fn show_mcp_tools(&mut self) {
-        // TODO: Get MCP tools from config
-        self.messages.push(Message::system("MCP tools: (none configured)"));
+    /// Show MCP tools - query the server for MCP server statuses
+    async fn show_mcp_tools(&mut self) {
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::McpServerList;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "mcpServerStatus/list",
+                "id": self.request_counter,
+                "params": {}
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+            self.messages.push(Message::system("Fetching MCP servers..."));
+        }
     }
 
     /// Request apps list
     async fn request_apps_list(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::AppsList;
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "app/list",
@@ -762,30 +896,7 @@ impl App {
 
     /// Open approvals picker - shows approval mode options
     async fn open_approvals_picker(&mut self) {
-        // Request current config first
-        if let Some(tx) = &self.input_tx {
-            self.request_counter += 1;
-            let msg = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "config/read",
-                "id": self.request_counter,
-                "params": {}
-            })
-            .to_string();
-            let _ = tx.send(msg).await;
-        }
-
-        // Show available approval modes
-        self.messages.push(Message::system(
-            "Approval Modes:\n\
-             1. Suggest - Codex suggests, you approve everything\n\
-             2. Auto Edit - Codex can edit files, asks for commands\n\
-             3. Full Auto - Codex can do everything without asking\n\n\
-             Use: /approvals <1|2|3> or wait for picker"
-        ));
-
-        // TODO: Implement proper picker mode handling
-        self.picker_mode = PickerMode::None;
+        self.picker_mode = PickerMode::Approvals;
         self.picker.title = "Approval Mode".to_string();
         let items = vec![
             PickerItem { id: "suggest".to_string(), title: "Suggest".to_string(), subtitle: "Approve everything".to_string() },
@@ -797,14 +908,7 @@ impl App {
 
     /// Open permissions picker - shows sandbox policy options  
     async fn open_permissions_picker(&mut self) {
-        self.messages.push(Message::system(
-            "Permission Modes:\n\
-             1. Read Only - Codex can only read files\n\
-             2. Workspace Write - Codex can write in workspace\n\
-             3. Full Access - Codex has full system access\n\n\
-             Use: /permissions <1|2|3>"
-        ));
-
+        self.picker_mode = PickerMode::Permissions;
         self.picker.title = "Permissions".to_string();
         let items = vec![
             PickerItem { id: "read-only".to_string(), title: "Read Only".to_string(), subtitle: "Can only read files".to_string() },
@@ -816,12 +920,7 @@ impl App {
 
     /// Open personality picker
     async fn open_personality_picker(&mut self) {
-        self.messages.push(Message::system(
-            "Personality:\n\
-             1. Friendly - Warm and encouraging\n\
-             2. Pragmatic - Direct and efficient"
-        ));
-
+        self.picker_mode = PickerMode::Personality;
         self.picker.title = "Personality".to_string();
         let items = vec![
             PickerItem { id: "friendly".to_string(), title: "Friendly".to_string(), subtitle: "Warm and encouraging".to_string() },
@@ -830,20 +929,34 @@ impl App {
         self.picker.open(items);
     }
 
-    /// Open experimental features picker
+    /// Open experimental features picker - reads config first
     async fn open_experimental_picker(&mut self) {
-        self.messages.push(Message::system(
-            "Experimental Features:\n\
-             Toggle experimental features on/off.\n\
-             These features may be unstable."
-        ));
-        // TODO: Get actual experimental features from config
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::ConfigRead;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "config/read",
+                "id": self.request_counter,
+                "params": {}
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+            self.messages.push(Message::system("Fetching experimental features..."));
+        }
     }
 
     /// Open collaboration mode picker
     async fn open_collab_picker(&mut self) {
+        self.picker_mode = PickerMode::Collab;
+        self.picker.title = "Collaboration Mode".to_string();
+        self.picker.open_loading();
+
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::CollabModeList;
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "collaborationMode/list",
@@ -852,7 +965,6 @@ impl App {
             })
             .to_string();
             let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Fetching collaboration modes..."));
         }
     }
 
@@ -879,8 +991,14 @@ impl App {
 
     /// Open agent thread picker
     async fn open_agent_picker(&mut self) {
+        self.picker_mode = PickerMode::Agent;
+        self.picker.title = "Active Agents".to_string();
+        self.picker.open_loading();
+
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::AgentThreadList;
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "thread/loaded/list",
@@ -889,7 +1007,6 @@ impl App {
             })
             .to_string();
             let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Fetching active threads..."));
         }
     }
 
@@ -915,8 +1032,8 @@ impl App {
 
 Make it comprehensive but concise."#;
 
+        let msg = self.create_turn_message(INIT_PROMPT);
         if let Some(tx) = &self.input_tx {
-            let msg = self.create_turn_message(INIT_PROMPT);
             let _ = tx.send(msg).await;
             self.messages.push(Message::user("/init"));
             self.messages.push(Message::system("Creating AGENTS.md..."));
@@ -951,36 +1068,89 @@ Make it comprehensive but concise."#;
     /// Handle picker selection
     async fn handle_picker_selection(&mut self) {
         if let Some(item) = self.picker.selected_item() {
-            let thread_id = item.id.clone();
-            let title = item.title.clone();
+            let item_id = item.id.clone();
+            let item_title = item.title.clone();
 
             match self.picker_mode {
                 PickerMode::Resume => {
                     self.messages.push(Message::system(&format!(
                         "Resuming session: {}",
-                        title
+                        item_title
                     )));
-
-                    // Send resume request and track it
                     if let Some(tx) = &self.input_tx {
                         self.request_counter += 1;
                         self.pending_request_id = Some(self.request_counter);
-                        self.pending_request_type = PendingRequestType::ThreadResume(thread_id.clone());
-                        
+                        self.pending_request_type = PendingRequestType::ThreadResume(item_id.clone());
                         let msg = serde_json::json!({
                             "jsonrpc": "2.0",
                             "method": "thread/resume",
                             "id": self.request_counter,
-                            "params": {
-                                "threadId": thread_id
-                            }
+                            "params": { "threadId": item_id }
                         })
                         .to_string();
                         let _ = tx.send(msg).await;
                     }
                 }
                 PickerMode::Model => {
-                    // TODO: Handle model selection
+                    self.messages.push(Message::system(&format!("Model set to: {}", item_title)));
+                    self.write_config("model", &serde_json::json!(item_id)).await;
+                }
+                PickerMode::SkillsMenu => {
+                    match item_id.as_str() {
+                        "list" => {
+                            // Switch to skill select picker
+                            self.picker_mode = PickerMode::SkillsSelect;
+                            self.picker.title = "Select Skill".to_string();
+                            self.picker.open_loading();
+                            self.fetch_skills_list().await;
+                            return; // Don't close picker
+                        }
+                        "manage" => {
+                            // Switch to manage mode, open loading picker
+                            self.picker_mode = PickerMode::SkillsManage;
+                            self.picker.title = "Enable/Disable Skills".to_string();
+                            self.picker.open_loading();
+                            self.fetch_skills_list().await;
+                            return; // Don't close picker
+                        }
+                        _ => {}
+                    }
+                }
+                PickerMode::SkillsSelect => {
+                    // Insert $skillname into input buffer
+                    let mention = format!("${}", item_id);
+                    self.input.buffer.push_str(&mention);
+                    self.input.cursor += mention.len();
+                }
+                PickerMode::SkillsManage => {
+                    // Toggle the selected skill
+                    // The id is formatted as "enabled:skill_name" or "disabled:skill_name"
+                    let currently_enabled = item_id.starts_with("enabled:");
+                    let skill_name = item_id
+                        .strip_prefix("enabled:")
+                        .or_else(|| item_id.strip_prefix("disabled:"))
+                        .unwrap_or(&item_id);
+                    self.toggle_skill(skill_name, currently_enabled).await;
+                }
+                PickerMode::Approvals => {
+                    self.messages.push(Message::system(&format!("Approval mode: {}", item_title)));
+                    self.write_config("approvalPolicy", &serde_json::json!(item_id)).await;
+                }
+                PickerMode::Permissions => {
+                    self.messages.push(Message::system(&format!("Permissions: {}", item_title)));
+                    self.write_config("sandboxPolicy", &serde_json::json!(item_id)).await;
+                }
+                PickerMode::Personality => {
+                    self.messages.push(Message::system(&format!("Personality: {}", item_title)));
+                    self.write_config("personality", &serde_json::json!(item_id)).await;
+                }
+                PickerMode::Collab => {
+                    self.messages.push(Message::system(&format!("Collaboration mode: {}", item_title)));
+                    self.write_config("collaborationMode", &serde_json::json!(item_id)).await;
+                }
+                PickerMode::Agent => {
+                    self.messages.push(Message::system(&format!("Switched to agent: {}", item_title)));
+                    self.thread_id = Some(item_id);
                 }
                 PickerMode::None => {}
             }
@@ -989,6 +1159,25 @@ Make it comprehensive but concise."#;
         self.picker.close();
         self.picker_mode = PickerMode::None;
         self.scroll_to_bottom();
+    }
+
+    /// Helper: write a config value to Codex via config/value/write
+    async fn write_config(&mut self, key_path: &str, value: &serde_json::Value) {
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "config/value/write",
+                "id": self.request_counter,
+                "params": {
+                    "keyPath": key_path,
+                    "value": value,
+                    "mergeStrategy": "replace"
+                }
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+        }
     }
     
     async fn respond_to_approval(&mut self, request_id: u64, approval_type: &ApprovalType, accept: bool) {
@@ -1188,6 +1377,17 @@ Make it comprehensive but concise."#;
                 }
             }
             
+            // Always capture thread_id from any response that contains result.thread.id
+            // This handles initialization thread/start, thread/resume, thread/fork etc.
+            if let Some(tid) = json
+                .get("result")
+                .and_then(|r| r.get("thread"))
+                .and_then(|t| t.get("id"))
+                .and_then(|i| i.as_str())
+            {
+                self.thread_id = Some(tid.to_string());
+            }
+
             // Check if this is a JSON-RPC response (has "id" and "result" or "error")
             if let Some(id) = json.get("id") {
                 // This is a response to a request we made
@@ -1198,14 +1398,24 @@ Make it comprehensive but concise."#;
                         return;
                     }
                 }
-                // Check for error responses
+                // Check for error responses (only for non-pending requests)
                 if let Some(error) = json.get("error") {
                     let error_msg = error
                         .get("message")
                         .and_then(|m| m.as_str())
                         .unwrap_or("Unknown error");
-                    self.messages.push(Message::system(&format!("Error: {}", error_msg)));
-                    self.is_processing = false;
+                    // Only show error if it seems relevant (not from init)
+                    if self.pending_request_id.is_some() {
+                        self.messages.push(Message::system(&format!("Error: {}", error_msg)));
+                        self.is_processing = false;
+                        self.pending_request_id = None;
+                        self.pending_request_type = PendingRequestType::None;
+                        // Close picker if it was open
+                        if self.picker.visible {
+                            self.picker.close();
+                            self.picker_mode = PickerMode::None;
+                        }
+                    }
                     return;
                 }
             }
@@ -1854,9 +2064,341 @@ Make it comprehensive but concise."#;
                     }
                 }
             }
-            PendingRequestType::None => {
-                // Unexpected response
+            PendingRequestType::ModelList => {
+                if let Some(result) = json.get("result") {
+                    if let Some(models) = result.get("data").and_then(|m| m.as_array()) {
+                        let items: Vec<PickerItem> = models
+                            .iter()
+                            .filter_map(|m| {
+                                let id = m.get("id").and_then(|i| i.as_str())?.to_string();
+                                let name = m.get("displayName").and_then(|n| n.as_str())
+                                    .or_else(|| m.get("model").and_then(|n| n.as_str()))
+                                    .unwrap_or(&id)
+                                    .to_string();
+                                let provider = m.get("modelProvider").and_then(|p| p.as_str()).unwrap_or("");
+                                Some(PickerItem {
+                                    id,
+                                    title: name,
+                                    subtitle: provider.to_string(),
+                                })
+                            })
+                            .collect();
+
+                        if items.is_empty() {
+                            self.picker.close();
+                            self.picker_mode = PickerMode::None;
+                            self.messages.push(Message::system("No models available."));
+                        } else {
+                            self.picker.set_items(items);
+                        }
+                    } else {
+                        self.picker.close();
+                        self.picker_mode = PickerMode::None;
+                        let text = serde_json::to_string_pretty(result).unwrap_or_default();
+                        self.messages.push(Message::system(&format!("Models:\n{}", text)));
+                    }
+                } else {
+                    self.handle_rpc_error(json, "Failed to load models");
+                }
             }
+            PendingRequestType::SkillsList => {
+                if let Some(result) = json.get("result") {
+                    // Collect all skills from all cwds: (name, desc, enabled, path)
+                    let mut all_skills: Vec<(String, String, bool, String)> = Vec::new();
+                    let mut errors: Vec<String> = Vec::new();
+
+                    if let Some(data) = result.get("data").and_then(|d| d.as_array()) {
+                        for entry in data {
+                            if let Some(skills) = entry.get("skills").and_then(|s| s.as_array()) {
+                                for skill in skills {
+                                    let name = skill.get("name").and_then(|n| n.as_str()).unwrap_or("unnamed").to_string();
+                                    let desc = skill.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
+                                    let enabled = skill.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+                                    let path = skill.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                                    all_skills.push((name, desc, enabled, path));
+                                }
+                            }
+                            if let Some(errs) = entry.get("errors").and_then(|e| e.as_array()) {
+                                for err in errs {
+                                    // SkillErrorInfo has path and message fields
+                                    let path = err.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                                    let msg = err.get("message").and_then(|m| m.as_str())
+                                        .unwrap_or_else(|| err.as_str().unwrap_or("unknown error"));
+                                    if path.is_empty() {
+                                        errors.push(msg.to_string());
+                                    } else {
+                                        errors.push(format!("{}: {}", path, msg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    match self.picker_mode {
+                        PickerMode::SkillsSelect => {
+                            // Show enabled skills in picker for selection/mention
+                            let enabled_skills: Vec<&(String, String, bool, String)> = all_skills.iter()
+                                .filter(|(_, _, enabled, _)| *enabled)
+                                .collect();
+
+                            if enabled_skills.is_empty() {
+                                self.picker.close();
+                                self.picker_mode = PickerMode::None;
+                                self.messages.push(Message::system("No enabled skills found."));
+                            } else {
+                                let items: Vec<PickerItem> = enabled_skills.iter().map(|(name, desc, _, _)| {
+                                    PickerItem {
+                                        id: name.clone(),
+                                        title: name.clone(),
+                                        subtitle: desc.clone(),
+                                    }
+                                }).collect();
+                                self.picker.set_items(items);
+                            }
+                        }
+                        PickerMode::SkillsManage => {
+                            // Show all skills in picker for toggling
+                            if all_skills.is_empty() {
+                                self.picker.close();
+                                self.picker_mode = PickerMode::None;
+                                self.messages.push(Message::system("No skills found to manage."));
+                            } else {
+                                let items: Vec<PickerItem> = all_skills.iter().map(|(name, desc, enabled, path)| {
+                                    let status = if *enabled { "✓" } else { "✗" };
+                                    let prefix = if *enabled { "enabled" } else { "disabled" };
+                                    PickerItem {
+                                        // Use path as ID since skills/config/write requires path
+                                        id: format!("{}:{}", prefix, path),
+                                        title: format!("{} {}", status, name),
+                                        subtitle: desc.clone(),
+                                    }
+                                }).collect();
+                                self.picker.set_items(items);
+                            }
+                        }
+                        _ => {
+                            // Fallback: display as text
+                            self.picker.close();
+                            self.picker_mode = PickerMode::None;
+
+                            if all_skills.is_empty() && errors.is_empty() {
+                                self.messages.push(Message::system("No skills found. Add skills via AGENTS.md or ~/.codex/skills/"));
+                            } else {
+                                let mut lines = Vec::new();
+                                for (name, desc, enabled, _path) in &all_skills {
+                                    let status = if *enabled { "✓" } else { "✗" };
+                                    lines.push(format!("  {} {} — {}", status, name, desc));
+                                }
+                                for err in &errors {
+                                    lines.push(format!("  ⚠ {}", err));
+                                }
+                                self.messages.push(Message::system(&format!("Skills:\n{}", lines.join("\n"))));
+                            }
+                        }
+                    }
+                } else {
+                    self.picker.close();
+                    self.picker_mode = PickerMode::None;
+                    self.handle_rpc_error(json, "Failed to load skills");
+                }
+            }
+            PendingRequestType::CollabModeList => {
+                if let Some(result) = json.get("result") {
+                    if let Some(modes) = result.get("data").and_then(|m| m.as_array()) {
+                        let items: Vec<PickerItem> = modes
+                            .iter()
+                            .filter_map(|m| {
+                                let name = m.get("name").and_then(|n| n.as_str())?.to_string();
+                                let mode = m.get("mode").and_then(|d| d.as_str()).unwrap_or("");
+                                let model = m.get("model").and_then(|d| d.as_str()).unwrap_or("");
+                                let subtitle = if !model.is_empty() {
+                                    format!("{} ({})", mode, model)
+                                } else {
+                                    mode.to_string()
+                                };
+                                Some(PickerItem {
+                                    id: name.clone(),
+                                    title: name,
+                                    subtitle,
+                                })
+                            })
+                            .collect();
+
+                        if items.is_empty() {
+                            self.picker.close();
+                            self.picker_mode = PickerMode::None;
+                            self.messages.push(Message::system("No collaboration modes available."));
+                        } else {
+                            self.picker.set_items(items);
+                        }
+                    } else {
+                        self.picker.close();
+                        self.picker_mode = PickerMode::None;
+                        let text = serde_json::to_string_pretty(result).unwrap_or_default();
+                        self.messages.push(Message::system(&format!("Collaboration modes:\n{}", text)));
+                    }
+                } else {
+                    self.picker.close();
+                    self.picker_mode = PickerMode::None;
+                    self.handle_rpc_error(json, "Failed to load collaboration modes");
+                }
+            }
+            PendingRequestType::AgentThreadList => {
+                if let Some(result) = json.get("result") {
+                    // data is Vec<String> (thread IDs), not Vec<objects>
+                    if let Some(thread_ids) = result.get("data").and_then(|t| t.as_array()) {
+                        let items: Vec<PickerItem> = thread_ids
+                            .iter()
+                            .filter_map(|t| {
+                                let id = t.as_str()?.to_string();
+                                let short_id = if id.len() > 12 { &id[..12] } else { &id };
+                                Some(PickerItem {
+                                    id: id.clone(),
+                                    title: format!("Thread {}", short_id),
+                                    subtitle: id.clone(),
+                                })
+                            })
+                            .collect();
+
+                        if items.is_empty() {
+                            self.picker.close();
+                            self.picker_mode = PickerMode::None;
+                            self.messages.push(Message::system("No active agent threads."));
+                        } else {
+                            self.picker.set_items(items);
+                        }
+                    } else {
+                        self.picker.close();
+                        self.picker_mode = PickerMode::None;
+                        let text = serde_json::to_string_pretty(result).unwrap_or_default();
+                        self.messages.push(Message::system(&format!("Agent threads:\n{}", text)));
+                    }
+                } else {
+                    self.picker.close();
+                    self.picker_mode = PickerMode::None;
+                    self.handle_rpc_error(json, "Failed to load agent threads");
+                }
+            }
+            PendingRequestType::McpServerList => {
+                if let Some(result) = json.get("result") {
+                    let mut lines = Vec::new();
+
+                    if let Some(servers) = result.get("data").and_then(|s| s.as_array()) {
+                        for server in servers {
+                            let name = server.get("name").and_then(|n| n.as_str()).unwrap_or("unnamed");
+                            let auth_status = server.get("authStatus").and_then(|s| s.as_str()).unwrap_or("unknown");
+                            // tools is a HashMap<String, McpTool>, not an array
+                            let tool_count = server.get("tools").and_then(|t| t.as_object()).map(|o| o.len()).unwrap_or(0);
+                            lines.push(format!("  {} [{}] - {} tools", name, auth_status, tool_count));
+
+                            if let Some(tools) = server.get("tools").and_then(|t| t.as_object()) {
+                                for (tool_name, _tool_info) in tools {
+                                    lines.push(format!("    - {}", tool_name));
+                                }
+                            }
+                        }
+                    }
+
+                    if lines.is_empty() {
+                        self.messages.push(Message::system("MCP: No servers configured."));
+                    } else {
+                        self.messages.push(Message::system(&format!("MCP Servers:\n{}", lines.join("\n"))));
+                    }
+                } else {
+                    self.handle_rpc_error(json, "Failed to load MCP servers");
+                }
+            }
+            PendingRequestType::AppsList => {
+                if let Some(result) = json.get("result") {
+                    let mut lines = Vec::new();
+
+                    if let Some(apps) = result.get("data").and_then(|a| a.as_array()) {
+                        for app in apps {
+                            let name = app.get("name").and_then(|n| n.as_str()).unwrap_or("unnamed");
+                            let desc = app.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                            let accessible = app.get("isAccessible").and_then(|a| a.as_bool()).unwrap_or(false);
+                            let status = if accessible { "✓" } else { "✗" };
+                            lines.push(format!("  {} {} — {}", status, name, desc));
+                        }
+                    }
+
+                    if lines.is_empty() {
+                        self.messages.push(Message::system("No apps configured."));
+                    } else {
+                        self.messages.push(Message::system(&format!("Apps:\n{}", lines.join("\n"))));
+                    }
+                } else {
+                    self.handle_rpc_error(json, "Failed to load apps");
+                }
+            }
+            PendingRequestType::ConfigRead => {
+                if let Some(result) = json.get("result") {
+                    let text = serde_json::to_string_pretty(result).unwrap_or_default();
+                    self.messages.push(Message::system(&format!("Current config:\n{}", text)));
+                } else {
+                    self.handle_rpc_error(json, "Failed to read config");
+                }
+            }
+            PendingRequestType::FeedbackUpload => {
+                if json.get("result").is_some() {
+                    self.messages.push(Message::system("Feedback uploaded successfully. Thank you!"));
+                } else {
+                    self.handle_rpc_error(json, "Failed to upload feedback");
+                }
+            }
+            PendingRequestType::NewThread => {
+                if let Some(result) = json.get("result") {
+                    if let Some(thread_id) = result.get("thread").and_then(|t| t.get("id")).and_then(|i| i.as_str()) {
+                        self.thread_id = Some(thread_id.to_string());
+                        self.messages.push(Message::system("New session ready."));
+                    }
+                } else {
+                    self.handle_rpc_error(json, "Failed to start new session");
+                }
+            }
+            PendingRequestType::ForkThread => {
+                if let Some(result) = json.get("result") {
+                    if let Some(thread_id) = result.get("thread").and_then(|t| t.get("id")).and_then(|i| i.as_str()) {
+                        self.thread_id = Some(thread_id.to_string());
+                        self.messages.push(Message::system("Session forked successfully."));
+                    } else {
+                        self.messages.push(Message::system("Session forked."));
+                    }
+                } else {
+                    self.handle_rpc_error(json, "Failed to fork session");
+                }
+            }
+            PendingRequestType::RenameThread => {
+                if json.get("result").is_some() {
+                    self.messages.push(Message::system("Thread renamed."));
+                } else {
+                    self.handle_rpc_error(json, "Failed to rename thread");
+                }
+            }
+            PendingRequestType::Logout => {
+                if json.get("result").is_some() {
+                    self.messages.push(Message::system("Logged out. Exiting..."));
+                    self.should_quit = true;
+                } else {
+                    self.handle_rpc_error(json, "Failed to logout");
+                }
+            }
+            PendingRequestType::None => {
+                // Unexpected response - ignore
+            }
+        }
+    }
+
+    /// Helper to display RPC error messages
+    fn handle_rpc_error(&mut self, json: &serde_json::Value, fallback: &str) {
+        if let Some(error) = json.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or(fallback);
+            self.messages.push(Message::system(&format!("Error: {}", error_msg)));
+        } else {
+            self.messages.push(Message::system(fallback));
         }
     }
     
@@ -1885,12 +2427,13 @@ Make it comprehensive but concise."#;
         }
     }
 
-    fn create_turn_message(&self, text: &str) -> String {
+    fn create_turn_message(&mut self, text: &str) -> String {
+        self.request_counter += 1;
         let thread_id = self.thread_id.as_deref().unwrap_or("main");
         serde_json::json!({
             "jsonrpc": "2.0",
             "method": "turn/start",
-            "id": 2,
+            "id": self.request_counter,
             "params": {
                 "threadId": thread_id,
                 "input": [{
