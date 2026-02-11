@@ -44,6 +44,23 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install panic hook that writes to a crash log file
+    // so we can debug "flash-exit" issues.
+    std::panic::set_hook(Box::new(|info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen
+        );
+        let msg = format!(
+            "gugugaga crashed!\n{}\nBacktrace:\n{:?}\n",
+            info,
+            std::backtrace::Backtrace::capture()
+        );
+        let _ = std::fs::write("gugugaga-crash.log", &msg);
+        eprintln!("{msg}");
+    }));
+
     let cli = Cli::parse();
 
     // Resolve paths
@@ -97,16 +114,27 @@ async fn run_tui_mode(
     // Set channels on app
     app.set_channels(user_input_tx.clone(), output_rx);
 
-    // Create interceptor
-    let interceptor = Interceptor::new(config).await?;
+    // Create interceptor — if this fails, restore terminal first
+    let interceptor = match Interceptor::new(config).await {
+        Ok(i) => i,
+        Err(e) => {
+            drop(app);
+            eprintln!("\x1b[1;31mError:\x1b[0m Failed to start Codex backend: {e}");
+            eprintln!("Make sure codex app-server is installed and accessible.");
+            std::process::exit(1);
+        }
+    };
 
     // Share notebook with TUI so the right-side panel updates live
     let notebook = interceptor.notebook();
     app.set_notebook(notebook);
 
-    // Run interceptor in background
+    // Run interceptor in background — capture errors so we can log them
     let interceptor_handle = tokio::spawn(async move {
-        let _ = interceptor.run(user_input_rx, output_tx).await;
+        if let Err(e) = interceptor.run(user_input_rx, output_tx).await {
+            let msg = format!("Interceptor error: {e}\n");
+            let _ = std::fs::write("gugugaga-crash.log", &msg);
+        }
     });
 
     // Send initialize sequence to app-server
@@ -148,10 +176,25 @@ async fn run_tui_mode(
     let _ = user_input_tx.send(thread_start_msg).await;
 
     // Run TUI (this blocks until quit)
-    app.run().await?;
+    let run_result = app.run().await;
+
+    // Drop app first to restore terminal before printing any error
+    drop(app);
 
     // Cleanup
     interceptor_handle.abort();
+
+    // Now check if the TUI run had an error
+    if let Err(e) = run_result {
+        let msg = format!(
+            "TUI error: {e}\nBacktrace:\n{:?}\n",
+            std::backtrace::Backtrace::capture()
+        );
+        let _ = std::fs::write("gugugaga-crash.log", &msg);
+        eprintln!("\x1b[1;31mError:\x1b[0m TUI exited unexpectedly: {e}");
+        eprintln!("Details saved to gugugaga-crash.log");
+        std::process::exit(1);
+    }
 
     Ok(())
 }

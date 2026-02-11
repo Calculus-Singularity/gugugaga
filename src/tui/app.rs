@@ -31,6 +31,20 @@ use super::widgets::{
     ContextPanel,
 };
 
+/// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
+/// This avoids panicking on multi-byte characters (e.g. CJK).
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk backwards from max_bytes to find a char boundary
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Application phase — welcome screen or main chat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppPhase {
@@ -273,6 +287,11 @@ impl App {
             let _ = event::read()?;
         }
 
+        // Minimum time the welcome screen must be displayed before
+        // accepting input (prevents accidental instant skip).
+        let welcome_start = std::time::Instant::now();
+        let welcome_min_display = Duration::from_millis(600);
+
         while !self.should_quit {
             match self.phase {
                 AppPhase::Welcome => {
@@ -284,11 +303,18 @@ impl App {
                         match event::read()? {
                             Event::Key(key) => {
                                 use crossterm::event::{KeyCode, KeyModifiers};
-                                // Ctrl+C → quit immediately
+
+                                // Ignore input during minimum display period
+                                // (except Ctrl+C which always works)
+                                let accept_input = welcome_start.elapsed() >= welcome_min_display;
+
+                                // Ctrl+C → quit immediately (always)
                                 if key.code == KeyCode::Char('c')
                                     && key.modifiers.contains(KeyModifiers::CONTROL)
                                 {
                                     self.should_quit = true;
+                                } else if !accept_input {
+                                    // Swallow key — too early
                                 } else if self.trust_ctx.is_some() {
                                     // Trust selection mode: only 1 or 2 advance
                                     match key.code {
@@ -333,8 +359,12 @@ impl App {
                         last_spinner_update = std::time::Instant::now();
                     }
                     
-                    // Draw UI
-                    self.draw()?;
+                    // Draw UI — wrap error for better diagnostics
+                    if let Err(e) = self.draw() {
+                        let msg = format!("draw() error: {e}\nmessage_count: {}\n", self.messages.len());
+                        let _ = std::fs::write("gugugaga-crash.log", &msg);
+                        return Err(e);
+                    }
 
                     // Poll for keyboard events with short timeout
                     if event::poll(poll_timeout)? {
@@ -820,7 +850,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, cmd)| {
-                    let preview = if cmd.len() > 60 { &cmd[..60] } else { cmd };
+                    let preview = truncate_utf8(cmd, 60);
                     format!("  [{}] {}", i + 1, preview)
                 })
                 .collect();
@@ -1480,7 +1510,7 @@ Make it comprehensive but concise."#;
             if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
                 // Show important events
                 if method.contains("error") || method.contains("Error") {
-                    let preview = if msg.len() > 200 { &msg[..200] } else { msg };
+                    let preview = truncate_utf8(msg, 200);
                     self.messages.push(Message::system(&format!("[{}] {}", method, preview)));
                 }
             }
@@ -1702,7 +1732,7 @@ Make it comprehensive but concise."#;
                                         .collect::<Vec<_>>()
                                         .join("\n");
                                     let truncated = if truncated.len() > MAX_OUTPUT_CHARS {
-                                        format!("{}...", &truncated[..MAX_OUTPUT_CHARS])
+                                        format!("{}...", truncate_utf8(&truncated, MAX_OUTPUT_CHARS))
                                     } else {
                                         truncated
                                     };
@@ -1714,7 +1744,7 @@ Make it comprehensive but concise."#;
                         // First line - just show beginning
                         let first_line = delta.lines().next().unwrap_or(delta);
                         let display = if first_line.len() > 80 {
-                            format!("{}...", &first_line[..80])
+                            format!("{}...", truncate_utf8(first_line, 80))
                         } else {
                             first_line.to_string()
                         };
@@ -1747,7 +1777,7 @@ Make it comprehensive but concise."#;
                                 let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("command");
                                 // Truncate long commands
                                 let cmd_display = if cmd.len() > 60 {
-                                    format!("{}...", &cmd[..60])
+                                    format!("{}...", truncate_utf8(&cmd, 60))
                                 } else {
                                     cmd.to_string()
                                 };
@@ -1789,7 +1819,7 @@ Make it comprehensive but concise."#;
                                             .and_then(|p| p.as_str())
                                             .unwrap_or("");
                                         let preview = if prompt.len() > 80 {
-                                            format!("{}...", &prompt[..80])
+                                            format!("{}...", truncate_utf8(&prompt, 80))
                                         } else {
                                             prompt.to_string()
                                         };
@@ -1878,13 +1908,13 @@ Make it comprehensive but concise."#;
                                             _ => "🤖"
                                         };
                                         let short_id = if agent_id.len() > 8 {
-                                            &agent_id[..8]
+                                            truncate_utf8(&agent_id, 8)
                                         } else {
                                             agent_id
                                         };
                                         if let Some(msg) = msg {
                                             let preview = if msg.len() > 100 {
-                                                format!("{}...", &msg[..100])
+                                                format!("{}...", truncate_utf8(&msg, 100))
                                             } else {
                                                 msg.to_string()
                                             };
@@ -2444,7 +2474,7 @@ Make it comprehensive but concise."#;
                             .iter()
                             .filter_map(|t| {
                                 let id = t.as_str()?.to_string();
-                                let short_id = if id.len() > 12 { &id[..12] } else { &id };
+                                let short_id = if id.len() > 12 { truncate_utf8(&id, 12) } else { &id };
                                 Some(PickerItem {
                                     id: id.clone(),
                                     title: format!("Thread {}", short_id),
