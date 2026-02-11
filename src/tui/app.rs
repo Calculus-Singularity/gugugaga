@@ -587,9 +587,6 @@ impl App {
             CodexCommand::Ps => {
                 self.show_background_processes();
             }
-            CodexCommand::Compact => {
-                self.request_compact().await;
-            }
 
             // === RPC commands (forward to Codex with correct method) ===
             CodexCommand::Model => {
@@ -745,23 +742,6 @@ impl App {
                 running.len(),
                 display.join("\n")
             )));
-        }
-    }
-
-    /// Request compact/summarize - sends a summarization prompt to compact context
-    async fn request_compact(&mut self) {
-        // The app-server does not expose a dedicated compact RPC.
-        // Codex's native TUI uses Op::Compact internally. We approximate by
-        // sending a turn with a compact/summarize instruction.
-        let msg = self.create_turn_message(
-            "Please summarize the conversation so far into a compact summary, \
-             preserving all important context, decisions, and pending tasks. \
-             This will help keep the context window manageable."
-        );
-        if let Some(tx) = &self.input_tx {
-            let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Compacting conversation..."));
-            self.is_processing = true;
         }
     }
 
