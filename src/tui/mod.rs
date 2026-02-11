@@ -3,6 +3,8 @@
 //! Provides a beautiful TUI for the Gugugaga, inspired by Codex CLI's design.
 
 mod app;
+pub mod ascii_animation;
+pub mod frames;
 mod input;
 mod picker;
 mod shimmer;

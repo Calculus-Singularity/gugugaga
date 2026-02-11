@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::memory::GugugagaNotebook;
 
+use super::ascii_animation::AsciiAnimation;
 use super::input::{InputAction, InputState};
 use super::picker::{Picker, PickerItem};
 use super::slash_commands::{parse_command, CodexCommand, ParsedCommand, SlashPopup, GugugagaCommand};
@@ -29,6 +30,18 @@ use super::widgets::{
     render_message_lines, HeaderBar, HelpBar, InputBox, Message, MessageRole, StatusBar,
     ContextPanel,
 };
+
+/// Application phase — welcome screen or main chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppPhase {
+    Welcome,
+    Chat,
+}
+
+/// Minimum terminal dimensions for showing the animation.
+/// Frame is 17 rows × 42 cols; leave room for 3 lines of text below.
+const MIN_ANIMATION_WIDTH: u16 = 44;
+const MIN_ANIMATION_HEIGHT: u16 = 20;
 
 /// Current picker mode
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,11 +154,24 @@ pub struct App {
     notebook_mistakes_count: usize,
     /// Gugugaga thinking status (shown in status bar, like Codex's StatusIndicatorWidget)
     gugugaga_status: Option<String>,
+    /// Current application phase (Welcome animation → Chat).
+    phase: AppPhase,
+    /// ASCII art animation for the welcome screen.
+    animation: AsciiAnimation,
+    /// Trust onboarding context. `Some` = user still needs to choose.
+    trust_ctx: Option<crate::trust::TrustContext>,
 }
 
 impl App {
-    /// Create a new App instance
-    pub fn new(project_name: String, cwd: String) -> io::Result<Self> {
+    /// Create a new App instance.
+    ///
+    /// If `trust_ctx` is `Some`, the Welcome phase will show the trust
+    /// selection UI alongside the animation (matching Codex's onboarding).
+    pub fn new(
+        project_name: String,
+        cwd: String,
+        trust_ctx: Option<crate::trust::TrustContext>,
+    ) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         // Note: NOT using EnableMouseCapture so users can still select/copy text
@@ -157,9 +183,8 @@ impl App {
             terminal,
             input: InputState::new(),
             messages: vec![
-                Message::system("🛡️ Gugugaga initialized. Monitoring enabled."),
+                Message::system("Gugugaga initialized. Monitoring enabled."),
                 Message::system("Commands: /cmd = Codex, //cmd = Gugugaga. Tab to autocomplete."),
-                Message::system("Violations will be detected and reported automatically."),
             ],
             scroll_offset: 0,
             spinner_frame: 0,
@@ -192,6 +217,9 @@ impl App {
             notebook_attention_items: Vec::new(),
             notebook_mistakes_count: 0,
             gugugaga_status: None,
+            phase: AppPhase::Welcome,
+            animation: AsciiAnimation::new(),
+            trust_ctx,
         })
     }
 
@@ -228,6 +256,7 @@ impl App {
     pub async fn run(&mut self) -> io::Result<()> {
         // Short poll timeout for responsive UI - check for messages frequently
         let poll_timeout = Duration::from_millis(16); // ~60fps responsiveness
+        let animation_poll = Duration::from_millis(80); // Match animation frame rate
         let mut last_spinner_update = std::time::Instant::now();
         let spinner_interval = Duration::from_millis(80);
         
@@ -238,26 +267,81 @@ impl App {
         let _ = io::Write::write_all(&mut io::stdout(), b"\x1b[?1007h");
         let _ = io::Write::flush(&mut io::stdout());
 
-        while !self.should_quit {
-            // Check for new messages first (non-blocking)
-            self.check_output().await;
-            
-            // Update notebook cache for display
-            self.update_notebook_cache().await;
-            
-            // Update spinner at fixed interval
-            if last_spinner_update.elapsed() >= spinner_interval {
-                self.spinner_frame = self.spinner_frame.wrapping_add(1);
-                last_spinner_update = std::time::Instant::now();
-            }
-            
-            // Draw UI
-            self.draw()?;
+        // Drain any events queued during terminal setup so they don't
+        // trigger an immediate transition out of the Welcome screen.
+        while event::poll(Duration::from_millis(0))? {
+            let _ = event::read()?;
+        }
 
-            // Poll for keyboard events with short timeout
-            if event::poll(poll_timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    self.handle_input(key).await;
+        while !self.should_quit {
+            match self.phase {
+                AppPhase::Welcome => {
+                    // ── Welcome screen phase ────────────────────────────
+                    self.draw_welcome()?;
+
+                    // Poll with animation frame rate
+                    if event::poll(animation_poll)? {
+                        match event::read()? {
+                            Event::Key(key) => {
+                                use crossterm::event::{KeyCode, KeyModifiers};
+                                // Ctrl+C → quit immediately
+                                if key.code == KeyCode::Char('c')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                                {
+                                    self.should_quit = true;
+                                } else if self.trust_ctx.is_some() {
+                                    // Trust selection mode: only 1 or 2 advance
+                                    match key.code {
+                                        KeyCode::Char('1') => {
+                                            if let Some(ctx) = self.trust_ctx.take() {
+                                                let _ = crate::trust::write_trust_decision(&ctx, true);
+                                            }
+                                            self.phase = AppPhase::Chat;
+                                            self.terminal.clear()?;
+                                        }
+                                        KeyCode::Char('2') => {
+                                            if let Some(ctx) = self.trust_ctx.take() {
+                                                let _ = crate::trust::write_trust_decision(&ctx, false);
+                                            }
+                                            self.phase = AppPhase::Chat;
+                                            self.terminal.clear()?;
+                                        }
+                                        _ => {} // ignore other keys
+                                    }
+                                } else {
+                                    // No trust needed — any key advances
+                                    self.phase = AppPhase::Chat;
+                                    self.terminal.clear()?;
+                                }
+                            }
+                            // Silently consume non-key events
+                            _ => {}
+                        }
+                    }
+                }
+                AppPhase::Chat => {
+                    // ── Main chat phase ──────────────────────────────────
+                    // Check for new messages first (non-blocking)
+                    self.check_output().await;
+                    
+                    // Update notebook cache for display
+                    self.update_notebook_cache().await;
+                    
+                    // Update spinner at fixed interval
+                    if last_spinner_update.elapsed() >= spinner_interval {
+                        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                        last_spinner_update = std::time::Instant::now();
+                    }
+                    
+                    // Draw UI
+                    self.draw()?;
+
+                    // Poll for keyboard events with short timeout
+                    if event::poll(poll_timeout)? {
+                        if let Event::Key(key) = event::read()? {
+                            self.handle_input(key).await;
+                        }
+                    }
                 }
             }
         }
@@ -2576,6 +2660,93 @@ Make it comprehensive but concise."#;
 
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+    }
+
+    /// Render the animated welcome screen with optional trust selection.
+    ///
+    /// Bypasses ratatui's double-buffered diff rendering and writes directly
+    /// to the terminal via crossterm so that every animation frame is fully
+    /// flushed.
+    fn draw_welcome(&mut self) -> io::Result<()> {
+        use crossterm::{cursor, terminal as ct, QueueableCommand};
+        use std::io::Write as _;
+
+        let frame_text = self.animation.current_frame();
+        let mut stdout = io::stdout();
+
+        stdout.queue(cursor::MoveTo(0, 0))?;
+        stdout.queue(ct::Clear(ct::ClearType::All))?;
+
+        let (term_w, term_h) = ct::size()?;
+        let show_animation = term_w >= MIN_ANIMATION_WIDTH && term_h >= MIN_ANIMATION_HEIGHT;
+
+        // ── Animation ──
+        if show_animation {
+            for line in frame_text.lines() {
+                write!(stdout, "{}\r\n", line)?;
+            }
+            write!(stdout, "\r\n")?;
+        }
+
+        // ── Welcome text ──
+        write!(
+            stdout,
+            "  Welcome to \x1b[1;36mGugugaga\x1b[0m, Codex Supervisor Agent\r\n"
+        )?;
+        write!(stdout, "\r\n")?;
+
+        // ── Trust selection (if needed) or "press any key" ──
+        if let Some(ctx) = &self.trust_ctx {
+            write!(
+                stdout,
+                "  You are running Gugugaga in \x1b[1m{}\x1b[0m\r\n",
+                ctx.display_path
+            )?;
+            write!(stdout, "\r\n")?;
+
+            if ctx.is_git {
+                write!(
+                    stdout,
+                    "  Since this folder is version controlled, you may wish to allow\r\n"
+                )?;
+                write!(
+                    stdout,
+                    "  Codex to work in this folder without asking for approval.\r\n"
+                )?;
+            } else {
+                write!(
+                    stdout,
+                    "  Since this folder is \x1b[33mnot version controlled\x1b[0m, we recommend\r\n"
+                )?;
+                write!(
+                    stdout,
+                    "  requiring approval of all edits and commands.\r\n"
+                )?;
+            }
+
+            write!(stdout, "\r\n")?;
+            write!(
+                stdout,
+                "  \x1b[1;32m[1]\x1b[0m Allow Codex to work without asking for approval\r\n"
+            )?;
+            write!(
+                stdout,
+                "  \x1b[1;33m[2]\x1b[0m Require approval of edits and commands\r\n"
+            )?;
+            write!(stdout, "\r\n")?;
+            write!(
+                stdout,
+                "\x1b[90m  Press 1 or 2 \u{2022} Ctrl+C to quit\x1b[0m"
+            )?;
+        } else {
+            write!(
+                stdout,
+                "\x1b[90m  Press any key to continue \u{2022} Ctrl+C to quit\x1b[0m"
+            )?;
+        }
+
+        stdout.flush()?;
+        Ok(())
     }
 
     fn draw(&mut self) -> io::Result<()> {

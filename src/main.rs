@@ -4,14 +4,13 @@
 
 use clap::Parser;
 use gugugaga::{Interceptor, GugugagaConfig};
+use gugugaga::trust;
 use gugugaga::tui::App;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-
-mod trust;
 
 /// Gugugaga - Monitor and correct Codex behavior
 #[derive(Parser, Debug)]
@@ -73,10 +72,10 @@ async fn run_tui_mode(
     codex_home: PathBuf,
     project_name: String,
 ) -> anyhow::Result<()> {
-    // ── Trust directory onboarding (aligned with Codex) ──
-    // If the project has no trust_level in ~/.codex/config.toml, ask the user
-    // before spawning app-server, exactly like Codex does.
-    trust::ensure_trust_decision(&codex_home, &cwd)?;
+    // ── Trust directory onboarding ──
+    // Check if trust decision is needed — actual prompt is shown in the TUI
+    // Welcome phase (animation + trust UI together, like Codex).
+    let trust_ctx = trust::check_trust(&codex_home, &cwd);
 
     // Create config
     let mut config = GugugagaConfig::new(cwd.clone(), codex_home)
@@ -89,7 +88,7 @@ async fn run_tui_mode(
 
     // Create TUI app
     let cwd_str = cwd.to_string_lossy().to_string();
-    let mut app = App::new(project_name, cwd_str)?;
+    let mut app = App::new(project_name, cwd_str, trust_ctx)?;
 
     // Setup channels for communication
     let (user_input_tx, user_input_rx) = mpsc::channel::<String>(32);
