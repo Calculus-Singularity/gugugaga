@@ -139,6 +139,8 @@ pub struct App {
     notebook_completed_count: usize,
     notebook_attention_items: Vec<(String, bool)>, // (content, is_high_priority)
     notebook_mistakes_count: usize,
+    /// Gugugaga thinking status (shown in status bar, like Codex's StatusIndicatorWidget)
+    gugugaga_status: Option<String>,
 }
 
 impl App {
@@ -189,6 +191,7 @@ impl App {
             notebook_completed_count: 0,
             notebook_attention_items: Vec::new(),
             notebook_mistakes_count: 0,
+            gugugaga_status: None,
         })
     }
 
@@ -1931,33 +1934,25 @@ Make it comprehensive but concise."#;
                     }
                 }
                 "gugugaga/thinking" => {
-                    // Show gugugaga thinking/reasoning
+                    // Update status bar instead of pushing inline messages (aligned with Codex)
                     if let Some(msg) = json
                         .get("params")
                         .and_then(|p| p.get("message"))
                         .and_then(|m| m.as_str())
                     {
-                        self.messages.push(Message::thinking(&format!("🛡️ {}", msg)));
-                        self.scroll_to_bottom();
+                        self.gugugaga_status = Some(msg.to_string());
                     }
                 }
                 "gugugaga/check" => {
+                    // Clear gugugaga status (thinking is done)
+                    self.gugugaga_status = None;
+
                     // Show supervision check result with Markdown support
                     if let Some(status) = json
                         .get("params")
                         .and_then(|p| p.get("status"))
                         .and_then(|s| s.as_str())
                     {
-                        // Show thinking if present
-                        if let Some(thinking) = json
-                            .get("params")
-                            .and_then(|p| p.get("thinking"))
-                            .and_then(|t| t.as_str())
-                        {
-                            if !thinking.is_empty() {
-                                self.messages.push(Message::thinking(&format!("🛡️ {}", thinking)));
-                            }
-                        }
 
                         let msg = json
                             .get("params")
@@ -2602,6 +2597,7 @@ Make it comprehensive but concise."#;
         let notebook_completed_count = &self.notebook_completed_count;
         let notebook_attention_items = &self.notebook_attention_items;
         let notebook_mistakes_count = &self.notebook_mistakes_count;
+        let gugugaga_status = &self.gugugaga_status;
 
         self.terminal.draw(|f| {
             let size = f.area();
@@ -2633,9 +2629,12 @@ Make it comprehensive but concise."#;
 
             // Status bar
             let status = StatusBar {
-                is_processing,
+                is_processing: is_processing || gugugaga_status.is_some(),
                 spinner_frame,
-                status_text: if is_processing {
+                status_text: if let Some(gs) = gugugaga_status {
+                    // Gugugaga is thinking — show its status (like Codex's StatusIndicatorWidget)
+                    format!("Supervising: {} (Esc to interrupt)", gs)
+                } else if is_processing {
                     "Thinking... (Esc to interrupt)".to_string()
                 } else if is_paused {
                     "Monitoring paused".to_string()

@@ -109,6 +109,7 @@ impl Interceptor {
         let output_tx_clone = output_tx.clone();
         let to_server_tx_clone = to_server_tx.clone();
         let memory = self.memory.clone();
+        let notebook = self.notebook.clone();
         let gugugaga_agent = self.gugugaga_agent.clone();
         let config = self.config.clone();
 
@@ -216,6 +217,7 @@ impl Interceptor {
                         let action = Self::process_server_message(
                             &msg,
                             &memory,
+                            &notebook,
                             &gugugaga_agent,
                             &violation_detector,
                             &config,
@@ -416,6 +418,7 @@ impl Interceptor {
     async fn process_server_message(
         msg: &Value,
         memory: &Arc<RwLock<PersistentMemory>>,
+        notebook: &Arc<RwLock<GugugagaNotebook>>,
         gugugaga_agent: &Arc<GugugagaAgent>,
         violation_detector: &ViolationDetector,
         config: &GugugagaConfig,
@@ -487,12 +490,13 @@ impl Interceptor {
                 match eval_result {
                     Ok(result) => {
                         if let Some(violation) = result.violation {
-                            // Record mistake to notebook
+                            // Record mistake to GugugagaNotebook (not PersistentMemory)
                             {
-                                let mut mem = memory.write().await;
-                                let _ = mem.record_mistake(
-                                    &violation.description,
-                                    &violation.correction
+                                let mut nb = notebook.write().await;
+                                let _ = nb.record_mistake(
+                                    violation.description.clone(),
+                                    violation.correction.clone(),
+                                    format!("Codex violated: {}", violation.description),
                                 ).await;
                             }
                             // Found a violation - send correction directly to Codex

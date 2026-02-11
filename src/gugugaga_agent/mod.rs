@@ -9,9 +9,10 @@ pub use evaluator::{Evaluator, GugugagaThinking, ParsedResponse};
 pub use responder::Responder;
 
 use crate::memory::{
-    ContextBuilder, PersistentMemory, GugugagaNotebook,
+    ContextBuilder, Compactor, PersistentMemory, GugugagaNotebook,
     Priority, AttentionSource,
 };
+use crate::memory::compact::DEFAULT_CONTEXT_WINDOW;
 use crate::rules::Violation;
 use crate::Result;
 use std::path::{Path, PathBuf};
@@ -98,10 +99,29 @@ impl GugugagaAgent {
         self.responder.parse_evaluation_response(&response)
     }
 
-    /// Detect violations in agent output with tool call support
+    /// Detect violations in agent output with tool call support.
+    ///
+    /// Includes compaction aligned with Codex:
+    /// - Before first LLM call: compact conversation history if token usage >= 90%
+    /// - After each LLM call with tool follow-up: compact tool results if too large
     pub async fn detect_violation(&self, agent_message: &str) -> Result<CheckResult> {
+        // ── Pre-call compaction (aligned with Codex: check at turn start) ──
+        {
+            let mut memory = self.memory.write().await;
+            let total_tokens = memory.history_token_usage();
+            let _ = Compactor::compact_history_if_needed(
+                &self.evaluator,
+                DEFAULT_CONTEXT_WINDOW,
+                total_tokens,
+                memory.conversation_history_mut(),
+            )
+            .await;
+        }
+
         let mut tool_results: Vec<String> = Vec::new();
         let mut last_thinking: Option<String>;
+        // Token budget for accumulated tool results before compaction
+        const TOOL_RESULTS_MAX_TOKENS: usize = 6_000;
 
         loop {
             let prompt = {
@@ -109,10 +129,10 @@ impl GugugagaAgent {
                 let notebook = self.notebook.read().await;
                 let context_builder = ContextBuilder::new(&memory).with_notebook(&notebook);
                 let mut p = context_builder.for_violation_detection(agent_message);
-                
+
                 // Append tool results if any
                 if !tool_results.is_empty() {
-                    p.push_str("\n\n=== Tool call result ===\n");
+                    p.push_str("\n\n=== Tool call results ===\n");
                     p.push_str(&tool_results.join("\n"));
                 }
                 p
@@ -125,6 +145,16 @@ impl GugugagaAgent {
             // Check for tool calls
             if let Some(tool_result) = self.execute_tool_call(response).await {
                 tool_results.push(tool_result);
+
+                // ── Mid-loop compaction (aligned with Codex: after sampling, if needs follow-up) ──
+                // Compact tool results if they've grown too large
+                let _ = Compactor::compact_tool_results_if_needed(
+                    &self.evaluator,
+                    &mut tool_results,
+                    TOOL_RESULTS_MAX_TOKENS,
+                )
+                .await;
+
                 continue;
             }
 
@@ -143,7 +173,7 @@ impl GugugagaAgent {
         let args = caps.get(2)?.as_str().trim().trim_matches('"').trim_matches('\'');
 
         match tool_name {
-            // === Memory tools ===
+            // === History query tools ===
             "search_history" => {
                 let memory = self.memory.read().await;
                 match memory.search_history(args).await {
@@ -151,45 +181,79 @@ impl GugugagaAgent {
                         if results.is_empty() {
                             Some(format!("search_history(\"{}\"): No results", args))
                         } else {
+                            let total = results.len();
                             let summaries: Vec<String> = results
                                 .iter()
-                                .take(5)
-                                .map(|t| format!("[{:?}] {}", t.role, &t.content[..t.content.len().min(100)]))
+                                .take(10)
+                                .map(|t| {
+                                    let preview = &t.content[..t.content.len().min(500)];
+                                    format!("[{:?} @ {}] {}", t.role, t.timestamp.format("%H:%M"), preview)
+                                })
                                 .collect();
-                            Some(format!("search_history(\"{}\"): {} results\n{}", args, results.len(), summaries.join("\n")))
+                            Some(format!(
+                                "search_history(\"{}\"): {} results (showing first {})\n{}",
+                                args, total, summaries.len(), summaries.join("\n---\n")
+                            ))
                         }
                     }
                     Err(_) => Some(format!("search_history(\"{}\"): Search failed", args)),
                 }
             }
-            "set_focus" => {
-                let mut memory = self.memory.write().await;
-                match memory.set_focus(args).await {
-                    Ok(_) => Some(format!("set_focus(\"{}\"): Focus set", args)),
-                    Err(_) => Some(format!("set_focus(\"{}\"): Set failed", args)),
-                }
-            }
-            "add_context" => {
-                let mut memory = self.memory.write().await;
-                match memory.add_key_context(args).await {
-                    Ok(_) => Some(format!("add_context(\"{}\"): Added to key context", args)),
-                    Err(_) => Some(format!("add_context(\"{}\"): Add failed", args)),
-                }
-            }
-            "record_mistake" => {
-                // Format: what|lesson
-                let parts: Vec<&str> = args.splitn(2, '|').collect();
-                if parts.len() == 2 {
-                    let mut memory = self.memory.write().await;
-                    match memory.record_mistake(parts[0].trim(), parts[1].trim()).await {
-                        Ok(_) => Some(format!("record_mistake: Mistake recorded")),
-                        Err(_) => Some(format!("record_mistake: Record failed")),
+            "read_recent" => {
+                let n: usize = args.parse().unwrap_or(5).min(20);
+                let memory = self.memory.read().await;
+                match memory.read_recent_turns(n).await {
+                    Ok(turns) => {
+                        if turns.is_empty() {
+                            Some("read_recent: No history available".to_string())
+                        } else {
+                            let formatted: Vec<String> = turns
+                                .iter()
+                                .enumerate()
+                                .map(|(i, t)| {
+                                    format!("#{} [{:?} @ {}] {}", i, t.role, t.timestamp.format("%H:%M"), t.content)
+                                })
+                                .collect();
+                            Some(format!(
+                                "read_recent({}): {} turns\n{}",
+                                n, turns.len(), formatted.join("\n---\n")
+                            ))
+                        }
                     }
-                } else {
-                    Some("record_mistake: Format error, should be what|lesson".to_string())
+                    Err(e) => Some(format!("read_recent({}): Error: {}", n, e)),
                 }
             }
-            
+            "read_turn" => {
+                let index: usize = match args.parse() {
+                    Ok(i) => i,
+                    Err(_) => return Some(format!("read_turn(\"{}\"): Invalid index", args)),
+                };
+                let memory = self.memory.read().await;
+                match memory.read_turn_at(index).await {
+                    Ok(Some(turn)) => {
+                        Some(format!(
+                            "read_turn({}): [{:?} @ {}]\n{}",
+                            index, turn.role, turn.timestamp.format("%H:%M:%S"), turn.content
+                        ))
+                    }
+                    Ok(None) => Some(format!("read_turn({}): Turn not found", index)),
+                    Err(e) => Some(format!("read_turn({}): Error: {}", index, e)),
+                }
+            }
+            "history_stats" => {
+                let memory = self.memory.read().await;
+                match memory.total_turns().await {
+                    Ok(total) => {
+                        let in_memory = memory.conversation_history.len();
+                        let in_memory_tokens = memory.history_token_usage();
+                        Some(format!(
+                            "history_stats: {} total turns in archive, {} in memory ({} tokens)",
+                            total, in_memory, in_memory_tokens
+                        ))
+                    }
+                    Err(e) => Some(format!("history_stats: Error: {}", e)),
+                }
+            }
             // === Notebook tools (persistent, never compacted) ===
             "update_notebook" => {
                 self.handle_update_notebook(args).await

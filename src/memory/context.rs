@@ -97,11 +97,11 @@ Notebook tools (persistent, never lost):
 - TOOL: add_attention("content|priority")
 - TOOL: notebook_mistake("what|how_corrected|lesson")
 
-Memory tools:
-- TOOL: search_history("keyword") - Search conversation history
-- TOOL: set_focus("current task description") - Update current focus
-- TOOL: add_context("important info") - Add key context
-- TOOL: record_mistake("issue|lesson") - Record mistakes
+History tools (full conversation archive, never lost):
+- TOOL: search_history("keyword") - Search all past conversations by keyword
+- TOOL: read_recent("5") - Read the most recent N turns (default 5, max 20)
+- TOOL: read_turn("3") - Read a specific turn by index (0-based)
+- TOOL: history_stats() - Get total turn count and token usage
 
 File system tools (read-only, for verification):
 - TOOL: read_file("path") or read_file("path|offset|limit") - Read file content

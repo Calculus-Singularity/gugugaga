@@ -8,10 +8,6 @@ use tokio::io::AsyncWriteExt;
 
 /// Approximate bytes per token for context estimation
 const APPROX_BYTES_PER_TOKEN: usize = 4;
-/// Max tokens for recent conversation history
-const MAX_HISTORY_TOKENS: usize = 4000;
-/// Max conversation turns to keep in memory
-const MAX_HISTORY_TURNS: usize = 10;
 
 /// Persistent memory that survives context compaction
 #[derive(Debug, Clone)]
@@ -31,9 +27,6 @@ pub struct PersistentMemory {
     /// Agent behavior log (recent entries)
     pub behavior_log: Vec<BehaviorEntry>,
 
-    /// Agent's notebook - mistakes, learnings, current focus
-    pub notebook: AgentNotebook,
-
     /// Recent conversation history (user + codex messages)
     pub conversation_history: Vec<ConversationTurn>,
 
@@ -41,25 +34,6 @@ pub struct PersistentMemory {
     conversation_archive_path: PathBuf,
 }
 
-/// Agent's self-maintained notebook
-#[derive(Debug, Clone, Default)]
-pub struct AgentNotebook {
-    /// Mistakes made and lessons learned
-    pub mistakes: Vec<MistakeEntry>,
-    /// What the agent is currently focused on
-    pub current_focus: Option<String>,
-    /// Important context to remember
-    pub key_context: Vec<String>,
-    /// Last updated timestamp
-    pub last_updated: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MistakeEntry {
-    pub timestamp: DateTime<Utc>,
-    pub what_happened: String,
-    pub lesson_learned: String,
-}
 
 #[derive(Debug, Clone)]
 pub struct ConversationTurn {
@@ -114,7 +88,6 @@ impl PersistentMemory {
             current_task: None,
             decisions: Vec::new(),
             behavior_log: Vec::new(),
-            notebook: AgentNotebook::default(),
             conversation_history: Vec::new(),
             conversation_archive_path: archive_path,
         };
@@ -150,30 +123,20 @@ impl PersistentMemory {
         // Archive to file for search
         self.archive_turn(&turn).await?;
 
-        // Add to recent history
+        // Add to recent history (compaction is handled externally by Compactor)
         self.conversation_history.push(turn);
-
-        // Trim history if too long (by turns or tokens)
-        self.trim_history();
 
         Ok(())
     }
 
-    /// Trim conversation history to fit within limits
-    fn trim_history(&mut self) {
-        // First, limit by turn count
-        while self.conversation_history.len() > MAX_HISTORY_TURNS {
-            self.conversation_history.remove(0);
-        }
+    /// Estimate total token usage of conversation history
+    pub fn history_token_usage(&self) -> usize {
+        self.conversation_history.iter().map(|t| t.tokens).sum()
+    }
 
-        // Then, limit by token count
-        let mut total_tokens: usize = self.conversation_history.iter().map(|t| t.tokens).sum();
-        while total_tokens > MAX_HISTORY_TOKENS && !self.conversation_history.is_empty() {
-            if let Some(removed) = self.conversation_history.first() {
-                total_tokens -= removed.tokens;
-            }
-            self.conversation_history.remove(0);
-        }
+    /// Get mutable access to conversation history (for compaction)
+    pub fn conversation_history_mut(&mut self) -> &mut Vec<ConversationTurn> {
+        &mut self.conversation_history
     }
 
     /// Archive a turn to the JSONL file for later search
@@ -237,39 +200,6 @@ impl PersistentMemory {
         Ok(results)
     }
 
-    /// Update agent notebook - record a mistake
-    pub async fn record_mistake(&mut self, what_happened: &str, lesson: &str) -> Result<()> {
-        self.notebook.mistakes.push(MistakeEntry {
-            timestamp: Utc::now(),
-            what_happened: what_happened.to_string(),
-            lesson_learned: lesson.to_string(),
-        });
-        self.notebook.last_updated = Some(Utc::now());
-        // Keep only recent mistakes (last 10)
-        if self.notebook.mistakes.len() > 10 {
-            self.notebook.mistakes.remove(0);
-        }
-        self.save().await
-    }
-
-    /// Update agent notebook - set current focus
-    pub async fn set_focus(&mut self, focus: &str) -> Result<()> {
-        self.notebook.current_focus = Some(focus.to_string());
-        self.notebook.last_updated = Some(Utc::now());
-        self.save().await
-    }
-
-    /// Update agent notebook - add key context
-    pub async fn add_key_context(&mut self, context: &str) -> Result<()> {
-        self.notebook.key_context.push(context.to_string());
-        self.notebook.last_updated = Some(Utc::now());
-        // Keep only recent context (last 20)
-        if self.notebook.key_context.len() > 20 {
-            self.notebook.key_context.remove(0);
-        }
-        self.save().await
-    }
-
     /// Get recent conversation as formatted string for prompt
     pub fn recent_conversation_str(&self) -> String {
         self.conversation_history
@@ -286,27 +216,71 @@ impl PersistentMemory {
             .join("\n\n")
     }
 
-    /// Get notebook as formatted string for prompt
-    pub fn notebook_str(&self) -> String {
-        let mut parts = Vec::new();
-
-        if let Some(focus) = &self.notebook.current_focus {
-            parts.push(format!("Current Task: {}", focus));
+    /// Read the most recent N turns from the JSONL archive (full content).
+    pub async fn read_recent_turns(&self, n: usize) -> Result<Vec<ConversationTurn>> {
+        if !self.conversation_archive_path.exists() {
+            return Ok(Vec::new());
         }
-
-        if !self.notebook.mistakes.is_empty() {
-            let mistakes: Vec<String> = self.notebook.mistakes
-                .iter()
-                .map(|m| format!("- {}: {}", m.what_happened, m.lesson_learned))
-                .collect();
-            parts.push(format!("Past Mistakes:\n{}", mistakes.join("\n")));
+        let content = fs::read_to_string(&self.conversation_archive_path).await?;
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines.len().saturating_sub(n);
+        let mut turns = Vec::new();
+        for line in &lines[start..] {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                turns.push(Self::parse_archive_line(&json));
+            }
         }
+        Ok(turns)
+    }
 
-        if !self.notebook.key_context.is_empty() {
-            parts.push(format!("Key Context:\n- {}", self.notebook.key_context.join("\n- ")));
+    /// Read a specific turn by index (0-based) from the JSONL archive.
+    pub async fn read_turn_at(&self, index: usize) -> Result<Option<ConversationTurn>> {
+        if !self.conversation_archive_path.exists() {
+            return Ok(None);
         }
+        let content = fs::read_to_string(&self.conversation_archive_path).await?;
+        let line = content.lines().nth(index);
+        Ok(line.and_then(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .map(|json| Self::parse_archive_line(&json))
+        }))
+    }
 
-        parts.join("\n\n")
+    /// Count total turns in the JSONL archive.
+    pub async fn total_turns(&self) -> Result<usize> {
+        if !self.conversation_archive_path.exists() {
+            return Ok(0);
+        }
+        let content = fs::read_to_string(&self.conversation_archive_path).await?;
+        Ok(content.lines().filter(|l| !l.trim().is_empty()).count())
+    }
+
+    /// Parse a single JSONL line from the archive into a ConversationTurn.
+    fn parse_archive_line(json: &serde_json::Value) -> ConversationTurn {
+        let role = match json.get("role").and_then(|r| r.as_str()) {
+            Some("User") => TurnRole::User,
+            Some("Codex") => TurnRole::Codex,
+            _ => TurnRole::Gugugaga,
+        };
+        let content = json
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let timestamp = json
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        let tokens = Self::estimate_tokens(&content);
+        ConversationTurn {
+            timestamp,
+            role,
+            content,
+            tokens,
+        }
     }
 
     /// Load memory from file
@@ -571,14 +545,6 @@ impl PersistentMemory {
     /// Build complete context for gugugaga LLM
     pub fn build_context(&self) -> String {
         let mut context = String::new();
-
-        // Agent notebook (most important - mistakes and focus)
-        let notebook = self.notebook_str();
-        if !notebook.is_empty() {
-            context.push_str("=== Gugugaga Notes ===\n");
-            context.push_str(&notebook);
-            context.push_str("\n\n");
-        }
 
         // User instructions
         if !self.user_instructions.is_empty() {
