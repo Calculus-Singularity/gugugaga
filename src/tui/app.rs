@@ -1709,15 +1709,15 @@ Make it comprehensive but concise."#;
                     }
                 }
                 "item/commandExecution/outputDelta" => {
-                    // Command execution output streaming - limit display
+                    // Command execution output streaming
                     if let Some(delta) = json
                         .get("params")
                         .and_then(|p| p.get("delta"))
                         .and_then(|t| t.as_str())
                     {
                         self.is_processing = true;
-                        const MAX_OUTPUT_LINES: usize = 10;
-                        const MAX_OUTPUT_CHARS: usize = 500;
+                        const MAX_OUTPUT_LINES: usize = 50;
+                        const MAX_OUTPUT_CHARS: usize = 4000;
                         
                         if let Some(last) = self.messages.last_mut() {
                             if last.role == MessageRole::CommandExec {
@@ -1746,14 +1746,7 @@ Make it comprehensive but concise."#;
                                 return;
                             }
                         }
-                        // First line - just show beginning
-                        let first_line = delta.lines().next().unwrap_or(delta);
-                        let display = if first_line.len() > 80 {
-                            format!("{}...", truncate_utf8(first_line, 80))
-                        } else {
-                            first_line.to_string()
-                        };
-                        self.messages.push(Message::command_exec(display));
+                        self.messages.push(Message::command_exec(delta));
                     }
                 }
                 "item/fileChange/outputDelta" => {
@@ -1771,6 +1764,35 @@ Make it comprehensive but concise."#;
                             }
                         }
                         self.messages.push(Message::file_change(delta));
+                    }
+                }
+                "turn/diff/updated" => {
+                    // Turn-level unified diff — the aggregated diff of all file
+                    // changes so far in this turn (same as what Codex CLI shows).
+                    if let Some(diff) = json
+                        .get("params")
+                        .and_then(|p| p.get("diff"))
+                        .and_then(|d| d.as_str())
+                    {
+                        if !diff.trim().is_empty() {
+                            // Replace any existing turn diff message, or create new one.
+                            // We look for the last FileChange message that starts with
+                            // our marker so we replace instead of appending on each update.
+                            let marker = "[turn diff]";
+                            let new_content = format!("{}\n{}", marker, diff);
+                            let replaced = self.messages.iter_mut().rev().any(|m| {
+                                if m.role == MessageRole::FileChange && m.content.starts_with(marker) {
+                                    m.content = new_content.clone();
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            if !replaced {
+                                self.messages.push(Message::file_change(&new_content));
+                            }
+                            self.scroll_to_bottom();
+                        }
                     }
                 }
                 "item/started" => {
@@ -1960,16 +1982,7 @@ Make it comprehensive but concise."#;
                         }
                     }
                 }
-                "turn/diff/updated" => {
-                    // Diff update - show in file change format
-                    if let Some(diff) = json.get("params").and_then(|p| p.get("diff")).and_then(|d| d.as_str()) {
-                        if !diff.is_empty() {
-                            // Only show a summary, not the full diff
-                            let line_count = diff.lines().count();
-                            self.messages.push(Message::system(&format!("Diff updated ({} lines)", line_count)));
-                        }
-                    }
-                }
+                // "turn/diff/updated" handled above (near item/fileChange/outputDelta)
                 "turn/started" => {
                     self.is_processing = true;
                     self.current_turn_violations = 0;
