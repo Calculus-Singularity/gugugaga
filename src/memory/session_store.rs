@@ -1,9 +1,8 @@
 //! Per-thread session state caching.
 //!
-//! Like Codex, each thread/conversation gets its own cached session state.
-//! When a new thread starts, we begin clean. When resuming an existing thread,
-//! we restore that thread's saved state. Data is never lost — it's archived
-//! per thread_id.
+//! ALL state lives inside each thread's session. There is NO global persistent
+//! state across conversations. New thread = blank slate. Resume thread = full
+//! restore. Each session is saved to sessions/{thread_id}.json on exit.
 
 use crate::Result;
 use chrono::{DateTime, Utc};
@@ -13,23 +12,28 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-use super::notebook::{AttentionItem, AttentionSource, CompletedItem, GugugagaNotebook};
-use super::persistent::{BehaviorEntry, PersistentMemory, TaskObjective};
+use super::notebook::{AttentionItem, CompletedItem, GugugagaNotebook, MistakeEntry};
+use super::persistent::{
+    BehaviorEntry, ConversationTurn, Decision, PersistentMemory, TaskObjective, UserInstruction,
+};
 
-/// Snapshot of session-scoped state from PersistentMemory.
+/// Full snapshot of PersistentMemory (everything, not just "session-scoped").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemorySnapshot {
+    pub user_instructions: Vec<UserInstruction>,
     pub current_task: Option<TaskObjective>,
+    pub decisions: Vec<Decision>,
     pub behavior_log: Vec<BehaviorEntry>,
+    pub conversation_history: Vec<ConversationTurn>,
 }
 
-/// Snapshot of session-scoped state from GugugagaNotebook.
+/// Full snapshot of GugugagaNotebook (everything).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotebookSnapshot {
     pub current_activity: Option<String>,
     pub completed: Vec<CompletedItem>,
-    /// Inference-based attention items (session-scoped).
-    pub inference_attention: Vec<AttentionItem>,
+    pub attention: Vec<AttentionItem>,
+    pub mistakes: Vec<MistakeEntry>,
 }
 
 /// Combined session snapshot saved per thread.
@@ -57,7 +61,7 @@ impl SessionStore {
         Ok(Self { sessions_dir })
     }
 
-    /// Save the current session state for a given thread.
+    /// Save the FULL current state for a given thread.
     pub async fn save(
         &self,
         thread_id: &str,
@@ -68,18 +72,17 @@ impl SessionStore {
             thread_id: thread_id.to_string(),
             saved_at: Utc::now(),
             memory: MemorySnapshot {
+                user_instructions: memory.user_instructions.clone(),
                 current_task: memory.current_task.clone(),
+                decisions: memory.decisions.clone(),
                 behavior_log: memory.behavior_log.clone(),
+                conversation_history: memory.conversation_history.clone(),
             },
             notebook: NotebookSnapshot {
                 current_activity: notebook.current_activity.clone(),
                 completed: notebook.completed.clone(),
-                inference_attention: notebook
-                    .attention
-                    .iter()
-                    .filter(|a| a.source == AttentionSource::Inference)
-                    .cloned()
-                    .collect(),
+                attention: notebook.attention.clone(),
+                mistakes: notebook.mistakes.clone(),
             },
         };
 
@@ -169,37 +172,41 @@ impl SessionStore {
         // Sanitize thread_id for use as filename
         let safe_id: String = thread_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.sessions_dir.join(format!("{}.json", safe_id))
     }
 }
 
-/// Apply a loaded session snapshot to restore memory and notebook state.
+/// Apply a loaded session snapshot — replaces ALL memory and notebook state.
 pub async fn restore_snapshot(
     memory: &mut PersistentMemory,
     notebook: &mut GugugagaNotebook,
     snapshot: SessionSnapshot,
 ) -> Result<()> {
-    // Restore memory session state
+    // Restore ALL memory state
+    memory.user_instructions = snapshot.memory.user_instructions;
     memory.current_task = snapshot.memory.current_task;
+    memory.decisions = snapshot.memory.decisions;
     memory.behavior_log = snapshot.memory.behavior_log;
+    memory.conversation_history = snapshot.memory.conversation_history;
 
-    // Restore notebook session state
+    // Restore ALL notebook state
     notebook.current_activity = snapshot.notebook.current_activity;
     notebook.completed = snapshot.notebook.completed;
-
-    // Merge inference attention back (avoid duplicates)
-    for item in snapshot.notebook.inference_attention {
-        if !notebook.attention.iter().any(|a| a.content == item.content) {
-            notebook.attention.push(item);
-        }
-    }
+    notebook.attention = snapshot.notebook.attention;
+    notebook.mistakes = snapshot.notebook.mistakes;
 
     // Persist the restored state
     memory.save().await?;
     notebook.save().await?;
 
-    info!("Restored session state for thread {}", snapshot.thread_id);
+    info!("Restored full session state for thread {}", snapshot.thread_id);
     Ok(())
 }

@@ -8,8 +8,15 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+/// Retry config aligned with Codex: codex-rs/core/src/model_provider_info.rs
+const MAX_RETRY_ATTEMPTS: u32 = 4;
+const RETRY_BASE_DELAY_MS: u64 = 200;
+/// Request timeout (Codex uses reqwest defaults ~30s, we set explicitly)
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Evaluator that calls LLM for gugugaga decisions
 pub struct Evaluator {
@@ -100,9 +107,28 @@ impl Evaluator {
         }
     }
 
+    /// Compute exponential backoff with jitter, aligned with Codex's retry.rs
+    fn retry_backoff(attempt: u32) -> Duration {
+        let exp = 2u64.saturating_pow(attempt.saturating_sub(1));
+        let base_ms = RETRY_BASE_DELAY_MS.saturating_mul(exp);
+        // Jitter: 0.9 - 1.1 (deterministic approximation to avoid rand dep)
+        let jitter = 1.0 + ((attempt as f64 * 0.37).sin() * 0.1);
+        Duration::from_millis((base_ms as f64 * jitter) as u64)
+    }
+
+    /// Check if an error is retryable (network/timeout/5xx)
+    fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+        status.is_server_error() // 5xx
+    }
+
     /// Create a new evaluator, loading auth and config from codex home
     pub async fn new(codex_home: &Path) -> Result<Self> {
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(Duration::from_secs(15))
+            .user_agent("gugugaga/0.1.0")
+            .build()
+            .unwrap_or_else(|_| Client::new());
 
         // Load API key from Codex auth storage
         let api_key = Self::load_api_key(codex_home).await?;
@@ -215,7 +241,58 @@ impl Evaluator {
         ))
     }
 
-    /// Call LLM with a prompt (non-streaming, for simple cases)
+    /// Send a single HTTP request to the LLM API (no retry).
+    async fn send_chat_request(&self, request: &ChatRequest) -> Result<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    GugugagaError::LlmEvaluation(format!("timeout: {}", e))
+                } else if e.is_connect() {
+                    GugugagaError::LlmEvaluation(format!("network: {}", e))
+                } else {
+                    GugugagaError::LlmEvaluation(e.to_string())
+                }
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if Self::is_retryable_status(status) {
+                return Err(GugugagaError::LlmEvaluation(format!(
+                    "retryable API error {}: {}",
+                    status, text
+                )));
+            }
+            error!("LLM API error: {} - {}", status, text);
+            return Err(GugugagaError::LlmEvaluation(format!(
+                "API error {}: {}",
+                status, text
+            )));
+        }
+
+        let chat_response: ChatResponse = response
+            .json()
+            .await
+            .map_err(|e| GugugagaError::LlmEvaluation(e.to_string()))?;
+
+        Ok(chat_response
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default())
+    }
+
+    /// Call LLM with retry logic aligned with Codex (max 4 attempts, exponential backoff).
+    /// Retries on network errors, timeouts, and 5xx responses.
     pub async fn call_llm(&self, prompt: &str) -> Result<String> {
         debug!("Calling LLM with prompt length: {}", prompt.len());
 
@@ -230,53 +307,51 @@ impl Evaluator {
             stream: false,
         };
 
-        // Use configured base_url (supports custom providers like relay.nf.video)
-        let url = format!("{}/chat/completions", self.base_url);
-        
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| GugugagaError::LlmEvaluation(e.to_string()))?;
+        let mut last_err = None;
+        for attempt in 0..MAX_RETRY_ATTEMPTS {
+            if attempt > 0 {
+                let delay = Self::retry_backoff(attempt);
+                warn!(
+                    "LLM request failed (attempt {}/{}), retrying in {:?}...",
+                    attempt, MAX_RETRY_ATTEMPTS, delay
+                );
+                tokio::time::sleep(delay).await;
+            }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            error!("LLM API error: {} - {}", status, text);
-            return Err(GugugagaError::LlmEvaluation(format!(
-                "API error {}: {}",
-                status, text
-            )));
+            match self.send_chat_request(&request).await {
+                Ok(content) => {
+                    let parsed = Self::parse_think_tags(&content);
+                    if let Some(thinking) = &parsed.thinking {
+                        debug!("LLM thinking: {}", thinking);
+                    }
+                    debug!("LLM response: {}", parsed.response);
+                    return Ok(parsed.response);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    // Retry on network, timeout, and retryable API errors
+                    let retryable = msg.contains("timeout")
+                        || msg.contains("network")
+                        || msg.contains("retryable")
+                        || msg.contains("error sending request")
+                        || msg.contains("connection");
+                    if retryable && attempt + 1 < MAX_RETRY_ATTEMPTS {
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
-        let chat_response: ChatResponse = response
-            .json()
-            .await
-            .map_err(|e| GugugagaError::LlmEvaluation(e.to_string()))?;
-
-        let content = chat_response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
-
-        // Parse and extract response
-        let parsed = Self::parse_think_tags(&content);
-        if let Some(thinking) = &parsed.thinking {
-            debug!("LLM thinking: {}", thinking);
-        }
-
-        debug!("LLM response: {}", parsed.response);
-        Ok(parsed.response)
+        Err(last_err.unwrap_or_else(|| {
+            GugugagaError::LlmEvaluation("all retry attempts exhausted".to_string())
+        }))
     }
     
-    /// Call LLM and return both thinking and response
+    /// Call LLM and return both thinking and response (with retry).
     pub async fn call_llm_with_thinking(&self, prompt: &str) -> Result<ParsedResponse> {
-        debug!("Calling LLM with prompt length: {}", prompt.len());
+        debug!("Calling LLM (with thinking) prompt length: {}", prompt.len());
 
         let request = ChatRequest {
             model: self.model.clone(),
@@ -289,46 +364,45 @@ impl Evaluator {
             stream: false,
         };
 
-        let url = format!("{}/chat/completions", self.base_url);
-        
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| GugugagaError::LlmEvaluation(e.to_string()))?;
+        let mut last_err = None;
+        for attempt in 0..MAX_RETRY_ATTEMPTS {
+            if attempt > 0 {
+                let delay = Self::retry_backoff(attempt);
+                warn!(
+                    "LLM request failed (attempt {}/{}), retrying in {:?}...",
+                    attempt, MAX_RETRY_ATTEMPTS, delay
+                );
+                tokio::time::sleep(delay).await;
+            }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            error!("LLM API error: {} - {}", status, text);
-            return Err(GugugagaError::LlmEvaluation(format!(
-                "API error {}: {}",
-                status, text
-            )));
+            match self.send_chat_request(&request).await {
+                Ok(content) => {
+                    let parsed = Self::parse_think_tags(&content);
+                    if let Some(thinking) = &parsed.thinking {
+                        debug!("LLM thinking: {}", thinking);
+                    }
+                    debug!("LLM response: {}", parsed.response);
+                    return Ok(parsed);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let retryable = msg.contains("timeout")
+                        || msg.contains("network")
+                        || msg.contains("retryable")
+                        || msg.contains("error sending request")
+                        || msg.contains("connection");
+                    if retryable && attempt + 1 < MAX_RETRY_ATTEMPTS {
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
-        let chat_response: ChatResponse = response
-            .json()
-            .await
-            .map_err(|e| GugugagaError::LlmEvaluation(e.to_string()))?;
-
-        let content = chat_response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
-
-        let parsed = Self::parse_think_tags(&content);
-        if let Some(thinking) = &parsed.thinking {
-            debug!("LLM thinking: {}", thinking);
-        }
-        debug!("LLM response: {}", parsed.response);
-        
-        Ok(parsed)
+        Err(last_err.unwrap_or_else(|| {
+            GugugagaError::LlmEvaluation("all retry attempts exhausted".to_string())
+        }))
     }
 
     /// Call LLM with streaming output - returns channel for real-time thinking

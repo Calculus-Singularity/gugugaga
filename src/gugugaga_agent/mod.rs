@@ -603,36 +603,13 @@ impl GugugagaAgent {
         }
     }
 
-    /// Parse check response (OK or VIOLATION)
+    /// Parse check response using JSON-first strategy with text fallback.
+    /// Never returns Err — unparseable responses are treated as "OK".
     fn parse_check_response(&self, response: &str, thinking: Option<String>) -> Result<CheckResult> {
-        // Parse "OK: [summary]" format
-        if response.starts_with("OK:") || response.starts_with("OK：") {
-            let summary = response
-                .trim_start_matches("OK:")
-                .trim_start_matches("OK：")
-                .trim()
-                .to_string();
-            return Ok(CheckResult {
-                violation: None,
-                summary: if summary.is_empty() { "Check complete".to_string() } else { summary },
-                thinking,
-            });
-        }
-
-        // Parse "VIOLATION: [type] - [desc] - [correction]" format
-        if response.contains("VIOLATION:") {
-            let violation = self.responder.parse_violation_response(response)?;
-            return Ok(CheckResult {
-                violation: Some(violation.clone()),
-                summary: violation.description.clone(),
-                thinking,
-            });
-        }
-
-        // Fallback: treat entire response as summary
+        let parsed = self.responder.parse_check_response(response);
         Ok(CheckResult {
-            violation: None,
-            summary: if response.is_empty() { "Check complete".to_string() } else { response.to_string() },
+            violation: parsed.violation,
+            summary: parsed.summary,
             thinking,
         })
     }

@@ -364,25 +364,10 @@ impl GugugagaNotebook {
         Ok(())
     }
 
-    /// Reset session-scoped state while preserving cross-session learnings.
+    /// Clear ALL data for a fresh start. No cross-conversation persistence.
     ///
-    /// Called when a new gugugaga process starts (new Codex session).
-    /// Clears: current_activity, completed items, inference-based attention.
-    /// Keeps: mistakes (lessons learned), user-instruction/mistake-based attention.
-    pub async fn reset_session(&mut self) -> Result<()> {
-        self.current_activity = None;
-        self.completed.clear();
-        // Only keep attention items from user instructions or mistakes (long-term knowledge).
-        // Remove inference-based items which are task-specific.
-        self.attention.retain(|a| {
-            matches!(a.source, AttentionSource::UserInstruction | AttentionSource::Mistake)
-        });
-        self.last_updated = Some(Utc::now());
-        self.save().await
-    }
-
-    /// Clear all data
-    pub async fn clear(&mut self) -> Result<()> {
+    /// Called when a new thread starts. Everything lives per-thread.
+    pub async fn clear_all(&mut self) -> Result<()> {
         self.current_activity = None;
         self.completed.clear();
         self.attention.clear();

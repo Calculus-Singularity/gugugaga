@@ -35,7 +35,7 @@ pub struct PersistentMemory {
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConversationTurn {
     pub timestamp: DateTime<Utc>,
     pub role: TurnRole,
@@ -44,14 +44,14 @@ pub struct ConversationTurn {
     pub tokens: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TurnRole {
     User,
     Codex,
     Gugugaga,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserInstruction {
     pub timestamp: DateTime<Utc>,
     pub content: String,
@@ -64,7 +64,7 @@ pub struct TaskObjective {
     pub started_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Decision {
     pub timestamp: DateTime<Utc>,
     pub what: String,
@@ -503,13 +503,13 @@ impl PersistentMemory {
         md
     }
 
-    /// Reset session-scoped state while preserving cross-session knowledge.
+    /// Clear ALL state for a fresh start. No cross-conversation persistence.
     ///
-    /// Called when a new gugugaga process starts (new Codex session).
-    /// Clears: current_task, behavior_log, conversation_history.
-    /// Keeps: user_instructions (long-term preferences), decisions (architectural knowledge).
-    pub async fn reset_session(&mut self) -> Result<()> {
+    /// Called when a new thread starts. Everything lives per-thread.
+    pub async fn clear_all(&mut self) -> Result<()> {
+        self.user_instructions.clear();
         self.current_task = None;
+        self.decisions.clear();
         self.behavior_log.clear();
         self.conversation_history.clear();
         self.save().await

@@ -55,12 +55,18 @@ impl<'a> ContextBuilder<'a> {
 === Current Request ===
 {request_content}
 
-Evaluate this request:
-- If simple confirmation (e.g., "can I continue?"), return AUTO_REPLY: [your reply]
-- If Agent did something wrong, return CORRECT: [correction content]
-- If strategic user decision needed, return FORWARD_TO_USER
+Evaluate this request and respond with a single JSON object:
 
-Output format: ACTION: [content]"#
+{{"action": "AUTO_REPLY", "content": "your reply"}}
+  — for simple confirmations (e.g., "can I continue?")
+
+{{"action": "CORRECT", "content": "correction content"}}
+  — if Agent did something wrong
+
+{{"action": "FORWARD_TO_USER"}}
+  — if strategic user decision needed
+
+Output ONLY the JSON object."#
         )
     }
 
@@ -130,9 +136,17 @@ Violation types:
 1. Pay close attention to ALL user instructions in context. If the user expressed any intent for autonomous/uninterrupted work (e.g. "just do it", "don't ask", "work autonomously", "finish before talking to me"), then ANY mid-task narration, plan explanation, or confirmation request from Codex is a UNNECESSARY_INTERACTION violation — even if the narration itself sounds polite or helpful.
 2. If the user explicitly chose an approach (e.g. "use LLM for this"), do NOT add redundant mechanisms using a different approach (e.g. regex matching). Trust the user's architectural decisions. Doing extra unrequested work that contradicts the user's design intent is a violation.
 
-Return format (give final answer after tool calls):
-- Violation: VIOLATION: [type] - [specific issue] - [specific correction instruction]
-- Normal: OK: [What Codex did, one sentence]"#
+Return format — you MUST respond with a single JSON object (after any tool calls):
+
+If no violation:
+{{"result": "ok", "summary": "What Codex did, one sentence"}}
+
+If violation found:
+{{"result": "violation", "type": "VIOLATION_TYPE", "description": "What went wrong specifically", "correction": "Specific instruction to fix it"}}
+
+Valid violation types: FALLBACK, IGNORED_INSTRUCTION, UNAUTHORIZED_CHANGE, UNNECESSARY_INTERACTION, OVER_ENGINEERING
+
+Important: Output ONLY the JSON object as your final answer. No extra text before or after."#
         )
     }
 

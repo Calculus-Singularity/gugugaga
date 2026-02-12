@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Message interceptor that wraps Codex app-server
 pub struct Interceptor {
@@ -55,14 +55,16 @@ impl Interceptor {
 
     /// Create a new interceptor
     pub async fn new(config: GugugagaConfig) -> Result<Self> {
-        // Initialize persistent memory (loaded from disk, but NOT reset yet —
-        // session state is managed per thread_id, see handle_thread_id_detected).
-        let memory = PersistentMemory::new(config.memory_file.clone()).await?;
+        // Initialize persistent memory — start completely clean.
+        // All state lives per-thread; session store restores if resuming.
+        let mut memory = PersistentMemory::new(config.memory_file.clone()).await?;
+        memory.clear_all().await?;
         let memory = Arc::new(RwLock::new(memory));
 
-        // Initialize notebook (separate from memory, never compacted)
+        // Initialize notebook — also start completely clean.
         let notebook_path = config.memory_file.with_extension("notebook.json");
-        let notebook = GugugagaNotebook::new(notebook_path).await?;
+        let mut notebook = GugugagaNotebook::new(notebook_path).await?;
+        notebook.clear_all().await?;
         let notebook = Arc::new(RwLock::new(notebook));
 
         // Initialize session store for per-thread state caching
@@ -184,8 +186,8 @@ impl Interceptor {
                                         // context doesn't bleed in.
                                         let mut mem = memory.write().await;
                                         let mut nb = notebook.write().await;
-                                        let _ = mem.reset_session().await;
-                                        let _ = nb.reset_session().await;
+                                        let _ = mem.clear_all().await;
+                                        let _ = nb.clear_all().await;
                                     }
                                     Err(e) => {
                                         warn!("Session store load error: {}", e);
@@ -440,7 +442,13 @@ impl Interceptor {
             }
         }
 
-        // Cleanup: save session state for current thread before exiting
+        // Signal tasks to stop, then wait for them to finish
+        drop(to_server_tx);
+        let _ = stdout_task.await;
+        let _ = stdin_task.await;
+
+        // Save session AFTER all tasks are done, so we capture the final state
+        // (including any mistakes/corrections from the last turn).
         {
             let thread_id = self.current_thread_id.read().await;
             if let Some(tid) = thread_id.as_ref() {
@@ -454,9 +462,6 @@ impl Interceptor {
             }
         }
 
-        drop(to_server_tx);
-        let _ = stdout_task.await;
-        let _ = stdin_task.await;
         let _ = child.kill().await;
 
         Ok(())
@@ -585,8 +590,9 @@ impl Interceptor {
                         }
                     }
                     Err(e) => {
-                        // LLM evaluation failed
-                        error!("LLM evaluation failed: {}", e);
+                        // LLM evaluation failed — tell the user so they know
+                        // gugugaga is not working (API down, rate limited, etc.)
+                        warn!("LLM evaluation failed: {}", e);
                         let msg = serde_json::json!({
                             "method": "gugugaga/check",
                             "params": { "status": "error", "message": format!("Evaluation failed: {}", e) }
