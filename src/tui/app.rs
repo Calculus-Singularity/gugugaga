@@ -231,7 +231,12 @@ impl App {
             notebook_attention_items: Vec::new(),
             notebook_mistakes_count: 0,
             gugugaga_status: None,
-            phase: AppPhase::Welcome,
+            // Skip the Welcome animation if trust is already established
+            phase: if trust_ctx.is_some() {
+                AppPhase::Welcome
+            } else {
+                AppPhase::Chat
+            },
             animation: AsciiAnimation::new(),
             trust_ctx,
         })
