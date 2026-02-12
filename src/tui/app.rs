@@ -1812,10 +1812,35 @@ Make it comprehensive but concise."#;
                             }
                             "fileChange" => {
                                 if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
+                                    let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                                    let mut full_diff = String::new();
                                     for change in changes {
                                         let path = change.get("path").and_then(|p| p.as_str()).unwrap_or("file");
-                                        let kind = change.get("kind").and_then(|k| k.as_str()).unwrap_or("modify");
-                                        self.messages.push(Message::file_change(format!("{}: {}", kind, path)));
+                                        let kind = change.get("kind");
+                                        let verb = if let Some(k) = kind.and_then(|k| k.as_str()) {
+                                            match k {
+                                                "add" => "Added",
+                                                "delete" => "Deleted",
+                                                _ => "Edited",
+                                            }
+                                        } else {
+                                            "Edited"
+                                        };
+                                        full_diff.push_str(&format!("• {} {}\n", verb, path));
+                                        if let Some(diff) = change.get("diff").and_then(|d| d.as_str()) {
+                                            if !diff.trim().is_empty() {
+                                                full_diff.push_str(diff);
+                                                if !diff.ends_with('\n') {
+                                                    full_diff.push('\n');
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !full_diff.is_empty() {
+                                        // Tag with item_id so item/completed can replace it.
+                                        let marker = format!("[fc:{}]", item_id);
+                                        let content = format!("{}\n{}", marker, full_diff.trim_end());
+                                        self.messages.push(Message::file_change(&content));
                                     }
                                 }
                             }
@@ -1896,8 +1921,52 @@ Make it comprehensive but concise."#;
                                 self.messages.push(Message::system(&info));
                             }
                             "fileChange" => {
+                                let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
                                 let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("completed");
-                                self.messages.push(Message::system(&format!("File change {}", status)));
+                                // Build the final diff from completed changes.
+                                if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
+                                    let mut full_diff = String::new();
+                                    for change in changes {
+                                        let path = change.get("path").and_then(|p| p.as_str()).unwrap_or("file");
+                                        let kind = change.get("kind");
+                                        let verb = if let Some(k) = kind.and_then(|k| k.as_str()) {
+                                            match k {
+                                                "add" => "Added",
+                                                "delete" => "Deleted",
+                                                _ => "Edited",
+                                            }
+                                        } else {
+                                            "Edited"
+                                        };
+                                        full_diff.push_str(&format!("• {} {}\n", verb, path));
+                                        if let Some(diff) = change.get("diff").and_then(|d| d.as_str()) {
+                                            if !diff.trim().is_empty() {
+                                                full_diff.push_str(diff);
+                                                if !diff.ends_with('\n') {
+                                                    full_diff.push('\n');
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !full_diff.is_empty() {
+                                        let marker = format!("[fc:{}]", item_id);
+                                        let new_content = format!("{}\n{}", marker, full_diff.trim_end());
+                                        // Replace the in-progress message if it exists.
+                                        let replaced = self.messages.iter_mut().rev().any(|m| {
+                                            if m.role == MessageRole::FileChange && m.content.starts_with(&marker) {
+                                                m.content = new_content.clone();
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        });
+                                        if !replaced {
+                                            self.messages.push(Message::file_change(&new_content));
+                                        }
+                                    }
+                                }
+                                let icon = if status == "completed" { "✓" } else { "✘" };
+                                self.messages.push(Message::system(&format!("{} File change {}", icon, status)));
                             }
                             "exitedReviewMode" => {
                                 if let Some(review) = item.get("review").and_then(|r| r.as_str()) {

@@ -876,12 +876,21 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
             MessageRole::FileChange => {
                 // Diff lines — wrap them too so they don't break the border
                 for raw_line in content.lines() {
+                    // Skip internal markers used for message replacement
+                    if raw_line.starts_with("[fc:") || raw_line.starts_with("[turn diff]") {
+                        continue;
+                    }
                     let style = if raw_line.starts_with('+') {
                         Style::default().fg(Color::Green)
                     } else if raw_line.starts_with('-') {
                         Style::default().fg(Color::Red)
-                    } else if raw_line.starts_with('@') {
+                    } else if raw_line.starts_with("@@") {
                         Style::default().fg(Color::Cyan)
+                    } else if raw_line.starts_with("•") {
+                        // File path header (e.g. "• Edited src/foo.rs")
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else if raw_line.starts_with("diff ") || raw_line.starts_with("---") || raw_line.starts_with("+++") {
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
                     } else {
                         Theme::dim()
                     };
