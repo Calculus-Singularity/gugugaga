@@ -2,7 +2,8 @@
 //!
 //! Starts app-server as a subprocess and intercepts all JSONL communication.
 
-use crate::memory::{PersistentMemory, GugugagaNotebook};
+use crate::memory::{PersistentMemory, GugugagaNotebook, SessionStore};
+use crate::memory::session_store;
 use crate::protocol::{self, notifications};
 use crate::rules::ViolationDetector;
 use crate::gugugaga_agent::{EvaluationResult, GugugagaAgent};
@@ -22,6 +23,9 @@ pub struct Interceptor {
     memory: Arc<RwLock<PersistentMemory>>,
     notebook: Arc<RwLock<GugugagaNotebook>>,
     gugugaga_agent: Arc<GugugagaAgent>,
+    session_store: Arc<SessionStore>,
+    /// Thread ID for the current session (set after thread/start response)
+    current_thread_id: Arc<RwLock<Option<String>>>,
 }
 
 /// Action to take after intercepting a message
@@ -51,20 +55,22 @@ impl Interceptor {
 
     /// Create a new interceptor
     pub async fn new(config: GugugagaConfig) -> Result<Self> {
-        // Initialize persistent memory
-        let mut memory = PersistentMemory::new(config.memory_file.clone()).await?;
-        // Reset session-scoped state (current_task, behavior_log) while keeping
-        // cross-session knowledge (user_instructions, decisions).
-        memory.reset_session().await?;
+        // Initialize persistent memory (loaded from disk, but NOT reset yet —
+        // session state is managed per thread_id, see handle_thread_id_detected).
+        let memory = PersistentMemory::new(config.memory_file.clone()).await?;
         let memory = Arc::new(RwLock::new(memory));
 
         // Initialize notebook (separate from memory, never compacted)
         let notebook_path = config.memory_file.with_extension("notebook.json");
-        let mut notebook = GugugagaNotebook::new(notebook_path).await?;
-        // Reset session-scoped state (current_activity, completed) while keeping
-        // cross-session learnings (mistakes, user-instruction attention).
-        notebook.reset_session().await?;
+        let notebook = GugugagaNotebook::new(notebook_path).await?;
         let notebook = Arc::new(RwLock::new(notebook));
+
+        // Initialize session store for per-thread state caching
+        let project_dir = config.memory_file.parent().unwrap_or(std::path::Path::new("."));
+        let session_store = SessionStore::new(project_dir).await?;
+        // Clean up old sessions (keep the 50 most recent)
+        let _ = session_store.cleanup(50).await;
+        let session_store = Arc::new(session_store);
 
         // Initialize gugugaga agent
         let gugugaga_agent = GugugagaAgent::new(&config.codex_home, memory.clone(), notebook.clone()).await?;
@@ -75,6 +81,8 @@ impl Interceptor {
             memory,
             notebook,
             gugugaga_agent,
+            session_store,
+            current_thread_id: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -118,6 +126,8 @@ impl Interceptor {
         let notebook = self.notebook.clone();
         let gugugaga_agent = self.gugugaga_agent.clone();
         let config = self.config.clone();
+        let session_store = self.session_store.clone();
+        let shared_thread_id = self.current_thread_id.clone();
 
         let stdout_task = tokio::spawn(async move {
             let violation_detector = ViolationDetector::new();
@@ -125,6 +135,8 @@ impl Interceptor {
             let mut thread_turn_content: HashMap<String, String> = HashMap::new();
             // Track current (main) thread ID for corrections
             let mut current_thread_id: Option<String> = None;
+            // Whether we've already handled session init for the first thread_id
+            let mut session_initialized = false;
             // Track all active threads (main + sub-agents)
             let mut active_threads: HashMap<String, String> = HashMap::new(); // id -> source/label
             // Legacy: single accumulator for when we don't know the thread
@@ -150,6 +162,40 @@ impl Interceptor {
                             .and_then(|t| t.get("id"))
                             .and_then(|id| id.as_str())
                         {
+                            // Per-thread session management: on first thread_id detection,
+                            // either restore a cached session or start clean.
+                            if !session_initialized {
+                                session_initialized = true;
+                                let tid = thread_id.to_string();
+
+                                match session_store.load(&tid).await {
+                                    Ok(Some(snapshot)) => {
+                                        // Resuming an existing thread — restore its state
+                                        let mut mem = memory.write().await;
+                                        let mut nb = notebook.write().await;
+                                        if let Err(e) = session_store::restore_snapshot(
+                                            &mut mem, &mut nb, snapshot,
+                                        ).await {
+                                            warn!("Failed to restore session for {}: {}", tid, e);
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        // New thread — reset session-scoped state so old
+                                        // context doesn't bleed in.
+                                        let mut mem = memory.write().await;
+                                        let mut nb = notebook.write().await;
+                                        let _ = mem.reset_session().await;
+                                        let _ = nb.reset_session().await;
+                                    }
+                                    Err(e) => {
+                                        warn!("Session store load error: {}", e);
+                                    }
+                                }
+
+                                // Share the thread_id for session saving on exit
+                                *shared_thread_id.write().await = Some(tid);
+                            }
+
                             current_thread_id = Some(thread_id.to_string());
                             active_threads.insert(thread_id.to_string(), "main".to_string());
                             debug!("Tracking threadId: {}", thread_id);
@@ -394,7 +440,20 @@ impl Interceptor {
             }
         }
 
-        // Cleanup
+        // Cleanup: save session state for current thread before exiting
+        {
+            let thread_id = self.current_thread_id.read().await;
+            if let Some(tid) = thread_id.as_ref() {
+                let mem = self.memory.read().await;
+                let nb = self.notebook.read().await;
+                if let Err(e) = self.session_store.save(tid, &mem, &nb).await {
+                    warn!("Failed to save session for {}: {}", tid, e);
+                } else {
+                    info!("Saved session state for thread {}", tid);
+                }
+            }
+        }
+
         drop(to_server_tx);
         let _ = stdout_task.await;
         let _ = stdin_task.await;

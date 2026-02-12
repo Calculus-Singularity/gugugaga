@@ -7,6 +7,7 @@ pub mod compact;
 mod context;
 mod notebook;
 mod persistent;
+pub mod session_store;
 
 pub use compact::Compactor;
 pub use context::ContextBuilder;
@@ -16,3 +17,4 @@ pub use notebook::{
     Priority, AttentionSource,
 };
 pub use persistent::{PersistentMemory, TurnRole, ConversationTurn};
+pub use session_store::SessionStore;

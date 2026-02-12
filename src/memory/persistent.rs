@@ -57,7 +57,7 @@ pub struct UserInstruction {
     pub content: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TaskObjective {
     pub main_goal: String,
     pub constraints: Vec<String>,
@@ -71,7 +71,7 @@ pub struct Decision {
     pub why: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BehaviorEntry {
     pub timestamp: DateTime<Utc>,
     pub action: String,
