@@ -503,6 +503,18 @@ impl PersistentMemory {
         md
     }
 
+    /// Reset session-scoped state while preserving cross-session knowledge.
+    ///
+    /// Called when a new gugugaga process starts (new Codex session).
+    /// Clears: current_task, behavior_log, conversation_history.
+    /// Keeps: user_instructions (long-term preferences), decisions (architectural knowledge).
+    pub async fn reset_session(&mut self) -> Result<()> {
+        self.current_task = None;
+        self.behavior_log.clear();
+        self.conversation_history.clear();
+        self.save().await
+    }
+
     /// Record a user instruction
     pub async fn record_user_instruction(&mut self, content: &str) -> Result<()> {
         self.user_instructions.push(UserInstruction {

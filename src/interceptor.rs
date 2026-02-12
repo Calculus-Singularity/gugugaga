@@ -52,12 +52,18 @@ impl Interceptor {
     /// Create a new interceptor
     pub async fn new(config: GugugagaConfig) -> Result<Self> {
         // Initialize persistent memory
-        let memory = PersistentMemory::new(config.memory_file.clone()).await?;
+        let mut memory = PersistentMemory::new(config.memory_file.clone()).await?;
+        // Reset session-scoped state (current_task, behavior_log) while keeping
+        // cross-session knowledge (user_instructions, decisions).
+        memory.reset_session().await?;
         let memory = Arc::new(RwLock::new(memory));
 
         // Initialize notebook (separate from memory, never compacted)
         let notebook_path = config.memory_file.with_extension("notebook.json");
-        let notebook = GugugagaNotebook::new(notebook_path).await?;
+        let mut notebook = GugugagaNotebook::new(notebook_path).await?;
+        // Reset session-scoped state (current_activity, completed) while keeping
+        // cross-session learnings (mistakes, user-instruction attention).
+        notebook.reset_session().await?;
         let notebook = Arc::new(RwLock::new(notebook));
 
         // Initialize gugugaga agent
