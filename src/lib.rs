@@ -41,7 +41,14 @@ pub struct GugugagaConfig {
 
 impl GugugagaConfig {
     pub fn new(cwd: PathBuf, codex_home: PathBuf) -> Self {
-        let memory_file = codex_home.join("gugugaga").join("memory.md");
+        // Per-project isolation: use a short hash of the cwd so each project
+        // gets its own memory/notebook files, preventing cross-session bleed.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        cwd.hash(&mut hasher);
+        let dir_name = format!("{:016x}", hasher.finish());
+        let memory_file = codex_home.join("gugugaga").join(&dir_name).join("memory.md");
         Self {
             memory_file,
             cwd,
