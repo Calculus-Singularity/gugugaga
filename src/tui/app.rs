@@ -362,18 +362,18 @@ impl App {
                 }
                 AppPhase::Chat => {
                     // ── Main chat phase ──────────────────────────────────
-                    // Check for new messages first (non-blocking)
-                    self.check_output().await;
-                    
-                    // Update notebook cache for display
-                    self.update_notebook_cache().await;
-                    
-                    // Update spinner at fixed interval
-                    if last_spinner_update.elapsed() >= spinner_interval {
-                        self.spinner_frame = self.spinner_frame.wrapping_add(1);
-                        last_spinner_update = std::time::Instant::now();
-                    }
-                    
+            // Check for new messages first (non-blocking)
+            self.check_output().await;
+            
+            // Update notebook cache for display
+            self.update_notebook_cache().await;
+            
+            // Update spinner at fixed interval
+            if last_spinner_update.elapsed() >= spinner_interval {
+                self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                last_spinner_update = std::time::Instant::now();
+            }
+            
                     // Draw UI — wrap error for better diagnostics
                     if let Err(e) = self.draw() {
                         let msg = format!("draw() error: {e}\nmessage_count: {}\n", self.messages.len());
@@ -382,11 +382,11 @@ impl App {
                     }
 
                     // Poll for keyboard/mouse events with short timeout
-                    if event::poll(poll_timeout)? {
+            if event::poll(poll_timeout)? {
                         match event::read()? {
                             Event::Key(key) => {
-                                self.handle_input(key).await;
-                            }
+                    self.handle_input(key).await;
+                }
                             Event::Mouse(mouse) => {
                                 self.handle_mouse(mouse);
                             }
@@ -396,7 +396,7 @@ impl App {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -534,7 +534,7 @@ impl App {
             let _ = child.wait();
         }
     }
-
+    
     async fn handle_input(&mut self, key: event::KeyEvent) {
         // Handle approval dialog first (highest priority — modal overlay)
         if let Some(approval) = self.pending_approval.take() {
@@ -681,7 +681,7 @@ impl App {
                     self.send_turn_interrupt().await;
                 } else if self.quit_armed {
                     // Second press within timeout — actually quit
-                    self.should_quit = true;
+                self.should_quit = true;
                 } else {
                     // First press — arm the quit
                     self.quit_armed = true;
@@ -722,7 +722,7 @@ impl App {
                     self.scroll_to_bottom();
                     self.is_processing = true;
 
-                    let msg = self.create_turn_message(&text);
+                        let msg = self.create_turn_message(&text);
                     if let Some(tx) = &self.input_tx {
                         let _ = tx.send(msg).await;
                     }
@@ -750,7 +750,7 @@ impl App {
             InputAction::Escape => {
                 // Priority: slash_popup > running turn > nothing
                 if self.slash_popup.visible {
-                    self.slash_popup.close();
+                self.slash_popup.close();
                 } else if self.is_processing && self.current_turn_id.is_some() {
                     self.send_turn_interrupt().await;
                 }
@@ -942,7 +942,10 @@ impl App {
                 "id": self.request_counter,
                 "params": {
                     "sandbox": "workspace-write",
-                    "approvalPolicy": "untrusted"
+                    "approvalPolicy": "untrusted",
+                    "config": {
+                        "experimental_use_freeform_apply_patch": true
+                    }
                 }
             })
             .to_string();
@@ -1097,21 +1100,21 @@ impl App {
     /// Request code review
     async fn request_review(&mut self) {
         if let Some(thread_id) = &self.thread_id {
-            if let Some(tx) = &self.input_tx {
-                self.request_counter += 1;
-                let msg = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "review/start",
-                    "id": self.request_counter,
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "review/start",
+                "id": self.request_counter,
                     "params": {
                         "threadId": thread_id,
                         "target": {
                             "type": "uncommittedChanges"
                         }
                     }
-                })
-                .to_string();
-                let _ = tx.send(msg).await;
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
                 self.messages.push(Message::system("Starting code review (uncommitted changes)..."));
                 self.is_processing = true;
             }
@@ -1384,7 +1387,7 @@ impl App {
 
 Make it comprehensive but concise."#;
 
-        let msg = self.create_turn_message(INIT_PROMPT);
+            let msg = self.create_turn_message(INIT_PROMPT);
         if let Some(tx) = &self.input_tx {
             let _ = tx.send(msg).await;
             self.messages.push(Message::user("/init"));
@@ -1440,7 +1443,10 @@ Make it comprehensive but concise."#;
                         let mut params = serde_json::json!({
                             "threadId": item_id,
                             "sandbox": "workspace-write",
-                            "approvalPolicy": "untrusted"
+                            "approvalPolicy": "untrusted",
+                            "config": {
+                                "experimental_use_freeform_apply_patch": true
+                            }
                         });
                         if let Some(path) = &item_metadata {
                             params["path"] = serde_json::json!(path);
@@ -1524,13 +1530,13 @@ Make it comprehensive but concise."#;
         self.picker_mode = PickerMode::None;
         self.scroll_to_bottom();
     }
-
+    
     /// Helper: write a config value to Codex via config/value/write
     async fn write_config(&mut self, key_path: &str, value: &serde_json::Value) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
             let msg = serde_json::json!({
-                "jsonrpc": "2.0",
+                            "jsonrpc": "2.0",
                 "method": "config/value/write",
                 "id": self.request_counter,
                 "params": {
@@ -1548,7 +1554,7 @@ Make it comprehensive but concise."#;
     async fn respond_to_approval_decision(&mut self, approval: &PendingApproval, decision: &str) {
         if let Some(tx) = &self.input_tx {
             let response = serde_json::json!({
-                "jsonrpc": "2.0",
+                        "jsonrpc": "2.0",
                 "id": approval.request_id,
                 "result": {
                     "decision": decision
@@ -1748,7 +1754,7 @@ Make it comprehensive but concise."#;
             {
                 self.thread_id = Some(tid.to_string());
             }
-
+            
             // Check if this is a JSON-RPC response (has "id" and "result" or "error")
             if let Some(id) = json.get("id") {
                 // This is a response to a request we made
@@ -1767,8 +1773,8 @@ Make it comprehensive but concise."#;
                         .unwrap_or("Unknown error");
                     // Only show error if it seems relevant (not from init)
                     if self.pending_request_id.is_some() {
-                        self.messages.push(Message::system(&format!("Error: {}", error_msg)));
-                        self.is_processing = false;
+                    self.messages.push(Message::system(&format!("Error: {}", error_msg)));
+                    self.is_processing = false;
                         self.pending_request_id = None;
                         self.pending_request_type = PendingRequestType::None;
                         // Close picker if it was open
@@ -1795,10 +1801,12 @@ Make it comprehensive but concise."#;
                         if let Some(last) = self.messages.last_mut() {
                             if last.role == MessageRole::Codex {
                                 last.content.push_str(delta);
+                                self.scroll_to_bottom();
                                 return;
                             }
                         }
                         self.messages.push(Message::codex(delta));
+                        self.scroll_to_bottom();
                     }
                 }
                 "item/agentReasoning/delta" | "item/agentReasoning/summaryDelta" => {
@@ -2309,7 +2317,6 @@ Make it comprehensive but concise."#;
                     }
                 }
                 "gugugaga/thinking" => {
-                    // Update status bar instead of pushing inline messages (aligned with Codex)
                     if let Some(msg) = json
                         .get("params")
                         .and_then(|p| p.get("message"))
@@ -2419,10 +2426,11 @@ Make it comprehensive but concise."#;
                                 let title = if preview.is_empty() {
                                     format!("Session {}", &id[..8.min(id.len())])
                                 } else {
-                                    // Truncate long previews
-                                    let max_len = 40;
-                                    if preview.len() > max_len {
-                                        format!("{}...", &preview[..max_len])
+                                    // Truncate long previews (char-safe for UTF-8)
+                                    let max_chars = 40;
+                                    let truncated: String = preview.chars().take(max_chars).collect();
+                                    if truncated.len() < preview.len() {
+                                        format!("{}...", truncated)
                                     } else {
                                         preview.to_string()
                                     }
@@ -3174,13 +3182,13 @@ Make it comprehensive but concise."#;
         self.terminal.draw(|f| {
             let size = f.area();
 
-            // Main layout: header, content, input, help
+            // Main layout: header, content, status, input, help
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(1), // Header
-                    Constraint::Length(1), // Status
                     Constraint::Min(8),    // Content
+                    Constraint::Length(1), // Status (above input)
                     Constraint::Length(4), // Input
                     Constraint::Length(1), // Help
                 ])
@@ -3199,12 +3207,17 @@ Make it comprehensive but concise."#;
             };
             f.render_widget(header, main_chunks[0]);
 
-            // Status bar
+            // Content area: messages + stats
+            let content_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(30), Constraint::Length(28)])
+                .split(main_chunks[1]);
+
+            // Status bar (above input box)
             let status = StatusBar {
                 is_processing: is_processing || gugugaga_status.is_some(),
                 spinner_frame,
                 status_text: if let Some(gs) = gugugaga_status {
-                    // Gugugaga is thinking — show its status (like Codex's StatusIndicatorWidget)
                     format!("Supervising: {} (Esc to interrupt)", gs)
                 } else if is_processing {
                     "Thinking... (Esc to interrupt)".to_string()
@@ -3214,13 +3227,7 @@ Make it comprehensive but concise."#;
                     String::new()
                 },
             };
-            f.render_widget(status, main_chunks[1]);
-
-            // Content area: messages + stats
-            let content_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(30), Constraint::Length(28)])
-                .split(main_chunks[2]);
+            f.render_widget(status, main_chunks[2]);
 
             // Messages (with selection highlighting)
             let (lines_text, inner_rect) = Self::render_messages(f, content_chunks[0], messages, scroll_offset, sel_anchor, sel_end);
@@ -3658,8 +3665,7 @@ Make it comprehensive but concise."#;
             visible
         };
 
-        let paragraph = Paragraph::new(visible)
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(visible);
         f.render_widget(paragraph, inner);
 
         // Scrollbar

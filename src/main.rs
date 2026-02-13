@@ -173,7 +173,10 @@ async fn run_tui_mode(
         "id": 1,
         "params": {
             "sandbox": "workspace-write",
-            "approvalPolicy": "untrusted"
+            "approvalPolicy": "untrusted",
+            "config": {
+                "experimental_use_freeform_apply_patch": true
+            }
         }
     })
     .to_string();

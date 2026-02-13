@@ -2,7 +2,7 @@
 //!
 //! Starts app-server as a subprocess and intercepts all JSONL communication.
 
-use crate::memory::{PersistentMemory, GugugagaNotebook, SessionStore};
+use crate::memory::{PersistentMemory, GugugagaNotebook, SessionStore, TurnRole};
 use crate::memory::session_store;
 use crate::protocol::{self, notifications};
 use crate::rules::ViolationDetector;
@@ -145,6 +145,8 @@ impl Interceptor {
             let mut current_turn_content = String::new();
             // Channel to send corrections to Codex
             let correction_tx = to_server_tx_clone;
+            // Pending Gugugaga history messages to replay after session restore
+            let mut pending_gugugaga_history: Vec<String> = Vec::new();
 
             while let Ok(Some(line)) = stdout_reader.next_line().await {
                 if line.trim().is_empty() {
@@ -172,6 +174,20 @@ impl Interceptor {
 
                                 match session_store.load(&tid).await {
                                     Ok(Some(snapshot)) => {
+                                        // Collect Gugugaga conversation entries to replay in TUI
+                                        pending_gugugaga_history = snapshot
+                                            .memory
+                                            .conversation_history
+                                            .iter()
+                                            .filter(|t| t.role == TurnRole::Gugugaga)
+                                            .map(|t| {
+                                                serde_json::json!({
+                                                    "method": "gugugaga/check",
+                                                    "params": { "message": t.content.clone() }
+                                                })
+                                                .to_string()
+                                            })
+                                            .collect();
                                         // Resuming an existing thread — restore its state
                                         let mut mem = memory.write().await;
                                         let mut nb = notebook.write().await;
@@ -317,6 +333,23 @@ impl Interceptor {
                                     }
                                 }
                             }
+                            // Notify TUI that Gugugaga is evaluating before the blocking LLM call
+                            "turn/completed" => {
+                                let content_len = notif_thread_id
+                                    .as_ref()
+                                    .and_then(|tid| thread_turn_content.get(tid))
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(&current_turn_content)
+                                    .trim()
+                                    .len();
+                                if content_len >= 20 {
+                                    let thinking_msg = serde_json::json!({
+                                        "method": "gugugaga/thinking",
+                                        "params": { "message": "Evaluating..." }
+                                    }).to_string();
+                                    let _ = output_tx_clone.send(thinking_msg).await;
+                                }
+                            }
                             _ => {}
                         }
                         
@@ -427,6 +460,15 @@ impl Interceptor {
                                     });
                                     let _ = output_tx_clone.send(notify.to_string()).await;
                                 }
+                            }
+                        }
+
+                        // After forwarding a message, replay any pending Gugugaga
+                        // history from a restored session so the TUI shows them
+                        // after the Codex conversation history.
+                        if !pending_gugugaga_history.is_empty() {
+                            for hist_msg in pending_gugugaga_history.drain(..) {
+                                let _ = output_tx_clone.send(hist_msg).await;
                             }
                         }
                     }
@@ -578,6 +620,10 @@ impl Interceptor {
                             let _ = mem
                                 .record_behavior(&format!("Violation: {}", violation.description), false)
                                 .await;
+                            let _ = mem.add_turn(
+                                crate::memory::TurnRole::Gugugaga,
+                                format!("⚠️ {}", violation.description),
+                            ).await;
                             
                             // Send violation notification so TUI can display it
                             return InterceptAction::InjectBefore(vec![
@@ -626,14 +672,31 @@ impl Interceptor {
                                     format!("Codex violated: {}", violation.description),
                                 ).await;
                             }
+                            // Record Gugugaga output to conversation history
+                            {
+                                let mut mem = memory.write().await;
+                                let _ = mem.add_turn(
+                                    crate::memory::TurnRole::Gugugaga,
+                                    format!("🛡️ Violation: {}", violation.description),
+                                ).await;
+                            }
                             // Found a violation - send correction directly to Codex
                             // Use LLM's correction as-is, no template wrapper
                             return InterceptAction::CorrectAgent(violation.correction);
                         } else {
                             // No violation - show what was analyzed
+                            let summary = &result.summary;
+                            // Record Gugugaga output to conversation history
+                            {
+                                let mut mem = memory.write().await;
+                                let _ = mem.add_turn(
+                                    crate::memory::TurnRole::Gugugaga,
+                                    summary.clone(),
+                                ).await;
+                            }
                             let mut params = serde_json::json!({
                                 "status": "ok",
-                                "message": result.summary
+                                "message": summary
                             });
                             // Include thinking if present
                             if let Some(thinking) = result.thinking {
