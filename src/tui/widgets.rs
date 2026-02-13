@@ -1347,8 +1347,23 @@ fn parse_unified_diff(text: &str) -> (Vec<DiffHunk>, usize, usize, usize) {
     let mut new_ln = 1usize;
 
     for line in text.lines() {
-        // Skip unified diff metadata headers (--- a/path, +++ b/path)
+        // Skip unified diff metadata headers
         if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+        // Skip git diff metadata (mode, index, rename, similarity, etc.)
+        if line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+            || line.starts_with("old mode ")
+            || line.starts_with("new mode ")
+            || line.starts_with("index ")
+            || line.starts_with("similarity index ")
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ")
+            || line.starts_with("copy from ")
+            || line.starts_with("copy to ")
+            || line.starts_with("diff --git ")
+        {
             continue;
         }
         if line.starts_with("@@") {
