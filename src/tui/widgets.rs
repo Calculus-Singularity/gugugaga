@@ -1335,6 +1335,23 @@ fn parse_diff_blocks(content: &str) -> Vec<DiffBlock> {
     blocks
 }
 
+/// Check if a line is git diff metadata that should be skipped.
+fn is_diff_metadata(line: &str) -> bool {
+    line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+        || line.starts_with("index ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+        || line.starts_with("copy from ")
+        || line.starts_with("copy to ")
+        || line.starts_with("diff --git ")
+}
+
 /// Parse unified diff text (starting from @@ lines) into hunks with line numbers.
 fn parse_unified_diff(text: &str) -> (Vec<DiffHunk>, usize, usize, usize) {
     let mut hunks = Vec::new();
@@ -1345,28 +1362,15 @@ fn parse_unified_diff(text: &str) -> (Vec<DiffHunk>, usize, usize, usize) {
     let mut current_hunk_lines: Vec<DiffLine> = Vec::new();
     let mut old_ln = 1usize;
     let mut new_ln = 1usize;
+    let mut seen_hunk_header = false;
 
     for line in text.lines() {
-        // Skip unified diff metadata headers
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
-            continue;
-        }
-        // Skip git diff metadata (mode, index, rename, similarity, etc.)
-        if line.starts_with("new file mode ")
-            || line.starts_with("deleted file mode ")
-            || line.starts_with("old mode ")
-            || line.starts_with("new mode ")
-            || line.starts_with("index ")
-            || line.starts_with("similarity index ")
-            || line.starts_with("rename from ")
-            || line.starts_with("rename to ")
-            || line.starts_with("copy from ")
-            || line.starts_with("copy to ")
-            || line.starts_with("diff --git ")
-        {
+        // Skip git diff metadata
+        if is_diff_metadata(line) {
             continue;
         }
         if line.starts_with("@@") {
+            seen_hunk_header = true;
             // Flush previous hunk
             if !current_hunk_lines.is_empty() {
                 hunks.push(DiffHunk {
@@ -1403,6 +1407,21 @@ fn parse_unified_diff(text: &str) -> (Vec<DiffHunk>, usize, usize, usize) {
         hunks.push(DiffHunk {
             lines: current_hunk_lines,
         });
+    }
+
+    // If no @@ hunk header was found, the content is raw text (e.g. new file).
+    // Treat all context lines as additions.
+    if !seen_hunk_header && total_added == 0 && total_removed == 0 {
+        for hunk in &mut hunks {
+            for dl in &mut hunk.lines {
+                if let DiffLine::Context(ln, content) = dl {
+                    let ln_val = *ln;
+                    let content_val = std::mem::take(content);
+                    *dl = DiffLine::Add(ln_val, content_val);
+                    total_added += 1;
+                }
+            }
+        }
     }
 
     if max_line_number == 0 {
