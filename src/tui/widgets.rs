@@ -493,6 +493,10 @@ fn sanitize_for_display(text: &str) -> String {
                 col += spaces;
             }
             '\r' => {} // skip
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
             c if c.is_control() => {
                 out.push(' ');
                 col += 1;
@@ -1047,4 +1051,33 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
     // Spacing line
     lines.push(Line::from(""));
     lines
+}
+
+#[cfg(test)]
+mod md_test {
+    use super::*;
+    
+    #[test]
+    fn test_markdown_rendering() {
+        let content = "可以，文件在：\n\n- calculator.py:1\n\n功能包括：\n- 支持加减\n- 支持退出\n\n运行：\n\n```bash\npython3 calc.py\n```";
+        let msg = Message::codex(content);
+        let lines = render_message_lines(&msg, 80);
+        // Badge + paragraph + blank + list item + blank + paragraph + blank
+        // + 2 list items + blank + paragraph + blank + code line + spacing = 14
+        assert!(lines.len() > 5, "Expected multiple lines, got {}", lines.len());
+        // Check list items are on separate lines
+        let texts: Vec<String> = lines.iter().map(|l| {
+            l.spans.iter().map(|s| s.content.as_ref().to_string()).collect()
+        }).collect();
+        assert!(texts.iter().any(|t| t.contains("- 支持加减")));
+        assert!(texts.iter().any(|t| t.contains("- 支持退出")));
+        assert!(texts.iter().any(|t| t.contains("python3 calc.py")));
+    }
+
+    #[test]
+    fn test_sanitize_preserves_newlines() {
+        let input = "Hello\nWorld\n\n- item";
+        let output = sanitize_for_display(input);
+        assert_eq!(output, input, "sanitize_for_display should preserve newlines");
+    }
 }

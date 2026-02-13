@@ -165,12 +165,16 @@ async fn run_tui_mode(
     .to_string();
     let _ = user_input_tx.send(initialized_msg).await;
 
-    // Step 3: Start a thread
+    // Step 3: Start a thread with workspace-write sandbox so Codex can
+    // actually create/edit files.  The app-server default is read-only.
     let thread_start_msg = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "thread/start",
         "id": 1,
-        "params": {}
+        "params": {
+            "sandbox": "workspace-write",
+            "approvalPolicy": "untrusted"
+        }
     })
     .to_string();
     let _ = user_input_tx.send(thread_start_msg).await;

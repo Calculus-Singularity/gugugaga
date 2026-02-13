@@ -940,7 +940,10 @@ impl App {
                 "jsonrpc": "2.0",
                 "method": "thread/start",
                 "id": self.request_counter,
-                "params": {}
+                "params": {
+                    "sandbox": "workspace-write",
+                    "approvalPolicy": "untrusted"
+                }
             })
             .to_string();
             let _ = tx.send(msg).await;
@@ -1434,7 +1437,11 @@ Make it comprehensive but concise."#;
                         // Build params with both threadId and path (if available).
                         // The path takes precedence in the app-server, bypassing
                         // the potentially unreliable UUID-based file search.
-                        let mut params = serde_json::json!({ "threadId": item_id });
+                        let mut params = serde_json::json!({
+                            "threadId": item_id,
+                            "sandbox": "workspace-write",
+                            "approvalPolicy": "untrusted"
+                        });
                         if let Some(path) = &item_metadata {
                             params["path"] = serde_json::json!(path);
                         }
