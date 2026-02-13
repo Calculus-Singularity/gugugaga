@@ -371,12 +371,10 @@ impl Interceptor {
                             }
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to parse server message: {}", e);
-                        // Forward unparseable messages as-is
-                        if output_tx_clone.send(line).await.is_err() {
-                            break;
-                        }
+                    Err(_) => {
+                        // Non-JSON lines (e.g. tracing log output from app-server)
+                        // — silently drop, do NOT forward to TUI.
+                        debug!("Dropping non-JSON server output: {}", &line[..line.len().min(120)]);
                     }
                 }
             }
@@ -476,7 +474,7 @@ impl Interceptor {
             .current_dir(&self.config.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| GugugagaError::AppServerStart(e.to_string()))?;
 

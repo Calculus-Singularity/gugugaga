@@ -17,6 +17,8 @@ pub struct PickerItem {
     pub id: String,
     pub title: String,
     pub subtitle: String,
+    /// Optional metadata (e.g. rollout file path for resume)
+    pub metadata: Option<String>,
 }
 
 /// Generic picker state

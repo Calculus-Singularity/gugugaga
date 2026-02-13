@@ -857,22 +857,149 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
         // System messages — dim italic, no badge header
         let style = Theme::dim().add_modifier(Modifier::ITALIC);
         add_plain(&mut lines, &content, style, text_avail, indent);
+    } else if msg.role == MessageRole::CommandExec {
+        // ── Codex-style command execution rendering ──
+        // Content format: "$ {command}\n{output}\n✓ exit 0 • 50ms"
+        //
+        // Rendered as:
+        //   • Ran {command}                (green/red/yellow bullet)
+        //     │ {continuation lines}       (for long commands)
+        //     └ {output line 1}            (dim)
+        //       {output line 2}
+        //   ✓ • 50ms                       (green/red status)
+
+        // Parse content sections
+        let mut cmd_text = String::new();
+        let mut output_lines_vec: Vec<&str> = Vec::new();
+        let mut status_line: Option<&str> = None;
+
+        for line in content.lines() {
+            if line.starts_with("$ ") {
+                cmd_text = line[2..].to_string();
+            } else if line.starts_with('\u{2713}') || line.starts_with('\u{2717}') {
+                // ✓ or ✗
+                status_line = Some(line);
+            } else {
+                output_lines_vec.push(line);
+            }
+        }
+
+        let is_completed = status_line.is_some();
+        let is_failed = status_line.map(|s| s.starts_with('\u{2717}')).unwrap_or(false);
+
+        let bullet_style = if is_failed {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else if is_completed {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        };
+        let title = if is_completed { "Ran " } else { "Running " };
+
+        // Header line: • Ran/Running {command first part}
+        if !cmd_text.is_empty() {
+            let prefix_display_w = 2 + title.len(); // "• " + title
+            let cmd_avail = text_avail.saturating_sub(prefix_display_w);
+            let cmd_wrapped = wrap_content(&cmd_text, cmd_avail);
+
+            if let Some(first) = cmd_wrapped.first() {
+                lines.push(Line::from(vec![
+                    Span::styled("• ", bullet_style),
+                    Span::styled(title.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(first.clone(), Style::default().add_modifier(Modifier::DIM)),
+                ]));
+            }
+            // Continuation lines for long commands
+            for wrapped_line in cmd_wrapped.iter().skip(1) {
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled("  │ ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(wrapped_line.clone(), Style::default().add_modifier(Modifier::DIM)),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("• ", bullet_style),
+                Span::styled(title.trim().to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            ]));
+        }
+
+        // Output block with └ prefix
+        let non_empty_output: Vec<&&str> = output_lines_vec.iter()
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !non_empty_output.is_empty() {
+            let output_avail = text_avail.saturating_sub(4); // "  └ " or "    " prefix
+            for (i, &&out_line) in non_empty_output.iter().enumerate() {
+                let (initial_prefix, continuation_prefix) = if i == 0 {
+                    ("  └ ", "    ")
+                } else {
+                    ("    ", "    ")
+                };
+                let out_wrapped = wrap_content(out_line, output_avail);
+                for (j, wrapped) in out_wrapped.iter().enumerate() {
+                    let pfx = if j == 0 { initial_prefix } else { continuation_prefix };
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled(pfx.to_string(), Style::default().add_modifier(Modifier::DIM)),
+                        Span::styled(wrapped.clone(), Style::default().add_modifier(Modifier::DIM)),
+                    ]));
+                }
+            }
+        } else if is_completed {
+            // (no output)
+            lines.push(Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled("(no output)", Style::default().add_modifier(Modifier::DIM)),
+            ]));
+        }
+
+        // Status line: ✓ • 50ms or ✗ (1) • 50ms
+        if let Some(status) = status_line {
+            let style = if status.starts_with('\u{2713}') {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(status.to_string(), style),
+            ]));
+        }
+    } else if msg.role == MessageRole::Thinking {
+        // ── Codex-style thinking/reasoning rendering ──
+        // Dim + italic text with • bullet prefix (matching ReasoningSummaryCell)
+        let dim_italic = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
+
+        // Render markdown first (no indent — we add our own prefix)
+        let mut md_lines: Vec<Line<'static>> = Vec::new();
+        add_markdown(&mut md_lines, &content, text_avail.saturating_sub(2), "");
+
+        for (i, line) in md_lines.into_iter().enumerate() {
+            let prefix = if i == 0 {
+                format!("{}• ", indent)
+            } else {
+                format!("{}  ", indent)
+            };
+
+            let mut new_spans = vec![Span::styled(
+                prefix,
+                Style::default().add_modifier(Modifier::DIM),
+            )];
+            for span in line.spans {
+                new_spans.push(span.patch_style(dim_italic));
+            }
+            lines.push(Line::from(new_spans));
+        }
     } else {
-        // Badge header line
+        // Standard badge + content for User, Codex, Gugugaga, FileChange, Correction
         lines.push(Line::from(vec![
             Span::styled(badge_text, badge_style),
             Span::styled(format!(" {}", msg.timestamp), Theme::muted()),
         ]));
 
-        // Content
         match msg.role {
-            MessageRole::Thinking => {
-                add_markdown(&mut lines, &content, text_avail, indent);
-            }
-            MessageRole::CommandExec => {
-                let style = Style::default().fg(Color::DarkGray);
-                add_plain(&mut lines, &content, style, text_avail, indent);
-            }
             MessageRole::FileChange => {
                 // Diff lines — wrap them too so they don't break the border
                 for raw_line in content.lines() {
@@ -886,8 +1013,8 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                         Style::default().fg(Color::Red)
                     } else if raw_line.starts_with("@@") {
                         Style::default().fg(Color::Cyan)
-                    } else if raw_line.starts_with("•") {
-                        // File path header (e.g. "• Edited src/foo.rs")
+                    } else if raw_line.starts_with('\u{2022}') {
+                        // • File path header (e.g. "• Edited src/foo.rs")
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                     } else if raw_line.starts_with("diff ") || raw_line.starts_with("---") || raw_line.starts_with("+++") {
                         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)

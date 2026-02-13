@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event},
+    event::{self, Event, MouseEventKind, MouseButton},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -174,6 +174,19 @@ pub struct App {
     animation: AsciiAnimation,
     /// Trust onboarding context. `Some` = user still needs to choose.
     trust_ctx: Option<crate::trust::TrustContext>,
+
+    // ── Mouse selection state ─────────────────────────────────
+    /// Whether the user is currently drag-selecting with the mouse.
+    selecting: bool,
+    /// Anchor point of the selection (screen row relative to message inner area, col).
+    sel_anchor: Option<(u16, u16)>,
+    /// Current end of the selection (screen row, col).
+    sel_end: Option<(u16, u16)>,
+    /// Rendered line texts cached during draw() for selection copy.
+    /// Index = screen-row relative to the inner message area.
+    rendered_lines: Vec<String>,
+    /// The Rect of the inner message area (set each draw frame).
+    msg_inner_rect: Rect,
 }
 
 impl App {
@@ -188,8 +201,7 @@ impl App {
     ) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        // Note: NOT using EnableMouseCapture so users can still select/copy text
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
 
@@ -239,6 +251,11 @@ impl App {
             },
             animation: AsciiAnimation::new(),
             trust_ctx,
+            selecting: false,
+            sel_anchor: None,
+            sel_end: None,
+            rendered_lines: Vec::new(),
+            msg_inner_rect: Rect::default(),
         })
     }
 
@@ -279,13 +296,6 @@ impl App {
         let mut last_spinner_update = std::time::Instant::now();
         let spinner_interval = Duration::from_millis(80);
         
-        // Enable "alternate scroll" mode - this makes the terminal convert
-        // mouse wheel events to arrow key events, WITHOUT capturing the mouse.
-        // This allows both scrolling AND text selection!
-        // ANSI sequence: \x1b[?1007h (enable), \x1b[?1007l (disable)
-        let _ = io::Write::write_all(&mut io::stdout(), b"\x1b[?1007h");
-        let _ = io::Write::flush(&mut io::stdout());
-
         // Drain any events queued during terminal setup so they don't
         // trigger an immediate transition out of the Welcome screen.
         while event::poll(Duration::from_millis(0))? {
@@ -371,23 +381,160 @@ impl App {
                         return Err(e);
                     }
 
-                    // Poll for keyboard events with short timeout
+                    // Poll for keyboard/mouse events with short timeout
                     if event::poll(poll_timeout)? {
-                        if let Event::Key(key) = event::read()? {
-                            self.handle_input(key).await;
+                        match event::read()? {
+                            Event::Key(key) => {
+                                self.handle_input(key).await;
+                            }
+                            Event::Mouse(mouse) => {
+                                self.handle_mouse(mouse);
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
         }
         
-        // Disable alternate scroll mode on exit
-        let _ = io::Write::write_all(&mut io::stdout(), b"\x1b[?1007l");
-        let _ = io::Write::flush(&mut io::stdout());
-
         Ok(())
     }
-    
+
+    /// Handle mouse events: selection drag, scroll wheel, auto-scroll at edges.
+    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        let rect = self.msg_inner_rect;
+        // Ignore if message area hasn't been laid out yet
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Start selection if click is in the message area
+                if mouse.column >= rect.x
+                    && mouse.column < rect.x + rect.width
+                    && mouse.row >= rect.y
+                    && mouse.row < rect.y + rect.height
+                {
+                    let rel_row = mouse.row - rect.y;
+                    let rel_col = mouse.column - rect.x;
+                    self.selecting = true;
+                    self.sel_anchor = Some((rel_row, rel_col));
+                    self.sel_end = Some((rel_row, rel_col));
+                } else {
+                    // Click outside message area — clear selection
+                    self.selecting = false;
+                    self.sel_anchor = None;
+                    self.sel_end = None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.selecting {
+                    let rel_row = mouse.row.saturating_sub(rect.y);
+                    let rel_col = mouse.column.saturating_sub(rect.x);
+                    self.sel_end = Some((rel_row.min(rect.height - 1), rel_col));
+
+                    // Auto-scroll when dragging near edges
+                    if mouse.row <= rect.y + 1 {
+                        // Near top edge — scroll up
+                        self.scroll_offset = self.scroll_offset.saturating_add(1);
+                    } else if mouse.row >= rect.y + rect.height - 2 {
+                        // Near bottom edge — scroll down
+                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.selecting {
+                    self.selecting = false;
+                    // Copy selected text to clipboard
+                    if let (Some(anchor), Some(end)) = (self.sel_anchor, self.sel_end) {
+                        let text = self.extract_selected_text(anchor, end);
+                        if !text.is_empty() {
+                            Self::copy_to_clipboard(&text);
+                        }
+                    }
+                    // Keep selection visible (don't clear anchor/end yet)
+                    // It will be cleared on next mouse down
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract the text between two selection points from the rendered lines.
+    fn extract_selected_text(&self, anchor: (u16, u16), end: (u16, u16)) -> String {
+        // Normalize so start <= end
+        let (start, finish) = if anchor.0 < end.0 || (anchor.0 == end.0 && anchor.1 <= end.1) {
+            (anchor, end)
+        } else {
+            (end, anchor)
+        };
+
+        let mut result = String::new();
+        for row in start.0..=finish.0 {
+            let idx = row as usize;
+            if idx >= self.rendered_lines.len() {
+                break;
+            }
+            let line = &self.rendered_lines[idx];
+            let chars: Vec<char> = line.chars().collect();
+
+            let col_start = if row == start.0 { start.1 as usize } else { 0 };
+            let col_end = if row == finish.0 {
+                (finish.1 as usize + 1).min(chars.len())
+            } else {
+                chars.len()
+            };
+
+            let selected: String = chars
+                .get(col_start..col_end)
+                .unwrap_or(&[])
+                .iter()
+                .collect();
+            result.push_str(&selected);
+            if row < finish.0 {
+                result.push('\n');
+            }
+        }
+        result
+    }
+
+    /// Copy text to system clipboard (macOS: pbcopy, Linux: xclip/xsel).
+    fn copy_to_clipboard(text: &str) {
+        use std::process::{Command, Stdio};
+        // macOS
+        if let Ok(mut child) = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return;
+        }
+        // Linux fallback: xclip
+        if let Ok(mut child) = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+
     async fn handle_input(&mut self, key: event::KeyEvent) {
         // Handle approval dialog first (highest priority — modal overlay)
         if let Some(approval) = self.pending_approval.take() {
@@ -893,8 +1040,8 @@ impl App {
         self.picker_mode = PickerMode::SkillsMenu;
         self.picker.title = "Skills".to_string();
         let items = vec![
-            PickerItem { id: "list".to_string(), title: "List skills".to_string(), subtitle: "Show all available skills".to_string() },
-            PickerItem { id: "manage".to_string(), title: "Enable/Disable skills".to_string(), subtitle: "Toggle individual skills on/off".to_string() },
+            PickerItem { id: "list".to_string(), title: "List skills".to_string(), subtitle: "Show all available skills".to_string(), metadata: None },
+            PickerItem { id: "manage".to_string(), title: "Enable/Disable skills".to_string(), subtitle: "Toggle individual skills on/off".to_string(), metadata: None },
         ];
         self.picker.open(items);
     }
@@ -1101,9 +1248,9 @@ impl App {
         self.picker_mode = PickerMode::Approvals;
         self.picker.title = "Approval Mode".to_string();
         let items = vec![
-            PickerItem { id: "suggest".to_string(), title: "Suggest".to_string(), subtitle: "Approve everything".to_string() },
-            PickerItem { id: "auto-edit".to_string(), title: "Auto Edit".to_string(), subtitle: "Auto-approve file edits".to_string() },
-            PickerItem { id: "full-auto".to_string(), title: "Full Auto".to_string(), subtitle: "Auto-approve everything".to_string() },
+            PickerItem { id: "suggest".to_string(), title: "Suggest".to_string(), subtitle: "Approve everything".to_string(), metadata: None },
+            PickerItem { id: "auto-edit".to_string(), title: "Auto Edit".to_string(), subtitle: "Auto-approve file edits".to_string(), metadata: None },
+            PickerItem { id: "full-auto".to_string(), title: "Full Auto".to_string(), subtitle: "Auto-approve everything".to_string(), metadata: None },
         ];
         self.picker.open(items);
     }
@@ -1113,9 +1260,9 @@ impl App {
         self.picker_mode = PickerMode::Permissions;
         self.picker.title = "Permissions".to_string();
         let items = vec![
-            PickerItem { id: "read-only".to_string(), title: "Read Only".to_string(), subtitle: "Can only read files".to_string() },
-            PickerItem { id: "workspace-write".to_string(), title: "Workspace Write".to_string(), subtitle: "Can write in workspace".to_string() },
-            PickerItem { id: "full-access".to_string(), title: "Full Access".to_string(), subtitle: "Full system access".to_string() },
+            PickerItem { id: "read-only".to_string(), title: "Read Only".to_string(), subtitle: "Can only read files".to_string(), metadata: None },
+            PickerItem { id: "workspace-write".to_string(), title: "Workspace Write".to_string(), subtitle: "Can write in workspace".to_string(), metadata: None },
+            PickerItem { id: "full-access".to_string(), title: "Full Access".to_string(), subtitle: "Full system access".to_string(), metadata: None },
         ];
         self.picker.open(items);
     }
@@ -1125,8 +1272,8 @@ impl App {
         self.picker_mode = PickerMode::Personality;
         self.picker.title = "Personality".to_string();
         let items = vec![
-            PickerItem { id: "friendly".to_string(), title: "Friendly".to_string(), subtitle: "Warm and encouraging".to_string() },
-            PickerItem { id: "pragmatic".to_string(), title: "Pragmatic".to_string(), subtitle: "Direct and efficient".to_string() },
+            PickerItem { id: "friendly".to_string(), title: "Friendly".to_string(), subtitle: "Warm and encouraging".to_string(), metadata: None },
+            PickerItem { id: "pragmatic".to_string(), title: "Pragmatic".to_string(), subtitle: "Direct and efficient".to_string(), metadata: None },
         ];
         self.picker.open(items);
     }
@@ -1272,6 +1419,7 @@ Make it comprehensive but concise."#;
         if let Some(item) = self.picker.selected_item() {
             let item_id = item.id.clone();
             let item_title = item.title.clone();
+            let item_metadata = item.metadata.clone();
 
             match self.picker_mode {
                 PickerMode::Resume => {
@@ -1283,11 +1431,18 @@ Make it comprehensive but concise."#;
                         self.request_counter += 1;
                         self.pending_request_id = Some(self.request_counter);
                         self.pending_request_type = PendingRequestType::ThreadResume(item_id.clone());
+                        // Build params with both threadId and path (if available).
+                        // The path takes precedence in the app-server, bypassing
+                        // the potentially unreliable UUID-based file search.
+                        let mut params = serde_json::json!({ "threadId": item_id });
+                        if let Some(path) = &item_metadata {
+                            params["path"] = serde_json::json!(path);
+                        }
                         let msg = serde_json::json!({
                             "jsonrpc": "2.0",
                             "method": "thread/resume",
                             "id": self.request_counter,
-                            "params": { "threadId": item_id }
+                            "params": params
                         })
                         .to_string();
                         let _ = tx.send(msg).await;
@@ -1802,13 +1957,7 @@ Make it comprehensive but concise."#;
                         match item_type {
                             "commandExecution" => {
                                 let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("command");
-                                // Truncate long commands
-                                let cmd_display = if cmd.len() > 60 {
-                                    format!("{}...", truncate_utf8(&cmd, 60))
-                                } else {
-                                    cmd.to_string()
-                                };
-                                self.messages.push(Message::command_exec(format!("$ {}", cmd_display)));
+                                self.messages.push(Message::command_exec(format!("$ {}", cmd)));
                             }
                             "fileChange" => {
                                 if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
@@ -1908,17 +2057,35 @@ Make it comprehensive but concise."#;
                         let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
                         match item_type {
                             "commandExecution" => {
-                                let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("completed");
                                 let exit_code = item.get("exitCode").and_then(|e| e.as_i64());
                                 let duration = item.get("durationMs").and_then(|d| d.as_i64());
-                                let mut info = format!("Command {}", status);
-                                if let Some(code) = exit_code {
-                                    info.push_str(&format!(" (exit {})", code));
+
+                                let dur_str = duration.map(|d| format!(" • {}ms", d)).unwrap_or_default();
+                                let status_line = if exit_code.unwrap_or(0) == 0 {
+                                    format!("\n\u{2713}{}", dur_str)
+                                } else {
+                                    format!("\n\u{2717} ({}){}", exit_code.unwrap_or(-1), dur_str)
+                                };
+
+                                // Update the last in-progress CommandExec message
+                                let updated = self.messages.iter_mut().rev()
+                                    .find(|m| m.role == MessageRole::CommandExec
+                                        && !m.content.contains('\u{2713}')
+                                        && !m.content.contains('\u{2717}'))
+                                    .map(|m| {
+                                        m.content.push_str(&status_line);
+                                        true
+                                    })
+                                    .unwrap_or(false);
+
+                                if !updated {
+                                    // Fallback: separate system message
+                                    let code_str = exit_code.map(|c| format!(" (exit {})", c)).unwrap_or_default();
+                                    let dur = duration.map(|d| format!(" in {}ms", d)).unwrap_or_default();
+                                    self.messages.push(Message::system(
+                                        &format!("Command completed{}{}", code_str, dur)
+                                    ));
                                 }
-                                if let Some(ms) = duration {
-                                    info.push_str(&format!(" in {}ms", ms));
-                                }
-                                self.messages.push(Message::system(&info));
                             }
                             "fileChange" => {
                                 let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
@@ -2228,6 +2395,9 @@ Make it comprehensive but concise."#;
                             .filter_map(|thread| {
                                 let id = thread.get("id")?.as_str()?.to_string();
                                 
+                                // Extract rollout file path for direct resume
+                                let rollout_path = thread.get("path").and_then(|p| p.as_str()).map(|s| s.to_string());
+                                
                                 // Filter by cwd - only show sessions from current directory
                                 let thread_cwd = thread.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
                                 if !thread_cwd.is_empty() && thread_cwd != current_cwd {
@@ -2280,6 +2450,7 @@ Make it comprehensive but concise."#;
                                     id,
                                     title,
                                     subtitle: date,
+                                    metadata: rollout_path,
                                 })
                             })
                             .collect();
@@ -2313,10 +2484,16 @@ Make it comprehensive but concise."#;
                     if let Some(thread) = result.get("thread") {
                         if let Some(id) = thread.get("id").and_then(|i| i.as_str()) {
                             self.thread_id = Some(id.to_string());
-                            self.messages.push(Message::system("Session resumed successfully!"));
-                            
-                            // Now request the thread history
-                            self.request_thread_read(id.to_string());
+                            // Display history directly from the resume response.
+                            // thread/resume already includes turns — no need for a
+                            // separate thread/read call (which would also hit the
+                            // unreliable UUID file search).
+                            if let Some(turns) = thread.get("turns").and_then(|t| t.as_array()) {
+                                if !turns.is_empty() {
+                                    self.display_turns(turns);
+                                    self.scroll_to_bottom();
+                                }
+                            }
                         }
                     }
                 } else if let Some(error) = json.get("error") {
@@ -2335,40 +2512,7 @@ Make it comprehensive but concise."#;
                 if let Some(result) = json.get("result") {
                     if let Some(thread) = result.get("thread") {
                         if let Some(turns) = thread.get("turns").and_then(|t| t.as_array()) {
-                            self.messages.push(Message::system("--- Session History ---"));
-                            
-                            for turn in turns {
-                                if let Some(items) = turn.get("items").and_then(|i| i.as_array()) {
-                                    for item in items {
-                                        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                        match item_type {
-                                            "userMessage" => {
-                                                if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
-                                                    for c in content {
-                                                        if let Some(text) = c.get("text").and_then(|t| t.as_str()) {
-                                                            self.messages.push(Message::user(text));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            "agentMessage" => {
-                                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                                    self.messages.push(Message::codex(text));
-                                                }
-                                            }
-                                            "commandExecution" => {
-                                                if let Some(cmd) = item.get("command").and_then(|c| c.as_str()) {
-                                                    let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                                                    self.messages.push(Message::command_exec(format!("$ {} ({})", cmd, status)));
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            self.messages.push(Message::system("--- End of History ---"));
+                            self.display_turns(turns);
                             self.scroll_to_bottom();
                         }
                     }
@@ -2390,6 +2534,7 @@ Make it comprehensive but concise."#;
                                     id,
                                     title: name,
                                     subtitle: provider.to_string(),
+                                    metadata: None,
                                 })
                             })
                             .collect();
@@ -2461,6 +2606,7 @@ Make it comprehensive but concise."#;
                                         id: name.clone(),
                                         title: name.clone(),
                                         subtitle: desc.clone(),
+                                        metadata: None,
                                     }
                                 }).collect();
                                 self.picker.set_items(items);
@@ -2481,6 +2627,7 @@ Make it comprehensive but concise."#;
                                         id: format!("{}:{}", prefix, path),
                                         title: format!("{} {}", status, name),
                                         subtitle: desc.clone(),
+                                        metadata: None,
                                     }
                                 }).collect();
                                 self.picker.set_items(items);
@@ -2530,6 +2677,7 @@ Make it comprehensive but concise."#;
                                     id: name.clone(),
                                     title: name,
                                     subtitle,
+                                    metadata: None,
                                 })
                             })
                             .collect();
@@ -2566,6 +2714,7 @@ Make it comprehensive but concise."#;
                                     id: id.clone(),
                                     title: format!("Thread {}", short_id),
                                     subtitle: id.clone(),
+                                    metadata: None,
                                 })
                             })
                             .collect();
@@ -2737,6 +2886,128 @@ Make it comprehensive but concise."#;
         }
     }
 
+    /// Display turns (from thread/resume or thread/read responses) as chat messages.
+    fn display_turns(&mut self, turns: &[serde_json::Value]) {
+        for turn in turns {
+            if let Some(items) = turn.get("items").and_then(|i| i.as_array()) {
+                for item in items {
+                    let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match item_type {
+                        "userMessage" => {
+                            if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                                for c in content {
+                                    if let Some(text) = c.get("text").and_then(|t| t.as_str()) {
+                                        self.messages.push(Message::user(text));
+                                    }
+                                }
+                            }
+                        }
+                        "agentMessage" => {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                self.messages.push(Message::codex(text));
+                            }
+                        }
+                        "reasoning" => {
+                            // Show thinking/reasoning — prefer summary, fallback to content
+                            let mut reasoning_text = String::new();
+                            if let Some(summary) = item.get("summary").and_then(|s| s.as_array()) {
+                                for s in summary {
+                                    if let Some(t) = s.as_str() {
+                                        if !reasoning_text.is_empty() {
+                                            reasoning_text.push('\n');
+                                        }
+                                        reasoning_text.push_str(t);
+                                    }
+                                }
+                            }
+                            if reasoning_text.is_empty() {
+                                if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                                    for c in content {
+                                        if let Some(t) = c.as_str() {
+                                            if !reasoning_text.is_empty() {
+                                                reasoning_text.push('\n');
+                                            }
+                                            reasoning_text.push_str(t);
+                                        }
+                                    }
+                                }
+                            }
+                            if !reasoning_text.is_empty() {
+                                self.messages.push(Message::thinking(&reasoning_text));
+                            }
+                        }
+                        "commandExecution" => {
+                            let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("?");
+                            let exit_code = item.get("exitCode").and_then(|e| e.as_i64());
+                            let duration = item.get("durationMs").and_then(|d| d.as_i64());
+                            let output = item.get("aggregatedOutput").and_then(|o| o.as_str()).unwrap_or("");
+
+                            let mut msg = format!("$ {}", cmd);
+
+                            if !output.is_empty() {
+                                let max_output = 2000;
+                                if output.len() > max_output {
+                                    msg.push_str(&format!("\n{}...\n... (output truncated)", &output[..max_output]));
+                                } else {
+                                    msg.push_str(&format!("\n{}", output));
+                                }
+                            }
+
+                            // Status line matching new renderer format
+                            let dur_str = duration.map(|d| format!(" \u{2022} {}ms", d)).unwrap_or_default();
+                            if exit_code.unwrap_or(0) == 0 {
+                                msg.push_str(&format!("\n\u{2713}{}", dur_str));
+                            } else if let Some(code) = exit_code {
+                                msg.push_str(&format!("\n\u{2717} ({}){}", code, dur_str));
+                            }
+
+                            self.messages.push(Message::command_exec(msg));
+                        }
+                        "fileChange" => {
+                            if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
+                                let mut full_diff = String::new();
+                                for change in changes {
+                                    let path = change.get("path")
+                                        .and_then(|p| p.as_str())
+                                        .unwrap_or("unknown");
+                                    let kind = change.get("kind")
+                                        .and_then(|k| k.get("type"))
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("update");
+                                    let verb = match kind {
+                                        "add" => "Added",
+                                        "delete" => "Deleted",
+                                        _ => "Edited",
+                                    };
+                                    full_diff.push_str(&format!("\u{2022} {} {}\n", verb, path));
+                                    if let Some(diff) = change.get("diff").and_then(|d| d.as_str()) {
+                                        if !diff.trim().is_empty() {
+                                            full_diff.push_str(diff);
+                                            if !diff.ends_with('\n') {
+                                                full_diff.push('\n');
+                                            }
+                                        }
+                                    }
+                                }
+                                if !full_diff.is_empty() {
+                                    self.messages.push(Message::file_change(full_diff.trim_end()));
+                                }
+                            }
+                        }
+                        "plan" => {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                if !text.is_empty() {
+                                    self.messages.push(Message::system(&format!("Plan: {}", text)));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn create_turn_message(&mut self, text: &str) -> String {
         self.request_counter += 1;
         let thread_id = self.thread_id.as_deref().unwrap_or("main");
@@ -2886,6 +3157,12 @@ Make it comprehensive but concise."#;
         let notebook_attention_items = &self.notebook_attention_items;
         let notebook_mistakes_count = &self.notebook_mistakes_count;
         let gugugaga_status = &self.gugugaga_status;
+        let sel_anchor = self.sel_anchor;
+        let sel_end = self.sel_end;
+
+        // These will be filled by the draw closure and written back after
+        let mut captured_lines: Vec<String> = Vec::new();
+        let mut captured_rect = Rect::default();
 
         self.terminal.draw(|f| {
             let size = f.area();
@@ -2938,8 +3215,10 @@ Make it comprehensive but concise."#;
                 .constraints([Constraint::Min(30), Constraint::Length(28)])
                 .split(main_chunks[2]);
 
-            // Messages
-            Self::render_messages(f, content_chunks[0], messages, scroll_offset);
+            // Messages (with selection highlighting)
+            let (lines_text, inner_rect) = Self::render_messages(f, content_chunks[0], messages, scroll_offset, sel_anchor, sel_end);
+            captured_lines = lines_text;
+            captured_rect = inner_rect;
 
             // Context panel (shows notebook state from cached data)
             let context_panel = ContextPanel {
@@ -2995,6 +3274,10 @@ Make it comprehensive but concise."#;
                 Self::render_approval_overlay(f, size, approval, approval_scroll);
             }
         })?;
+
+        // Write back the captured data from the draw closure
+        self.rendered_lines = captured_lines;
+        self.msg_inner_rect = captured_rect;
 
         Ok(())
     }
@@ -3248,7 +3531,18 @@ Make it comprehensive but concise."#;
         f.render_widget(footer_para, footer_area);
     }
 
-    fn render_messages(f: &mut Frame, area: Rect, messages: &[Message], scroll_offset: usize) {
+    /// Render messages with optional selection highlight.
+    /// Returns (rendered_line_texts, inner_rect) for mouse selection support.
+    fn render_messages(
+        f: &mut Frame,
+        area: Rect,
+        messages: &[Message],
+        scroll_offset: usize,
+        sel_anchor: Option<(u16, u16)>,
+        sel_end: Option<(u16, u16)>,
+    ) -> (Vec<String>, Rect) {
+        use ratatui::style::{Color, Modifier};
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Theme::border())
@@ -3280,6 +3574,83 @@ Make it comprehensive but concise."#;
             .take(visible_height)
             .collect();
 
+        // Extract plain text for each visible line (for clipboard copy)
+        let line_texts: Vec<String> = visible
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Apply selection highlight if there's an active selection
+        let visible = if let (Some(anchor), Some(end)) = (sel_anchor, sel_end) {
+            let (sel_start, sel_finish) = if anchor.0 < end.0 || (anchor.0 == end.0 && anchor.1 <= end.1) {
+                (anchor, end)
+            } else {
+                (end, anchor)
+            };
+
+            visible
+                .into_iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let row = i as u16;
+                    if row >= sel_start.0 && row <= sel_finish.0 {
+                        // This line is (at least partially) selected
+                        let col_start = if row == sel_start.0 { sel_start.1 as usize } else { 0 };
+                        let col_end = if row == sel_finish.0 { sel_finish.1 as usize + 1 } else { usize::MAX };
+
+                        // Rebuild spans with selection highlight
+                        let mut new_spans = Vec::new();
+                        let mut col = 0usize;
+                        for span in &line.spans {
+                            let span_len = span.content.chars().count();
+                            let span_end = col + span_len;
+
+                            if span_end <= col_start || col >= col_end {
+                                // Entirely outside selection
+                                new_spans.push(span.clone());
+                            } else if col >= col_start && span_end <= col_end {
+                                // Entirely inside selection
+                                new_spans.push(Span::styled(
+                                    span.content.clone(),
+                                    span.style.bg(Color::White).fg(Color::Black).remove_modifier(Modifier::all()),
+                                ));
+                            } else {
+                                // Partially selected — split the span
+                                let chars: Vec<char> = span.content.chars().collect();
+                                let local_start = col_start.saturating_sub(col);
+                                let local_end = col_end.saturating_sub(col).min(span_len);
+
+                                if local_start > 0 {
+                                    let before: String = chars[..local_start].iter().collect();
+                                    new_spans.push(Span::styled(before, span.style));
+                                }
+                                let selected: String = chars[local_start..local_end].iter().collect();
+                                new_spans.push(Span::styled(
+                                    selected,
+                                    span.style.bg(Color::White).fg(Color::Black).remove_modifier(Modifier::all()),
+                                ));
+                                if local_end < span_len {
+                                    let after: String = chars[local_end..].iter().collect();
+                                    new_spans.push(Span::styled(after, span.style));
+                                }
+                            }
+                            col = span_end;
+                        }
+                        Line::from(new_spans)
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            visible
+        };
+
         let paragraph = Paragraph::new(visible)
             .wrap(Wrap { trim: false });
         f.render_widget(paragraph, inner);
@@ -3304,17 +3675,19 @@ Make it comprehensive but concise."#;
                 &mut scrollbar_state,
             );
         }
+
+        (line_texts, inner)
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Disable alternate scroll mode
-        let _ = io::Write::write_all(&mut io::stdout(), b"\x1b[?1007l");
-        let _ = io::Write::flush(&mut io::stdout());
-        
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            crossterm::event::DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
