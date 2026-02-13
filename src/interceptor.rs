@@ -230,11 +230,70 @@ impl Interceptor {
                                     current_turn_content.push_str(delta);
                                 }
                             }
-                            // Track sub-agent spawns via item/completed with collabAgentToolCall
+                            // Accumulate command execution events so Gugugaga
+                            // knows what Codex actually DID (not just what it said).
+                            "item/started" => {
+                                if let Some(item) = msg.get("params").and_then(|p| p.get("item")) {
+                                    let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                    let annotation = match item_type {
+                                        "commandExecution" => {
+                                            let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("?");
+                                            Some(format!("\n[EXECUTED COMMAND] $ {}", cmd))
+                                        }
+                                        "fileChange" => {
+                                            let mut paths = Vec::new();
+                                            if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
+                                                for change in changes {
+                                                    if let Some(p) = change.get("path").and_then(|p| p.as_str()) {
+                                                        let kind = change.get("kind")
+                                                            .and_then(|k| k.get("type"))
+                                                            .and_then(|t| t.as_str())
+                                                            .unwrap_or("modify");
+                                                        paths.push(format!("{} {}", kind, p));
+                                                    }
+                                                }
+                                            }
+                                            if !paths.is_empty() {
+                                                Some(format!("\n[FILE CHANGES] {}", paths.join(", ")))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(text) = annotation {
+                                        if let Some(tid) = &notif_thread_id {
+                                            thread_turn_content.entry(tid.clone()).or_default().push_str(&text);
+                                        }
+                                        current_turn_content.push_str(&text);
+                                    }
+                                }
+                            }
+                            // Track command completion (exit code) and sub-agent spawns.
                             "item/completed" => {
                                 if let Some(item) = msg.get("params").and_then(|p| p.get("item")) {
+                                    let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                    match item_type {
+                                        "commandExecution" => {
+                                            let exit_code = item.get("exitCode").and_then(|e| e.as_i64()).unwrap_or(-1);
+                                            let annotation = format!("\n[COMMAND EXIT {}]", exit_code);
+                                            if let Some(tid) = &notif_thread_id {
+                                                thread_turn_content.entry(tid.clone()).or_default().push_str(&annotation);
+                                            }
+                                            current_turn_content.push_str(&annotation);
+                                        }
+                                        "fileChange" => {
+                                            let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("completed");
+                                            let annotation = format!("\n[FILE CHANGE {}]", status);
+                                            if let Some(tid) = &notif_thread_id {
+                                                thread_turn_content.entry(tid.clone()).or_default().push_str(&annotation);
+                                            }
+                                            current_turn_content.push_str(&annotation);
+                                        }
+                                        _ => {}
+                                    }
+                                    // Track sub-agent spawns
                                     if let Some(details) = item.get("details") {
-                                        // Check for collab agent tool call
                                         if let Some(tool) = details.get("tool").and_then(|t| t.as_str()) {
                                             if tool == "spawnAgent" {
                                                 if let Some(ids) = details.get("receiverThreadIds").and_then(|r| r.as_array()) {
