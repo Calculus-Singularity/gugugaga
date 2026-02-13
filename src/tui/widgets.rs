@@ -1201,7 +1201,7 @@ fn render_file_change_diff(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum DiffChangeType {
     Add,
     Delete,
@@ -1274,7 +1274,7 @@ fn parse_diff_blocks(content: &str) -> Vec<DiffBlock> {
                 i += 1;
             }
 
-            let (hunks, added, removed, max_ln) = parse_unified_diff(&diff_text);
+            let (hunks, added, removed, max_ln) = parse_unified_diff(&diff_text, change_type);
             blocks.push(DiffBlock {
                 filename,
                 change_type,
@@ -1309,7 +1309,7 @@ fn parse_diff_blocks(content: &str) -> Vec<DiffBlock> {
                 i += 1;
             }
 
-            let (hunks, added, removed, max_ln) = parse_unified_diff(&diff_text);
+            let (hunks, added, removed, max_ln) = parse_unified_diff(&diff_text, DiffChangeType::Update);
             let change_type = if removed == 0 && added > 0 {
                 DiffChangeType::Add
             } else if added == 0 && removed > 0 {
@@ -1353,7 +1353,9 @@ fn is_diff_metadata(line: &str) -> bool {
 }
 
 /// Parse unified diff text (starting from @@ lines) into hunks with line numbers.
-fn parse_unified_diff(text: &str) -> (Vec<DiffHunk>, usize, usize, usize) {
+/// `hint` indicates the known change type from the header (Add/Delete/Update),
+/// used to correctly interpret raw content (no @@ headers) as additions or deletions.
+fn parse_unified_diff(text: &str, hint: DiffChangeType) -> (Vec<DiffHunk>, usize, usize, usize) {
     let mut hunks = Vec::new();
     let mut total_added = 0usize;
     let mut total_removed = 0usize;
@@ -1409,16 +1411,22 @@ fn parse_unified_diff(text: &str) -> (Vec<DiffHunk>, usize, usize, usize) {
         });
     }
 
-    // If no @@ hunk header was found, the content is raw text (e.g. new file).
-    // Treat all context lines as additions.
+    // If no @@ hunk header was found, the content is raw text (e.g. new/deleted file).
+    // Convert context lines to Add (new file) or Delete (deleted file) based on hint.
     if !seen_hunk_header && total_added == 0 && total_removed == 0 {
+        let as_delete = matches!(hint, DiffChangeType::Delete);
         for hunk in &mut hunks {
             for dl in &mut hunk.lines {
                 if let DiffLine::Context(ln, content) = dl {
                     let ln_val = *ln;
                     let content_val = std::mem::take(content);
-                    *dl = DiffLine::Add(ln_val, content_val);
-                    total_added += 1;
+                    if as_delete {
+                        *dl = DiffLine::Delete(ln_val, content_val);
+                        total_removed += 1;
+                    } else {
+                        *dl = DiffLine::Add(ln_val, content_val);
+                        total_added += 1;
+                    }
                 }
             }
         }

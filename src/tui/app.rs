@@ -41,7 +41,6 @@ use super::slash_commands::{parse_command, CodexCommand, ParsedCommand, SlashPop
 use super::theme::Theme;
 use super::widgets::{
     render_message_lines, HeaderBar, HelpBar, InputBox, Message, MessageRole, StatusBar,
-    ContextPanel,
 };
 
 /// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
@@ -719,7 +718,7 @@ impl App {
                             self.forward_codex_command(cmd, args).await;
                         }
                         ParsedCommand::Gugugaga(cmd, args) => {
-                            self.execute_gugugaga_command(cmd, args);
+                            self.execute_gugugaga_command(cmd, args).await;
                         }
                         ParsedCommand::Unknown(name) => {
                             self.messages.push(Message::system(&format!(
@@ -1598,7 +1597,7 @@ Make it comprehensive but concise."#;
         }
     }
 
-    fn execute_gugugaga_command(&mut self, cmd: GugugagaCommand, args: String) {
+    async fn execute_gugugaga_command(&mut self, cmd: GugugagaCommand, args: String) {
         match cmd {
             GugugagaCommand::Help => {
                 self.messages.push(Message::system("Gugugaga commands (//):"));
@@ -1655,6 +1654,66 @@ Make it comprehensive but concise."#;
                     "Total violations detected: {}",
                     self.violations_detected
                 )));
+            }
+            GugugagaCommand::Notebook => {
+                if let Some(notebook) = &self.notebook {
+                    let nb = notebook.read().await;
+                    let mut lines = Vec::new();
+                    lines.push("📓 Gugugaga Notebook".to_string());
+                    lines.push("─".repeat(40));
+
+                    // Current activity
+                    if let Some(activity) = &nb.current_activity {
+                        lines.push(format!("\n▸ Current Activity: {}", activity));
+                    } else {
+                        lines.push("\n▸ Current Activity: (none)".to_string());
+                    }
+
+                    // Completed items
+                    lines.push(format!("\n▸ Completed ({}):", nb.completed.len()));
+                    if nb.completed.is_empty() {
+                        lines.push("  (none)".to_string());
+                    } else {
+                        for (i, item) in nb.completed.iter().rev().take(10).enumerate() {
+                            lines.push(format!("  {}. {} — {}", i + 1, item.what, item.significance));
+                        }
+                        if nb.completed.len() > 10 {
+                            lines.push(format!("  ... and {} more", nb.completed.len() - 10));
+                        }
+                    }
+
+                    // Attention items
+                    lines.push(format!("\n▸ Attention ({}):", nb.attention.len()));
+                    if nb.attention.is_empty() {
+                        lines.push("  (none)".to_string());
+                    } else {
+                        for item in &nb.attention {
+                            let priority = if item.priority == crate::memory::Priority::High {
+                                "⚠️"
+                            } else {
+                                "  "
+                            };
+                            lines.push(format!("{} [{}] {}", priority, item.source, item.content));
+                        }
+                    }
+
+                    // Mistakes
+                    lines.push(format!("\n▸ Mistakes & Lessons ({}):", nb.mistakes.len()));
+                    if nb.mistakes.is_empty() {
+                        lines.push("  (none)".to_string());
+                    } else {
+                        for (i, m) in nb.mistakes.iter().rev().take(5).enumerate() {
+                            lines.push(format!("  {}. {} → {}", i + 1, m.what_happened, m.lesson));
+                        }
+                        if nb.mistakes.len() > 5 {
+                            lines.push(format!("  ... and {} more", nb.mistakes.len() - 5));
+                        }
+                    }
+
+                    self.messages.push(Message::system(&lines.join("\n")));
+                } else {
+                    self.messages.push(Message::system("No notebook available (not initialized)."));
+                }
             }
             GugugagaCommand::Pause => {
                 self.is_paused = true;
@@ -3192,18 +3251,11 @@ Make it comprehensive but concise."#;
         let is_processing = self.is_processing;
         let spinner_frame = self.spinner_frame;
         let scroll_offset = self.scroll_offset;
-        let violations = self.violations_detected;
-        let corrections = self.corrections_made;
-        let _auto_replies = self.auto_replies;
         let slash_popup = &self.slash_popup;
         let is_paused = self.is_paused;
         let picker = &self.picker;
         let pending_approval = &self.pending_approval;
         let approval_scroll = self.approval_scroll;
-        let notebook_current_activity = &self.notebook_current_activity;
-        let notebook_completed_count = &self.notebook_completed_count;
-        let notebook_attention_items = &self.notebook_attention_items;
-        let notebook_mistakes_count = &self.notebook_mistakes_count;
         let gugugaga_status = &self.gugugaga_status;
         let elapsed_secs = self.turn_start_time.map(|t| t.elapsed().as_secs_f64());
         let sel_anchor = self.sel_anchor;
@@ -3241,12 +3293,6 @@ Make it comprehensive but concise."#;
             };
             f.render_widget(header, main_chunks[0]);
 
-            // Content area: messages + stats
-            let content_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(30), Constraint::Length(28)])
-                .split(main_chunks[1]);
-
             // Status bar (above input box)
             let status = StatusBar {
                 is_processing: is_processing || gugugaga_status.is_some(),
@@ -3264,22 +3310,10 @@ Make it comprehensive but concise."#;
             };
             f.render_widget(status, main_chunks[2]);
 
-            // Messages (with selection highlighting)
-            let (lines_text, inner_rect) = Self::render_messages(f, content_chunks[0], messages, scroll_offset, sel_anchor, sel_end);
+            // Messages (full width, no side panel)
+            let (lines_text, inner_rect) = Self::render_messages(f, main_chunks[1], messages, scroll_offset, sel_anchor, sel_end);
             captured_lines = lines_text;
             captured_rect = inner_rect;
-
-            // Context panel (shows notebook state from cached data)
-            let context_panel = ContextPanel {
-                current_activity: notebook_current_activity.clone(),
-                completed_count: *notebook_completed_count,
-                attention_items: notebook_attention_items.clone(),
-                mistakes_count: *notebook_mistakes_count,
-                violations,
-                corrections,
-                is_monitoring: is_processing,
-            };
-            f.render_widget(context_panel, content_chunks[1]);
 
             // Input box
             let input_box = InputBox {
