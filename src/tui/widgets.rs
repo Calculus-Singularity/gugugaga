@@ -174,15 +174,29 @@ pub struct StatusBar {
     pub is_processing: bool,
     pub spinner_frame: usize,
     pub status_text: String,
+    /// Elapsed time since processing started (for "Thinking... 3.2s" display)
+    pub elapsed_secs: Option<f64>,
 }
 
 impl Widget for StatusBar {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let line = if self.is_processing {
             let spinner = super::shimmer::AnimatedDots::new(self.spinner_frame);
+            let elapsed_str = if let Some(secs) = self.elapsed_secs {
+                if secs < 60.0 {
+                    format!(" ({:.1}s)", secs)
+                } else {
+                    let mins = (secs / 60.0).floor() as u64;
+                    let remaining = secs - (mins as f64 * 60.0);
+                    format!(" ({}m {:.0}s)", mins, remaining)
+                }
+            } else {
+                String::new()
+            };
             Line::from(vec![
                 Span::styled(format!("{} ", spinner.current()), Theme::accent()),
                 Span::styled(&self.status_text, Theme::accent()),
+                Span::styled(elapsed_str, Theme::dim()),
             ])
         } else {
             Line::from(vec![

@@ -181,6 +181,8 @@ pub struct App {
     notebook_mistakes_count: usize,
     /// Gugugaga thinking status (shown in status bar, like Codex's StatusIndicatorWidget)
     gugugaga_status: Option<String>,
+    /// When the current turn started processing (for elapsed time display)
+    turn_start_time: Option<std::time::Instant>,
     /// Current application phase (Welcome animation → Chat).
     phase: AppPhase,
     /// ASCII art animation for the welcome screen.
@@ -256,6 +258,7 @@ impl App {
             notebook_attention_items: Vec::new(),
             notebook_mistakes_count: 0,
             gugugaga_status: None,
+            turn_start_time: None,
             // Skip the Welcome animation if trust is already established
             phase: if trust_ctx.is_some() {
                 AppPhase::Welcome
@@ -733,7 +736,7 @@ impl App {
                     }
                     self.messages.push(Message::user(&text));
                     self.scroll_to_bottom();
-                    self.is_processing = true;
+                    self.start_processing();
 
                         let msg = self.create_turn_message(&text);
                     if let Some(tx) = &self.input_tx {
@@ -1129,7 +1132,7 @@ impl App {
             .to_string();
             let _ = tx.send(msg).await;
                 self.messages.push(Message::system("Starting code review (uncommitted changes)..."));
-                self.is_processing = true;
+                self.start_processing();
             }
         } else {
             self.messages.push(Message::system("No active thread. Start a conversation first."));
@@ -1405,7 +1408,7 @@ Make it comprehensive but concise."#;
             let _ = tx.send(msg).await;
             self.messages.push(Message::user("/init"));
             self.messages.push(Message::system("Creating AGENTS.md..."));
-            self.is_processing = true;
+            self.start_processing();
         }
     }
 
@@ -1787,7 +1790,7 @@ Make it comprehensive but concise."#;
                     // Only show error if it seems relevant (not from init)
                     if self.pending_request_id.is_some() {
                     self.messages.push(Message::system(&format!("Error: {}", error_msg)));
-                    self.is_processing = false;
+                    self.stop_processing();
                         self.pending_request_id = None;
                         self.pending_request_type = PendingRequestType::None;
                         // Close picker if it was open
@@ -1810,7 +1813,7 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("delta"))
                         .and_then(|t| t.as_str())
                     {
-                        self.is_processing = true;
+                        self.start_processing();
                         if let Some(last) = self.messages.last_mut() {
                             if last.role == MessageRole::Codex {
                                 last.content.push_str(delta);
@@ -1829,7 +1832,7 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("delta"))
                         .and_then(|t| t.as_str())
                     {
-                        self.is_processing = true;
+                        self.start_processing();
                         // Append to existing thinking message or create new one
                         if let Some(last) = self.messages.last_mut() {
                             if last.role == MessageRole::Thinking {
@@ -1847,7 +1850,7 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("delta"))
                         .and_then(|t| t.as_str())
                     {
-                        self.is_processing = true;
+                        self.start_processing();
                         if let Some(last) = self.messages.last_mut() {
                             if last.role == MessageRole::Thinking {
                                 last.content.push_str(delta);
@@ -1864,7 +1867,7 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("delta"))
                         .and_then(|t| t.as_str())
                     {
-                        self.is_processing = true;
+                        self.start_processing();
                         if let Some(last) = self.messages.last_mut() {
                             if last.role == MessageRole::Thinking {
                                 last.content.push_str(delta);
@@ -1881,7 +1884,7 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("delta"))
                         .and_then(|t| t.as_str())
                     {
-                        self.is_processing = true;
+                        self.start_processing();
                         if let Some(last) = self.messages.last_mut() {
                             if last.role == MessageRole::Thinking {
                                 last.content.push_str(delta);
@@ -1898,7 +1901,7 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("delta"))
                         .and_then(|t| t.as_str())
                     {
-                        self.is_processing = true;
+                        self.start_processing();
                         const MAX_OUTPUT_LINES: usize = 50;
                         const MAX_OUTPUT_CHARS: usize = 4000;
                         
@@ -1939,7 +1942,7 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("delta"))
                         .and_then(|t| t.as_str())
                     {
-                        self.is_processing = true;
+                        self.start_processing();
                         if let Some(last) = self.messages.last_mut() {
                             if last.role == MessageRole::FileChange {
                                 last.content.push_str(delta);
@@ -2077,7 +2080,7 @@ Make it comprehensive but concise."#;
                             }
                             _ => {}
                         }
-                        self.is_processing = true;
+                        self.start_processing();
                     }
                 }
                 "item/completed" => {
@@ -2250,7 +2253,7 @@ Make it comprehensive but concise."#;
                 }
                 // "turn/diff/updated" handled above (near item/fileChange/outputDelta)
                 "turn/started" => {
-                    self.is_processing = true;
+                    self.start_processing();
                     self.current_turn_violations = 0;
                     // Capture turn_id for interrupt support
                     if let Some(turn_id) = json
@@ -2291,7 +2294,7 @@ Make it comprehensive but concise."#;
                         _ => {} // "completed" — normal
                     }
 
-                    self.is_processing = false;
+                    self.stop_processing();
                     self.current_turn_id = None;
                     self.scroll_to_bottom();
                 }
@@ -2399,7 +2402,7 @@ Make it comprehensive but concise."#;
                         .and_then(|m| m.as_str())
                     {
                         self.messages.push(Message::system(&format!("Error: {}", msg)));
-                        self.is_processing = false;
+                        self.stop_processing();
                     }
                 }
                 _ => {
@@ -3077,6 +3080,20 @@ Make it comprehensive but concise."#;
         }
     }
 
+    /// Mark the start of processing (sets timer if not already running).
+    fn start_processing(&mut self) {
+        if !self.is_processing {
+            self.turn_start_time = Some(std::time::Instant::now());
+        }
+        self.start_processing();
+    }
+
+    /// Mark the end of processing (clears timer).
+    fn stop_processing(&mut self) {
+        self.stop_processing();
+        self.turn_start_time = None;
+    }
+
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
@@ -3188,6 +3205,7 @@ Make it comprehensive but concise."#;
         let notebook_attention_items = &self.notebook_attention_items;
         let notebook_mistakes_count = &self.notebook_mistakes_count;
         let gugugaga_status = &self.gugugaga_status;
+        let elapsed_secs = self.turn_start_time.map(|t| t.elapsed().as_secs_f64());
         let sel_anchor = self.sel_anchor;
         let sel_end = self.sel_end;
 
@@ -3236,12 +3254,13 @@ Make it comprehensive but concise."#;
                 status_text: if let Some(gs) = gugugaga_status {
                     format!("Supervising: {} (Esc to interrupt)", gs)
                 } else if is_processing {
-                    "Thinking... (Esc to interrupt)".to_string()
+                    "Thinking (Esc to interrupt)".to_string()
                 } else if is_paused {
                     "Monitoring paused".to_string()
                 } else {
                     String::new()
                 },
+                elapsed_secs: if is_processing { elapsed_secs } else { None },
             };
             f.render_widget(status, main_chunks[2]);
 
