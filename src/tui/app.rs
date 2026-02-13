@@ -21,6 +21,19 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::memory::GugugagaNotebook;
 
+/// Convert an absolute file path to a relative path based on cwd.
+fn make_relative_path(raw_path: &str, cwd: &str) -> String {
+    if let Ok(rel) = std::path::Path::new(raw_path).strip_prefix(cwd) {
+        rel.to_string_lossy().to_string()
+    } else {
+        // Fallback: just use the filename
+        std::path::Path::new(raw_path)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| raw_path.to_string())
+    }
+}
+
 use super::ascii_animation::AsciiAnimation;
 use super::input::{InputAction, InputState};
 use super::picker::{Picker, PickerItem};
@@ -1979,7 +1992,8 @@ Make it comprehensive but concise."#;
                                     let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
                                     let mut full_diff = String::new();
                                     for change in changes {
-                                        let path = change.get("path").and_then(|p| p.as_str()).unwrap_or("file");
+                                        let raw_path = change.get("path").and_then(|p| p.as_str()).unwrap_or("file");
+                                        let path = make_relative_path(raw_path, &self.cwd);
                                         let kind = change.get("kind");
                                         let verb = if let Some(k) = kind.and_then(|k| k.as_str()) {
                                             match k {
@@ -2109,7 +2123,8 @@ Make it comprehensive but concise."#;
                                 if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
                                     let mut full_diff = String::new();
                                     for change in changes {
-                                        let path = change.get("path").and_then(|p| p.as_str()).unwrap_or("file");
+                                        let raw_path = change.get("path").and_then(|p| p.as_str()).unwrap_or("file");
+                                        let path = make_relative_path(raw_path, &self.cwd);
                                         let kind = change.get("kind");
                                         let verb = if let Some(k) = kind.and_then(|k| k.as_str()) {
                                             match k {
@@ -2982,9 +2997,10 @@ Make it comprehensive but concise."#;
                             if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
                                 let mut full_diff = String::new();
                                 for change in changes {
-                                    let path = change.get("path")
+                                    let raw_path = change.get("path")
                                         .and_then(|p| p.as_str())
                                         .unwrap_or("unknown");
+                                    let path = make_relative_path(raw_path, &self.cwd);
                                     let kind = change.get("kind")
                                         .and_then(|k| k.get("type"))
                                         .and_then(|t| t.as_str())

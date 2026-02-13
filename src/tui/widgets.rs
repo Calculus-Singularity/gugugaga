@@ -1005,33 +1005,8 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
 
         match msg.role {
             MessageRole::FileChange => {
-                // Diff lines — wrap them too so they don't break the border
-                for raw_line in content.lines() {
-                    // Skip internal markers used for message replacement
-                    if raw_line.starts_with("[fc:") || raw_line.starts_with("[turn diff]") {
-                        continue;
-                    }
-                    let style = if raw_line.starts_with('+') {
-                        Style::default().fg(Color::Green)
-                    } else if raw_line.starts_with('-') {
-                        Style::default().fg(Color::Red)
-                    } else if raw_line.starts_with("@@") {
-                        Style::default().fg(Color::Cyan)
-                    } else if raw_line.starts_with('\u{2022}') {
-                        // • File path header (e.g. "• Edited src/foo.rs")
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                    } else if raw_line.starts_with("diff ") || raw_line.starts_with("---") || raw_line.starts_with("+++") {
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                    } else {
-                        Theme::dim()
-                    };
-                    for wrapped in wrap_content(raw_line, text_avail) {
-                        lines.push(Line::from(vec![
-                            Span::raw(indent.to_string()),
-                            Span::styled(wrapped, style),
-                        ]));
-                    }
-                }
+                // Codex-style diff rendering with file headers, line counts, and line numbers
+                render_file_change_diff(&content, text_avail, indent, &mut lines);
             }
             MessageRole::Correction => {
                 add_markdown(&mut lines, &content, text_avail, indent);
@@ -1051,6 +1026,400 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
     // Spacing line
     lines.push(Line::from(""));
     lines
+}
+
+/// Codex-style file change diff rendering.
+///
+/// Parses unified diff content and renders:
+/// - File header: `• Edited filename (+N -M)` with colored counts
+/// - Line-numbered diff with colored +/- lines and gutter
+/// - Hunk separators with `⋮`
+fn render_file_change_diff(
+    content: &str,
+    text_avail: usize,
+    indent: &str,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let style_gutter = Style::default().add_modifier(Modifier::DIM);
+    let style_add = Style::default().fg(Color::Green);
+    let style_del = Style::default().fg(Color::Red);
+    let style_context = Style::default();
+
+    // Parse the content into per-file diff blocks
+    let blocks = parse_diff_blocks(content);
+
+    if blocks.is_empty() {
+        // Fallback: if we can't parse, show raw content dimmed
+        for raw_line in content.lines() {
+            if raw_line.starts_with("[fc:") || raw_line.starts_with("[turn diff]") {
+                continue;
+            }
+            lines.push(Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(raw_line.to_string(), Theme::dim()),
+            ]));
+        }
+        return;
+    }
+
+    let file_count = blocks.len();
+    let total_added: usize = blocks.iter().map(|b| b.added).sum();
+    let total_removed: usize = blocks.iter().map(|b| b.removed).sum();
+
+    // Summary header for multi-file changes
+    if file_count > 1 {
+        let noun = if file_count == 1 { "file" } else { "files" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}• ", indent), style_gutter),
+            Span::styled("Edited".to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {} {} ", file_count, noun)),
+            Span::raw("("),
+            Span::styled(format!("+{}", total_added), style_add),
+            Span::raw(" "),
+            Span::styled(format!("-{}", total_removed), style_del),
+            Span::raw(")"),
+        ]));
+    }
+
+    for (block_idx, block) in blocks.iter().enumerate() {
+        if block_idx > 0 {
+            lines.push(Line::from(""));
+        }
+
+        // Per-file header
+        let verb = match block.change_type {
+            DiffChangeType::Add => "Added",
+            DiffChangeType::Delete => "Deleted",
+            DiffChangeType::Update => "Edited",
+        };
+
+        let file_prefix = if file_count > 1 {
+            format!("{}  └ ", indent)
+        } else {
+            format!("{}• ", indent)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(file_prefix, style_gutter),
+            Span::styled(verb.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {} ", block.filename)),
+            Span::raw("("),
+            Span::styled(format!("+{}", block.added), style_add),
+            Span::raw(" "),
+            Span::styled(format!("-{}", block.removed), style_del),
+            Span::raw(")"),
+        ]));
+
+        // Diff content with line numbers
+        let gutter_width = block.max_line_number.to_string().len().max(1);
+        let content_avail = text_avail.saturating_sub(gutter_width + 5); // gutter + sign + padding
+
+        let mut is_first_hunk = true;
+        for hunk in &block.hunks {
+            if !is_first_hunk {
+                // Hunk separator
+                let spacer = format!(
+                    "{}{:>width$} ",
+                    indent,
+                    "",
+                    width = gutter_width
+                );
+                lines.push(Line::from(vec![
+                    Span::styled(spacer, style_gutter),
+                    Span::styled("⋮".to_string(), style_gutter),
+                ]));
+            }
+            is_first_hunk = false;
+
+            for diff_line in &hunk.lines {
+                let (sign, line_style, ln) = match diff_line {
+                    DiffLine::Add(ln, _) => ('+', style_add, *ln),
+                    DiffLine::Delete(ln, _) => ('-', style_del, *ln),
+                    DiffLine::Context(ln, _) => (' ', style_context, *ln),
+                };
+                let text = match diff_line {
+                    DiffLine::Add(_, t) | DiffLine::Delete(_, t) | DiffLine::Context(_, t) => t,
+                };
+
+                // Wrap long lines
+                let mut remaining = text.as_str();
+                let mut first = true;
+                loop {
+                    let chunk_len = remaining
+                        .char_indices()
+                        .nth(content_avail)
+                        .map(|(i, _)| i)
+                        .unwrap_or(remaining.len());
+                    let (chunk, rest) = remaining.split_at(chunk_len);
+                    remaining = rest;
+
+                    if first {
+                        let gutter = format!(
+                            "{}{:>width$} ",
+                            indent,
+                            ln,
+                            width = gutter_width
+                        );
+                        lines.push(Line::from(vec![
+                            Span::styled(gutter, style_gutter),
+                            Span::styled(format!("{}{}", sign, chunk), line_style),
+                        ]));
+                        first = false;
+                    } else {
+                        let gutter = format!(
+                            "{}{:>width$}  ",
+                            indent,
+                            "",
+                            width = gutter_width
+                        );
+                        lines.push(Line::from(vec![
+                            Span::styled(gutter, style_gutter),
+                            Span::styled(chunk.to_string(), line_style),
+                        ]));
+                    }
+
+                    if remaining.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DiffChangeType {
+    Add,
+    Delete,
+    Update,
+}
+
+#[derive(Debug)]
+enum DiffLine {
+    Add(usize, String),
+    Delete(usize, String),
+    Context(usize, String),
+}
+
+#[derive(Debug)]
+struct DiffHunk {
+    lines: Vec<DiffLine>,
+}
+
+#[derive(Debug)]
+struct DiffBlock {
+    filename: String,
+    change_type: DiffChangeType,
+    added: usize,
+    removed: usize,
+    max_line_number: usize,
+    hunks: Vec<DiffHunk>,
+}
+
+/// Parse diff content into structured blocks.
+/// Handles both:
+/// - Our custom format: `• Edited/Added/Deleted path\n<unified diff>`
+/// - Raw unified diff format: `diff --git a/path b/path\n---\n+++\n@@...`
+fn parse_diff_blocks(content: &str) -> Vec<DiffBlock> {
+    let mut blocks = Vec::new();
+    let raw_lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < raw_lines.len() {
+        let line = raw_lines[i];
+
+        // Skip internal markers
+        if line.starts_with("[fc:") || line.starts_with("[turn diff]") {
+            i += 1;
+            continue;
+        }
+
+        // Our custom format: "• Verb path"
+        if line.starts_with('\u{2022}') {
+            let rest = line.trim_start_matches('\u{2022}').trim();
+            let (change_type, filename) = if let Some(name) = rest.strip_prefix("Added ") {
+                (DiffChangeType::Add, name.trim().to_string())
+            } else if let Some(name) = rest.strip_prefix("Deleted ") {
+                (DiffChangeType::Delete, name.trim().to_string())
+            } else if let Some(name) = rest.strip_prefix("Edited ") {
+                (DiffChangeType::Update, name.trim().to_string())
+            } else {
+                (DiffChangeType::Update, rest.to_string())
+            };
+            i += 1;
+
+            // Collect diff lines until next block or end
+            let mut diff_text = String::new();
+            while i < raw_lines.len()
+                && !raw_lines[i].starts_with('\u{2022}')
+                && !raw_lines[i].starts_with("[fc:")
+                && !raw_lines[i].starts_with("diff ")
+            {
+                diff_text.push_str(raw_lines[i]);
+                diff_text.push('\n');
+                i += 1;
+            }
+
+            let (hunks, added, removed, max_ln) = parse_unified_diff(&diff_text);
+            blocks.push(DiffBlock {
+                filename,
+                change_type,
+                added,
+                removed,
+                max_line_number: max_ln,
+                hunks,
+            });
+            continue;
+        }
+
+        // Raw unified diff: "diff --git a/path b/path"
+        if line.starts_with("diff ") {
+            let filename = extract_filename_from_diff_header(line);
+            i += 1;
+            // Skip --- and +++ lines
+            while i < raw_lines.len()
+                && (raw_lines[i].starts_with("---") || raw_lines[i].starts_with("+++"))
+            {
+                i += 1;
+            }
+
+            // Collect @@ hunks
+            let mut diff_text = String::new();
+            while i < raw_lines.len()
+                && !raw_lines[i].starts_with("diff ")
+                && !raw_lines[i].starts_with('\u{2022}')
+                && !raw_lines[i].starts_with("[fc:")
+            {
+                diff_text.push_str(raw_lines[i]);
+                diff_text.push('\n');
+                i += 1;
+            }
+
+            let (hunks, added, removed, max_ln) = parse_unified_diff(&diff_text);
+            let change_type = if removed == 0 && added > 0 {
+                DiffChangeType::Add
+            } else if added == 0 && removed > 0 {
+                DiffChangeType::Delete
+            } else {
+                DiffChangeType::Update
+            };
+            blocks.push(DiffBlock {
+                filename,
+                change_type,
+                added,
+                removed,
+                max_line_number: max_ln,
+                hunks,
+            });
+            continue;
+        }
+
+        // Skip unrecognized lines
+        i += 1;
+    }
+
+    blocks
+}
+
+/// Parse unified diff text (starting from @@ lines) into hunks with line numbers.
+fn parse_unified_diff(text: &str) -> (Vec<DiffHunk>, usize, usize, usize) {
+    let mut hunks = Vec::new();
+    let mut total_added = 0usize;
+    let mut total_removed = 0usize;
+    let mut max_line_number = 0usize;
+
+    let mut current_hunk_lines: Vec<DiffLine> = Vec::new();
+    let mut old_ln = 1usize;
+    let mut new_ln = 1usize;
+
+    for line in text.lines() {
+        // Skip unified diff metadata headers (--- a/path, +++ b/path)
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+        if line.starts_with("@@") {
+            // Flush previous hunk
+            if !current_hunk_lines.is_empty() {
+                hunks.push(DiffHunk {
+                    lines: std::mem::take(&mut current_hunk_lines),
+                });
+            }
+            // Parse @@ -old_start,old_count +new_start,new_count @@
+            if let Some((old_start, new_start)) = parse_hunk_header(line) {
+                old_ln = old_start;
+                new_ln = new_start;
+            }
+        } else if let Some(rest) = line.strip_prefix('+') {
+            max_line_number = max_line_number.max(new_ln);
+            current_hunk_lines.push(DiffLine::Add(new_ln, rest.to_string()));
+            new_ln += 1;
+            total_added += 1;
+        } else if let Some(rest) = line.strip_prefix('-') {
+            max_line_number = max_line_number.max(old_ln);
+            current_hunk_lines.push(DiffLine::Delete(old_ln, rest.to_string()));
+            old_ln += 1;
+            total_removed += 1;
+        } else if line.starts_with(' ') || (!line.is_empty() && !line.starts_with('\\')) {
+            let text = if line.starts_with(' ') { &line[1..] } else { line };
+            max_line_number = max_line_number.max(new_ln);
+            current_hunk_lines.push(DiffLine::Context(new_ln, text.to_string()));
+            old_ln += 1;
+            new_ln += 1;
+        }
+        // Skip "\ No newline at end of file" and empty lines
+    }
+
+    // Flush last hunk
+    if !current_hunk_lines.is_empty() {
+        hunks.push(DiffHunk {
+            lines: current_hunk_lines,
+        });
+    }
+
+    if max_line_number == 0 {
+        max_line_number = 1;
+    }
+
+    (hunks, total_added, total_removed, max_line_number)
+}
+
+/// Parse a hunk header like `@@ -1,5 +1,7 @@` and return (old_start, new_start).
+fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    // Format: @@ -old_start[,old_count] +new_start[,new_count] @@
+    let trimmed = line.trim_start_matches('@').trim_end_matches('@').trim();
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let old_start = parts[0]
+        .trim_start_matches('-')
+        .split(',')
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    let new_start = parts[1]
+        .trim_start_matches('+')
+        .split(',')
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    Some((old_start, new_start))
+}
+
+/// Extract filename from a "diff --git a/path b/path" header.
+fn extract_filename_from_diff_header(line: &str) -> String {
+    // "diff --git a/foo/bar.rs b/foo/bar.rs"
+    if let Some(rest) = line.strip_prefix("diff --git ") {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() >= 2 {
+            return parts[1].trim_start_matches("b/").to_string();
+        }
+        if !parts.is_empty() {
+            return parts[0].trim_start_matches("a/").to_string();
+        }
+    }
+    // Fallback
+    line.to_string()
 }
 
 #[cfg(test)]
