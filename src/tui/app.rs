@@ -3085,12 +3085,12 @@ Make it comprehensive but concise."#;
         if !self.is_processing {
             self.turn_start_time = Some(std::time::Instant::now());
         }
-        self.start_processing();
+        self.is_processing = true;
     }
 
     /// Mark the end of processing (clears timer).
     fn stop_processing(&mut self) {
-        self.stop_processing();
+        self.is_processing = false;
         self.turn_start_time = None;
     }
 
