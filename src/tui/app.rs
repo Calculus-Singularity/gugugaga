@@ -942,7 +942,7 @@ impl App {
                 "id": self.request_counter,
                 "params": {
                     "sandbox": "workspace-write",
-                    "approvalPolicy": "untrusted",
+                    "approvalPolicy": "on-request",
                     "config": {
                         "experimental_use_freeform_apply_patch": true
                     }
@@ -1443,7 +1443,7 @@ Make it comprehensive but concise."#;
                         let mut params = serde_json::json!({
                             "threadId": item_id,
                             "sandbox": "workspace-write",
-                            "approvalPolicy": "untrusted",
+                            "approvalPolicy": "on-request",
                             "config": {
                                 "experimental_use_freeform_apply_patch": true
                             }
