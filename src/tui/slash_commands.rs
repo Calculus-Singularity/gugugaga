@@ -265,6 +265,8 @@ pub enum ParsedCommand {
     Codex(CodexCommand, String),
     /// Gugugaga command (handle locally)
     Gugugaga(GugugagaCommand, String),
+    /// Direct chat message to Gugugaga (// followed by non-command text)
+    GugugagaChat(String),
     /// Unknown command
     Unknown(String),
 }
@@ -282,6 +284,12 @@ pub fn parse_command(input: &str) -> Option<ParsedCommand> {
 
         if let Some(cmd) = GugugagaCommand::parse(cmd_name) {
             return Some(ParsedCommand::Gugugaga(cmd, args));
+        }
+        // Not a known command — treat the entire text after // as a direct
+        // chat message to Gugugaga (e.g. "// why did you flag that?")
+        let chat_text = rest.trim().to_string();
+        if !chat_text.is_empty() {
+            return Some(ParsedCommand::GugugagaChat(chat_text));
         }
         return Some(ParsedCommand::Unknown(cmd_name.to_string()));
     }
@@ -383,7 +391,7 @@ impl SlashPopup {
         }
     }
 
-    fn total_matches(&self) -> usize {
+    pub fn total_matches(&self) -> usize {
         if self.is_gugugaga {
             self.gugugaga_matches.len()
         } else {

@@ -87,7 +87,7 @@ impl Compactor {
         let user_messages: Vec<String> = history
             .iter()
             .filter_map(|turn| {
-                if turn.role == TurnRole::User && !is_summary_message(&turn.content) {
+                if (turn.role == TurnRole::User || turn.role == TurnRole::UserToGugugaga) && !is_summary_message(&turn.content) {
                     Some(turn.content.clone())
                 } else {
                     None
@@ -101,6 +101,7 @@ impl Compactor {
             .map(|t| {
                 let role = match t.role {
                     TurnRole::User => "User",
+                    TurnRole::UserToGugugaga => "User (to Gugugaga)",
                     TurnRole::Codex => "Codex",
                     TurnRole::Gugugaga => "Gugugaga",
                 };

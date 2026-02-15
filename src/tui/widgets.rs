@@ -60,6 +60,7 @@ pub enum MessageRole {
     CommandExec,   // Command execution output
     FileChange,    // File change notification
     Gugugaga,
+    UserToGugugaga, // User message directed at Gugugaga (via //)
     Correction,
     System,
 }
@@ -124,6 +125,14 @@ impl Message {
     pub fn gugugaga(content: impl Into<String>) -> Self {
         Self {
             role: MessageRole::Gugugaga,
+            content: content.into(),
+            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+        }
+    }
+
+    pub fn user_to_gugugaga(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::UserToGugugaga,
             content: content.into(),
             timestamp: chrono::Local::now().format("%H:%M").to_string(),
         }
@@ -546,6 +555,7 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
         MessageRole::CommandExec => ("", Style::default().fg(Color::Yellow)),
         MessageRole::FileChange => ("", Style::default().fg(Color::Cyan)),
         MessageRole::Gugugaga => ("", Style::default()),
+        MessageRole::UserToGugugaga => ("› ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::DIM)),
         MessageRole::Correction => ("! ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         MessageRole::System => ("", Theme::system_badge()),
     };
@@ -1070,104 +1080,86 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                     user_bg,
                 )));
             }
-            MessageRole::Gugugaga => {
-                // Gugugaga card: subtle purple-tinted background to distinguish from Codex
-                let bg_color = Color::Rgb(45, 40, 55);
-                let gg_bg = Style::default().bg(bg_color);
+            MessageRole::UserToGugugaga => {
+                // User message to Gugugaga: magenta left bar (matches Gugugaga's accent)
+                // with "› " prefix to show it's a user message, not Gugugaga's output.
+                let bar_style = Style::default().fg(Color::Magenta);
+                let bar = "▎";
+                let bar_w = bar.width();
                 let prefix_style = Style::default()
                     .fg(Color::Magenta)
-                    .bg(bg_color)
                     .add_modifier(Modifier::BOLD);
+                let text_style = Style::default().fg(Color::White);
+
+                let wrapped = wrap_content(&content, text_avail.saturating_sub(bar_w + 3));
+                for (i, line_text) in wrapped.iter().enumerate() {
+                    let mut spans = Vec::new();
+                    spans.push(Span::styled(indent.to_string(), Style::default()));
+                    spans.push(Span::styled(bar, bar_style));
+                    if i == 0 {
+                        spans.push(Span::styled("› ", prefix_style));
+                    } else {
+                        spans.push(Span::raw("  "));
+                    }
+                    spans.push(Span::styled(line_text.clone(), text_style));
+                    lines.push(Line::from(spans));
+                }
+            }
+            MessageRole::Gugugaga => {
+                // Gugugaga: left accent bar (magenta "▎") + normal background.
+                // Avoids the solid-purple-wall effect when multiple messages are consecutive.
+                let bar_style = Style::default().fg(Color::Magenta);
+                let bar = "▎";
+                let bar_w = bar.width(); // 1
+                let prefix_style = Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD);
+                let dim_style = Style::default().fg(Color::Rgb(140, 135, 150));
 
                 // Detect if this is a tool-call message (starts with "$ ")
                 let is_tool_call = content.starts_with("$ ");
 
-                // Top padding
-                lines.push(Line::from(Span::styled(
-                    " ".repeat(max_width),
-                    gg_bg,
-                )));
-
                 if is_tool_call {
-                    // Tool-call card: render like Codex's $ command display
-                    let cmd_style = Style::default().fg(Color::Magenta).bg(bg_color).add_modifier(Modifier::BOLD);
-                    let output_style = Style::default().fg(Color::Rgb(170, 165, 180)).bg(bg_color);
-                    let result_ok = Style::default().fg(Color::Green).bg(bg_color).add_modifier(Modifier::BOLD);
-                    let result_fail = Style::default().fg(Color::Red).bg(bg_color).add_modifier(Modifier::BOLD);
-                    let dim_style = Style::default().fg(Color::Rgb(130, 125, 140)).bg(bg_color);
+                    // Tool-call card: "▎ $ tool(args)" style
+                    let cmd_style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+                    let output_style = Style::default().fg(Color::Rgb(170, 165, 180));
+                    let result_ok = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+                    let result_fail = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
 
                     let content_lines: Vec<&str> = content.lines().collect();
                     for (i, line_text) in content_lines.iter().enumerate() {
                         let mut spans = Vec::new();
-                        spans.push(Span::styled(indent.to_string(), gg_bg));
-                        spans.push(Span::styled("  ", gg_bg));
-
-                        let mut line_width = indent_w + 2;
+                        spans.push(Span::styled(indent.to_string(), Style::default()));
+                        spans.push(Span::styled(bar, bar_style));
+                        spans.push(Span::styled(" ", Style::default()));
 
                         if i == 0 {
-                            // First line: "$ tool(args)" — magenta command style
-                            let sw = line_text.width();
-                            line_width += sw;
                             spans.push(Span::styled(line_text.to_string(), cmd_style));
                         } else if line_text.starts_with('✓') || line_text.starts_with('✗') {
-                            // Result line: "✓ 42ms" or "✗ 42ms"
                             let (icon, rest) = line_text.split_at(line_text.chars().next().map(|c| c.len_utf8()).unwrap_or(1));
                             let icon_style = if icon == "✓" { result_ok } else { result_fail };
                             spans.push(Span::styled(icon.to_string(), icon_style));
-                            let sw = rest.width();
-                            line_width += icon.width() + sw;
                             spans.push(Span::styled(rest.to_string(), dim_style));
                         } else {
-                            // Output lines — dim text
-                            let sw = line_text.width();
-                            line_width += sw;
                             spans.push(Span::styled(line_text.to_string(), output_style));
-                        }
-
-                        // Pad the rest
-                        if line_width < max_width {
-                            spans.push(Span::styled(" ".repeat(max_width - line_width), gg_bg));
                         }
                         lines.push(Line::from(spans));
                     }
                 } else {
-                    // Regular Gugugaga message: markdown with "▹ " prefix
+                    // Regular Gugugaga message: "▎ content" with left accent bar
                     let mut md_lines = Vec::new();
-                    add_markdown(&mut md_lines, &content, text_avail.saturating_sub(2), "");
-                    for (i, md_line) in md_lines.into_iter().enumerate() {
+                    add_markdown(&mut md_lines, &content, text_avail.saturating_sub(bar_w + 1), "");
+                    for (_i, md_line) in md_lines.into_iter().enumerate() {
                         let mut spans = Vec::new();
-                        spans.push(Span::styled(indent.to_string(), gg_bg));
-                        if i == 0 {
-                            spans.push(Span::styled("▹ ", prefix_style));
-                        } else {
-                            spans.push(Span::styled("  ", gg_bg));
-                        }
-                        // Apply background to each span from markdown
-                        let mut line_width = indent_w + 2;
+                        spans.push(Span::styled(indent.to_string(), Style::default()));
+                        spans.push(Span::styled(bar, bar_style));
+                        spans.push(Span::raw(" "));
                         for span in md_line.spans {
-                            let sw = span.content.width();
-                            line_width += sw;
-                            spans.push(Span::styled(
-                                span.content.to_string(),
-                                span.style.bg(bg_color),
-                            ));
-                        }
-                        // Pad the rest
-                        if line_width < max_width {
-                            spans.push(Span::styled(
-                                " ".repeat(max_width - line_width),
-                                gg_bg,
-                            ));
+                            spans.push(span);
                         }
                         lines.push(Line::from(spans));
                     }
                 }
-
-                // Bottom padding
-                lines.push(Line::from(Span::styled(
-                    " ".repeat(max_width),
-                    gg_bg,
-                )));
             }
             _ => {
                 // Codex — clean markdown, no prefix (like Codex's "• " on first line)

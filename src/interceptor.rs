@@ -145,8 +145,9 @@ impl Interceptor {
             let mut current_turn_content = String::new();
             // Channel to send corrections to Codex
             let correction_tx = to_server_tx_clone;
-            // Pending Gugugaga history messages to replay after session restore
-            let mut pending_gugugaga_history: Vec<String> = Vec::new();
+            // Full ordered conversation history for session restore (sent to TUI
+            // so it can display User/Codex/Gugugaga messages in correct order).
+            let mut pending_session_restore: Option<String> = None;
 
             while let Ok(Some(line)) = stdout_reader.next_line().await {
                 if line.trim().is_empty() {
@@ -174,29 +175,37 @@ impl Interceptor {
 
                                 match session_store.load(&tid).await {
                                     Ok(Some(snapshot)) => {
-                                        // Collect Gugugaga conversation entries to replay in TUI
-                                        pending_gugugaga_history = snapshot
-                                            .memory
-                                            .conversation_history
+                                        // Build ordered session restore containing ALL turns
+                                        // (User, Codex, Gugugaga) so the TUI can display them
+                                        // in the correct interleaved order.
+                                        let has_gugugaga = snapshot.memory.conversation_history
                                             .iter()
-                                            .filter(|t| t.role == TurnRole::Gugugaga)
-                                            .map(|t| {
-                                                // Determine status from content prefix
-                                                let status = if t.content.contains("Violation") || t.content.starts_with("⚠️") {
-                                                    "violation"
-                                                } else {
-                                                    "ok"
-                                                };
-                                                serde_json::json!({
-                                                    "method": "gugugaga/check",
-                                                    "params": {
-                                                        "status": status,
-                                                        "message": t.content.clone()
-                                                    }
+                                            .any(|t| t.role == TurnRole::Gugugaga);
+                                        if has_gugugaga {
+                                            let turns: Vec<serde_json::Value> = snapshot.memory
+                                                .conversation_history
+                                                .iter()
+                                                .map(|t| {
+                                                    let role = match t.role {
+                                                        TurnRole::User => "user",
+                                                        TurnRole::UserToGugugaga => "user_to_gugugaga",
+                                                        TurnRole::Codex => "codex",
+                                                        TurnRole::Gugugaga => "gugugaga",
+                                                    };
+                                                    serde_json::json!({
+                                                        "role": role,
+                                                        "content": t.content,
+                                                        "timestamp": t.timestamp.to_rfc3339(),
+                                                    })
                                                 })
-                                                .to_string()
-                                            })
-                                            .collect();
+                                                .collect();
+                                            pending_session_restore = Some(
+                                                serde_json::json!({
+                                                    "method": "gugugaga/sessionRestore",
+                                                    "params": { "turns": turns }
+                                                }).to_string()
+                                            );
+                                        }
                                         // Resuming an existing thread — restore its state
                                         let mut mem = memory.write().await;
                                         let mut nb = notebook.write().await;
@@ -381,6 +390,13 @@ impl Interceptor {
                         )
                         .await;
 
+                        // If we have a pending session restore, send it BEFORE the
+                        // resume response so the TUI receives it first and can use
+                        // it to build the interleaved message list.
+                        if let Some(restore_msg) = pending_session_restore.take() {
+                            let _ = output_tx_clone.send(restore_msg).await;
+                        }
+
                         match action {
                             InterceptAction::Forward => {
                                 if output_tx_clone.send(line).await.is_err() {
@@ -473,14 +489,8 @@ impl Interceptor {
                             }
                         }
 
-                        // After forwarding a message, replay any pending Gugugaga
-                        // history from a restored session so the TUI shows them
-                        // after the Codex conversation history.
-                        if !pending_gugugaga_history.is_empty() {
-                            for hist_msg in pending_gugugaga_history.drain(..) {
-                                let _ = output_tx_clone.send(hist_msg).await;
-                            }
-                        }
+                        // (Session restore is now sent as a single ordered
+                        // gugugaga/sessionRestore before the resume response.)
                     }
                     Err(_) => {
                         // Non-JSON lines (e.g. tracing log output from app-server)
@@ -510,12 +520,54 @@ impl Interceptor {
         let to_server_tx_clone = to_server_tx.clone();
         let memory = self.memory.clone();
 
+        // Clone references for the gugugaga/chat handler
+        let chat_agent = self.gugugaga_agent.clone();
+        let chat_memory = self.memory.clone();
+        let chat_output_tx = output_tx.clone();
+
         while let Some(input) = user_input_rx.recv().await {
             // Process user input
             match serde_json::from_str::<Value>(&input) {
                 Ok(msg) => {
-                    // Record user message to memory if it's a turn start
                     if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                        // Handle gugugaga/chat locally — don't forward to app-server
+                        if method == "gugugaga/chat" {
+                            let user_msg = msg.get("params")
+                                .and_then(|p| p.get("message"))
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            if !user_msg.is_empty() {
+                                // Record user message (as UserToGugugaga so restore shows correct style)
+                                {
+                                    let mut mem = chat_memory.write().await;
+                                    let _ = mem.add_turn(
+                                        crate::memory::TurnRole::UserToGugugaga,
+                                        user_msg.clone(),
+                                    ).await;
+                                }
+
+                                // Call Gugugaga agent with event streaming
+                                let response = chat_agent.chat(&user_msg, Some(&chat_output_tx)).await;
+
+                                // Send response back to TUI
+                                let reply = match response {
+                                    Ok(text) => serde_json::json!({
+                                        "method": "gugugaga/chatReply",
+                                        "params": { "message": text }
+                                    }),
+                                    Err(e) => serde_json::json!({
+                                        "method": "gugugaga/chatReply",
+                                        "params": { "message": format!("Error: {}", e) }
+                                    }),
+                                };
+                                let _ = chat_output_tx.send(reply.to_string()).await;
+                            }
+                            continue; // Don't forward to app-server
+                        }
+
+                        // Record user message to memory if it's a turn start
                         if method == protocol::methods::TURN_START {
                             if let Some(params) = msg.get("params") {
                                 if let Some(input_arr) = params.get("input").and_then(|i| i.as_array()) {

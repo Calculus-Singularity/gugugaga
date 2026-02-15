@@ -180,6 +180,8 @@ pub struct App {
     notebook_mistakes_count: usize,
     /// Gugugaga thinking status (shown in status bar, like Codex's StatusIndicatorWidget)
     gugugaga_status: Option<String>,
+    /// Pending session restore data from gugugaga/sessionRestore (arrives before thread/resume)
+    pending_session_restore: Option<Vec<serde_json::Value>>,
     /// When the current turn started processing (for elapsed time display)
     turn_start_time: Option<std::time::Instant>,
     /// Current application phase (Welcome animation → Chat).
@@ -222,10 +224,7 @@ impl App {
         Ok(Self {
             terminal,
             input: InputState::new(),
-            messages: vec![
-                Message::system("Gugugaga initialized. Monitoring enabled."),
-                Message::system("Commands: /cmd = Codex, //cmd = Gugugaga. Tab to autocomplete."),
-            ],
+            messages: vec![],
             scroll_offset: 0,
             spinner_frame: 0,
             is_processing: false,
@@ -257,6 +256,7 @@ impl App {
             notebook_attention_items: Vec::new(),
             notebook_mistakes_count: 0,
             gugugaga_status: None,
+            pending_session_restore: None,
             turn_start_time: None,
             // Skip the Welcome animation if trust is already established
             phase: if trust_ctx.is_some() {
@@ -662,13 +662,27 @@ impl App {
                     self.slash_popup.select_next();
                     return;
                 }
-                crossterm::event::KeyCode::Tab | crossterm::event::KeyCode::Enter => {
-                    // Complete selection
+                crossterm::event::KeyCode::Tab => {
+                    // Tab always completes from popup
                     if let Some(completed) = self.slash_popup.complete() {
                         self.input.set_buffer(&completed);
                         self.slash_popup.close();
                     }
                     return;
+                }
+                crossterm::event::KeyCode::Enter => {
+                    // If popup has a match, complete it.
+                    // Otherwise close popup and fall through so Enter
+                    // submits the text (e.g. "//hello" as a direct chat).
+                    if self.slash_popup.total_matches() > 0 {
+                        if let Some(completed) = self.slash_popup.complete() {
+                            self.input.set_buffer(&completed);
+                            self.slash_popup.close();
+                        }
+                        return;
+                    }
+                    self.slash_popup.close();
+                    // Don't return — let the key fall through to Submit
                 }
                 crossterm::event::KeyCode::Esc => {
                     self.slash_popup.close();
@@ -719,6 +733,9 @@ impl App {
                         }
                         ParsedCommand::Gugugaga(cmd, args) => {
                             self.execute_gugugaga_command(cmd, args).await;
+                        }
+                        ParsedCommand::GugugagaChat(message) => {
+                            self.send_gugugaga_chat(&message).await;
                         }
                         ParsedCommand::Unknown(name) => {
                             self.messages.push(Message::system(&format!(
@@ -838,6 +855,10 @@ impl App {
             let prefix = buffer.strip_prefix("//").unwrap_or("");
             let prefix = prefix.split(' ').next().unwrap_or("");
             self.slash_popup.set_filter(prefix);
+            // Auto-close when typing free text that matches no command
+            if self.slash_popup.total_matches() == 0 && !prefix.is_empty() {
+                self.slash_popup.close();
+            }
         } else if buffer.starts_with('/') {
             if self.slash_popup.is_gugugaga {
                 self.slash_popup.open_codex();
@@ -1595,6 +1616,26 @@ Make it comprehensive but concise."#;
             });
             let _ = tx.send(response.to_string()).await;
         }
+    }
+
+    /// Send a direct chat message to Gugugaga via the interceptor
+    async fn send_gugugaga_chat(&mut self, message: &str) {
+        // Show user's message in chat (with distinct magenta style for Gugugaga)
+        self.messages.push(Message::user_to_gugugaga(message));
+        self.scroll_to_bottom();
+
+        // Send to interceptor which will call GugugagaAgent::chat()
+        if let Some(tx) = &self.input_tx {
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "gugugaga/chat",
+                "params": { "message": message }
+            }).to_string();
+            let _ = tx.send(msg).await;
+        }
+
+        // Mark as processing so status bar shows thinking
+        self.gugugaga_status = Some("Thinking...".to_string());
     }
 
     async fn execute_gugugaga_command(&mut self, cmd: GugugagaCommand, args: String) {
@@ -2365,7 +2406,7 @@ Make it comprehensive but concise."#;
                     {
                         if let Some(id) = thread.get("id").and_then(|i| i.as_str()) {
                             self.thread_id = Some(id.to_string());
-                            self.messages.push(Message::system("Session started. Ready to chat!"));
+                            // Session ready — no startup message needed
                         }
                     }
                 }
@@ -2475,6 +2516,24 @@ Make it comprehensive but concise."#;
                         _ => {}
                     }
                 }
+                "gugugaga/sessionRestore" => {
+                    // Full ordered conversation history for session restore.
+                    // Store it; the thread/resume handler will use it instead of
+                    // display_turns() to show messages in correct interleaved order.
+                    if let Some(turns) = json.get("params").and_then(|p| p.get("turns")).and_then(|t| t.as_array()) {
+                        self.pending_session_restore = Some(turns.clone());
+                    }
+                }
+                "gugugaga/chatReply" => {
+                    // Direct chat response from Gugugaga
+                    self.gugugaga_status = None;
+                    if let Some(msg) = json.get("params").and_then(|p| p.get("message")).and_then(|m| m.as_str()) {
+                        if !msg.is_empty() {
+                            self.messages.push(Message::gugugaga(msg));
+                            self.scroll_to_bottom();
+                        }
+                    }
+                }
                 "gugugaga/check" => {
                     // Clear gugugaga status (thinking is done)
                     self.gugugaga_status = None;
@@ -2513,21 +2572,7 @@ Make it comprehensive but concise."#;
                     }
                 }
                 "gugugaga/status" => {
-                    // Show gugugaga status
-                    if let Some(text) = json
-                        .get("params")
-                        .and_then(|p| p.get("message"))
-                        .and_then(|t| t.as_str())
-                    {
-                        let strict = json
-                            .get("params")
-                            .and_then(|p| p.get("strictMode"))
-                            .and_then(|s| s.as_bool())
-                            .unwrap_or(false);
-                        let mode = if strict { " (strict mode)" } else { "" };
-                        self.messages.push(Message::system(&format!("🛡️ {}{}", text, mode)));
-                        self.scroll_to_bottom();
-                    }
+                    // Silently acknowledge gugugaga status — no message shown
                 }
                 "gugugaga/auto_reply" => {
                     self.auto_replies += 1;
@@ -2655,11 +2700,14 @@ Make it comprehensive but concise."#;
                     if let Some(thread) = result.get("thread") {
                         if let Some(id) = thread.get("id").and_then(|i| i.as_str()) {
                             self.thread_id = Some(id.to_string());
-                            // Display history directly from the resume response.
-                            // thread/resume already includes turns — no need for a
-                            // separate thread/read call (which would also hit the
-                            // unreliable UUID file search).
-                            if let Some(turns) = thread.get("turns").and_then(|t| t.as_array()) {
+
+                            // If we have a pending session restore (from gugugaga/sessionRestore),
+                            // use it to display ALL turns (User, Codex, Gugugaga) in correct
+                            // chronological order. Otherwise fall back to display_turns().
+                            if let Some(restore_turns) = self.pending_session_restore.take() {
+                                self.display_session_restore(&restore_turns);
+                                self.scroll_to_bottom();
+                            } else if let Some(turns) = thread.get("turns").and_then(|t| t.as_array()) {
                                 if !turns.is_empty() {
                                     self.display_turns(turns);
                                     self.scroll_to_bottom();
@@ -3178,6 +3226,60 @@ Make it comprehensive but concise."#;
                 }
             }
         }
+    }
+
+    /// Display session restore turns that include User, Codex, AND Gugugaga messages
+    /// in their original chronological order.
+    fn display_session_restore(&mut self, restore_turns: &[serde_json::Value]) {
+        for turn in restore_turns {
+            let role = turn.get("role").and_then(|r| r.as_str()).unwrap_or("unknown");
+            let raw_content = turn.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if raw_content.is_empty() {
+                continue;
+            }
+
+            match role {
+                "user" => {
+                    self.messages.push(Message::user(raw_content));
+                }
+                "user_to_gugugaga" => {
+                    self.messages.push(Message::user_to_gugugaga(raw_content));
+                }
+                "codex" | "assistant" => {
+                    // Strip internal annotations that were added for Gugugaga's
+                    // context (e.g. [EXECUTED COMMAND], [COMMAND EXIT], [FILE CHANGES]).
+                    // These are not meant for display.
+                    let cleaned = Self::strip_internal_annotations(raw_content);
+                    if !cleaned.is_empty() {
+                        self.messages.push(Message::codex(&cleaned));
+                    }
+                }
+                "gugugaga" => {
+                    self.messages.push(Message::gugugaga(raw_content));
+                }
+                _ => {
+                    self.messages.push(Message::system(raw_content));
+                }
+            }
+        }
+    }
+
+    /// Remove internal annotations ([EXECUTED COMMAND], [COMMAND EXIT], [FILE CHANGES])
+    /// from stored Codex turns so they don't leak into the display.
+    fn strip_internal_annotations(content: &str) -> String {
+        content
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("[EXECUTED COMMAND]")
+                    && !trimmed.starts_with("[COMMAND EXIT")
+                    && !trimmed.starts_with("[FILE CHANGES]")
+                    && !trimmed.starts_with("[FILE CHANGE ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
     }
 
     fn create_turn_message(&mut self, text: &str) -> String {

@@ -149,6 +149,29 @@ Important: Output ONLY the JSON object as your final answer. No extra text befor
         )
     }
 
+    /// Build context for direct user↔Gugugaga conversation
+    pub fn for_chat(&self, user_message: &str) -> String {
+        let base_context = self.build_full_context();
+
+        format!(
+            r#"You are Gugugaga, an AI supervision agent that monitors another AI (Codex).
+You have full access to the conversation history and your personal notebook.
+
+{base_context}
+
+The user is speaking to you directly. Answer helpfully, concisely, and in the
+same language the user used. You can:
+- Explain your past supervision decisions
+- Discuss the current task and Codex's behavior
+- Share observations from your notebook
+- Answer questions about the codebase (based on what you've seen)
+- Use tools if needed: TOOL: tool_name(args)
+
+User message:
+{user_message}"#
+        )
+    }
+
     /// Build context for understanding user intent from input
     pub fn for_user_input_analysis(&self, user_input: &str) -> String {
         format!(

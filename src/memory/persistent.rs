@@ -47,6 +47,8 @@ pub struct ConversationTurn {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TurnRole {
     User,
+    /// User message directed at Gugugaga (via //)
+    UserToGugugaga,
     Codex,
     Gugugaga,
 }
@@ -176,6 +178,7 @@ impl PersistentMemory {
                         if text.to_lowercase().contains(&query_lower) {
                             let role = match json.get("role").and_then(|r| r.as_str()) {
                                 Some("User") => TurnRole::User,
+                                Some("UserToGugugaga") => TurnRole::UserToGugugaga,
                                 Some("Codex") => TurnRole::Codex,
                                 _ => TurnRole::Gugugaga,
                             };
@@ -207,6 +210,7 @@ impl PersistentMemory {
             .map(|t| {
                 let role = match t.role {
                     TurnRole::User => "User",
+                    TurnRole::UserToGugugaga => "User (to Gugugaga)",
                     TurnRole::Codex => "Codex",
                     TurnRole::Gugugaga => "Gugugaga",
                 };
@@ -260,6 +264,7 @@ impl PersistentMemory {
     fn parse_archive_line(json: &serde_json::Value) -> ConversationTurn {
         let role = match json.get("role").and_then(|r| r.as_str()) {
             Some("User") => TurnRole::User,
+            Some("UserToGugugaga") => TurnRole::UserToGugugaga,
             Some("Codex") => TurnRole::Codex,
             _ => TurnRole::Gugugaga,
         };

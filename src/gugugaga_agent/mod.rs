@@ -88,6 +88,77 @@ impl GugugagaAgent {
         self.notebook.clone()
     }
 
+    /// Direct chat with the user. Gugugaga answers using full context
+    /// (memory, notebook, conversation history) and can use tools.
+    pub async fn chat(
+        &self,
+        user_message: &str,
+        event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<String> {
+        let emit = |tx: &tokio::sync::mpsc::Sender<String>, method: &str, params: serde_json::Value| {
+            let msg = serde_json::json!({ "method": method, "params": params }).to_string();
+            let _ = tx.try_send(msg);
+        };
+
+        let mut tool_results: Vec<String> = Vec::new();
+        const TOOL_RESULTS_MAX_TOKENS: usize = 6_000;
+
+        loop {
+            if let Some(tx) = event_tx {
+                let label = if tool_results.is_empty() {
+                    "Thinking...".to_string()
+                } else {
+                    format!("Thinking (follow-up #{})...", tool_results.len())
+                };
+                emit(tx, "gugugaga/thinking", serde_json::json!({ "status": "thinking", "message": label }));
+            }
+
+            let prompt = {
+                let memory = self.memory.read().await;
+                let notebook = self.notebook.read().await;
+                let context_builder = ContextBuilder::new(&memory).with_notebook(&notebook);
+                let mut p = context_builder.for_chat(user_message);
+                if !tool_results.is_empty() {
+                    p.push_str("\n\n=== Tool call results ===\n");
+                    p.push_str(&tool_results.join("\n"));
+                }
+                p
+            };
+
+            let started = std::time::Instant::now();
+            let parsed = self.evaluator.call_llm_with_thinking(&prompt).await?;
+            let duration = started.elapsed();
+            let response = parsed.response.trim();
+
+            if let (Some(tx), Some(thinking)) = (event_tx, &parsed.thinking) {
+                emit(tx, "gugugaga/thinking", serde_json::json!({
+                    "status": "thought",
+                    "message": thinking,
+                    "duration_ms": duration.as_millis() as u64,
+                }));
+            }
+
+            // Check for tool calls
+            if let Some(tool_result) = self.execute_tool_call_with_events(response, event_tx).await {
+                tool_results.push(tool_result);
+                let _ = Compactor::compact_tool_results_if_needed(
+                    &self.evaluator,
+                    &mut tool_results,
+                    TOOL_RESULTS_MAX_TOKENS,
+                ).await;
+                continue;
+            }
+
+            // Record the exchange in memory
+            {
+                let mut mem = self.memory.write().await;
+                let _ = mem.add_turn(crate::memory::TurnRole::Gugugaga, response.to_string()).await;
+            }
+
+            return Ok(response.to_string());
+        }
+    }
+
     /// Evaluate whether a request needs human intervention
     pub async fn evaluate_request(&self, request_content: &str) -> Result<EvaluationResult> {
         let memory = self.memory.read().await;
