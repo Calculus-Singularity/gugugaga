@@ -161,22 +161,8 @@ pub enum GugugagaCommand {
     Clear,
     /// Show gugugaga stats
     Stats,
-    /// Show current rules and instructions
-    Rules,
-    /// Add a permanent instruction
-    Instruct,
-    /// Set current task objective
-    Task,
-    /// List detected violations
-    Violations,
-    /// Pause gugugaga monitoring
-    Pause,
-    /// Resume gugugaga monitoring (note: different from Codex /resume!)
-    Unpause,
     /// View Gugugaga notebook
     Notebook,
-    /// Save memory to disk
-    Save,
     /// Quit gugugaga
     Quit,
 }
@@ -187,14 +173,7 @@ impl GugugagaCommand {
             GugugagaCommand::Help,
             GugugagaCommand::Clear,
             GugugagaCommand::Stats,
-            GugugagaCommand::Rules,
-            GugugagaCommand::Instruct,
-            GugugagaCommand::Task,
-            GugugagaCommand::Violations,
             GugugagaCommand::Notebook,
-            GugugagaCommand::Pause,
-            GugugagaCommand::Unpause,
-            GugugagaCommand::Save,
             GugugagaCommand::Quit,
         ]
     }
@@ -204,14 +183,7 @@ impl GugugagaCommand {
             GugugagaCommand::Help => "help",
             GugugagaCommand::Clear => "clear",
             GugugagaCommand::Stats => "stats",
-            GugugagaCommand::Rules => "rules",
-            GugugagaCommand::Instruct => "instruct",
-            GugugagaCommand::Task => "task",
-            GugugagaCommand::Violations => "violations",
             GugugagaCommand::Notebook => "notebook",
-            GugugagaCommand::Pause => "pause",
-            GugugagaCommand::Unpause => "unpause",
-            GugugagaCommand::Save => "save",
             GugugagaCommand::Quit => "quit",
         }
     }
@@ -221,20 +193,13 @@ impl GugugagaCommand {
             GugugagaCommand::Help => "Show Gugugaga help",
             GugugagaCommand::Clear => "Clear chat history",
             GugugagaCommand::Stats => "Show monitoring stats",
-            GugugagaCommand::Rules => "Show current rules",
-            GugugagaCommand::Instruct => "Add permanent instruction",
-            GugugagaCommand::Task => "Set current task objective",
-            GugugagaCommand::Violations => "List detected violations",
             GugugagaCommand::Notebook => "View Gugugaga notebook",
-            GugugagaCommand::Pause => "Pause monitoring",
-            GugugagaCommand::Unpause => "Resume monitoring",
-            GugugagaCommand::Save => "Save memory to disk",
             GugugagaCommand::Quit => "Quit Gugugaga",
         }
     }
 
     pub fn takes_args(&self) -> bool {
-        matches!(self, GugugagaCommand::Instruct | GugugagaCommand::Task)
+        false
     }
 
     pub fn matches(prefix: &str) -> Vec<GugugagaCommand> {
@@ -488,12 +453,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_gugugaga_with_args() {
-        match parse_command("//instruct Remember to speak Chinese") {
-            Some(ParsedCommand::Gugugaga(GugugagaCommand::Instruct, args)) => {
-                assert_eq!(args, "Remember to speak Chinese");
-            }
-            _ => panic!("Should parse with args"),
+    fn test_parse_gugugaga_stats() {
+        match parse_command("//stats") {
+            Some(ParsedCommand::Gugugaga(GugugagaCommand::Stats, _)) => {}
+            _ => panic!("Should parse as Gugugaga stats"),
         }
     }
 

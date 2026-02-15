@@ -147,8 +147,6 @@ pub struct App {
     output_rx: Option<mpsc::Receiver<String>>,
     /// Slash command popup state
     slash_popup: SlashPopup,
-    /// Whether gugugaga monitoring is paused
-    is_paused: bool,
     /// Generic picker for resume/model selection
     picker: Picker,
     /// What the picker is currently for
@@ -238,7 +236,6 @@ impl App {
             input_tx: None,
             output_rx: None,
             slash_popup: SlashPopup::new(),
-            is_paused: false,
             picker: Picker::new("Select"),
             picker_mode: PickerMode::None,
             pending_request_id: None,
@@ -994,11 +991,10 @@ impl App {
     /// Show status information
     fn show_status(&mut self) {
         let status = format!(
-            "Session Status:\n  Violations detected: {}\n  Corrections made: {}\n  Auto-replies: {}\n  Monitoring: {}",
+            "Session Status:\n  Violations detected: {}\n  Corrections made: {}\n  Auto-replies: {}",
             self.violations_detected,
             self.corrections_made,
             self.auto_replies,
-            if self.is_paused { "Paused" } else { "Active" }
         );
         self.messages.push(Message::system(&status));
     }
@@ -1638,7 +1634,7 @@ Make it comprehensive but concise."#;
         self.gugugaga_status = Some("Thinking...".to_string());
     }
 
-    async fn execute_gugugaga_command(&mut self, cmd: GugugagaCommand, args: String) {
+    async fn execute_gugugaga_command(&mut self, cmd: GugugagaCommand, _args: String) {
         match cmd {
             GugugagaCommand::Help => {
                 self.messages.push(Message::system("Gugugaga commands (//):"));
@@ -1661,39 +1657,6 @@ Make it comprehensive but concise."#;
                 self.messages.push(Message::system(&format!(
                     "Session stats:\n  Violations: {}\n  Corrections: {}\n  Auto-replies: {}",
                     self.violations_detected, self.corrections_made, self.auto_replies
-                )));
-            }
-            GugugagaCommand::Rules => {
-                self.messages
-                    .push(Message::system("Current rules: (loaded from memory.md)"));
-                // TODO: Load and display actual rules from PersistentMemory
-            }
-            GugugagaCommand::Instruct => {
-                if args.is_empty() {
-                    self.messages
-                        .push(Message::system("Usage: //instruct <instruction>"));
-                } else {
-                    self.messages.push(Message::system(&format!(
-                        "Added instruction: {}",
-                        args
-                    )));
-                    // TODO: Add to PersistentMemory
-                }
-            }
-            GugugagaCommand::Task => {
-                if args.is_empty() {
-                    self.messages
-                        .push(Message::system("Usage: //task <task description>"));
-                } else {
-                    self.messages
-                        .push(Message::system(&format!("Task set: {}", args)));
-                    // TODO: Add to PersistentMemory
-                }
-            }
-            GugugagaCommand::Violations => {
-                self.messages.push(Message::system(&format!(
-                    "Total violations detected: {}",
-                    self.violations_detected
                 )));
             }
             GugugagaCommand::Notebook => {
@@ -1755,20 +1718,6 @@ Make it comprehensive but concise."#;
                 } else {
                     self.messages.push(Message::system("No notebook available (not initialized)."));
                 }
-            }
-            GugugagaCommand::Pause => {
-                self.is_paused = true;
-                self.messages
-                    .push(Message::system("Gugugaga monitoring paused."));
-            }
-            GugugagaCommand::Unpause => {
-                self.is_paused = false;
-                self.messages
-                    .push(Message::system("Gugugaga monitoring resumed."));
-            }
-            GugugagaCommand::Save => {
-                self.messages.push(Message::system("Memory saved to disk."));
-                // TODO: Trigger memory save
             }
             GugugagaCommand::Quit => {
                 self.should_quit = true;
@@ -3433,7 +3382,6 @@ Make it comprehensive but concise."#;
         let spinner_frame = self.spinner_frame;
         let scroll_offset = self.scroll_offset;
         let slash_popup = &self.slash_popup;
-        let is_paused = self.is_paused;
         let picker = &self.picker;
         let pending_approval = &self.pending_approval;
         let approval_scroll = self.approval_scroll;
@@ -3463,11 +3411,7 @@ Make it comprehensive but concise."#;
 
             // Header
             let header = HeaderBar {
-                title: if is_paused {
-                    "Gugugaga [PAUSED]"
-                } else {
-                    "Gugugaga"
-                },
+                title: "Gugugaga",
                 project: project_name,
                 is_processing,
                 spinner_frame,
@@ -3482,8 +3426,6 @@ Make it comprehensive but concise."#;
                     format!("Supervising: {} (Esc to interrupt)", gs)
                 } else if is_processing {
                     "Thinking (Esc to interrupt)".to_string()
-                } else if is_paused {
-                    "Monitoring paused".to_string()
                 } else {
                     String::new()
                 },
