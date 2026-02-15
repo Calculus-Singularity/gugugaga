@@ -2508,7 +2508,7 @@ Make it comprehensive but concise."#;
                             content.push_str(&format!("{} {}", icon, duration_str));
 
                             self.messages.push(Message::gugugaga(&content));
-                            self.scroll_to_bottom();
+                        self.scroll_to_bottom();
 
                             // Update status bar
                             self.gugugaga_status = Some(format!("{} {}({}) {}", icon, tool, args, duration_str));
@@ -2544,12 +2544,12 @@ Make it comprehensive but concise."#;
                         .and_then(|s| s.as_str())
                         .unwrap_or("ok");
 
-                    let msg = json
-                        .get("params")
-                        .and_then(|p| p.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("");
-
+                        let msg = json
+                            .get("params")
+                            .and_then(|p| p.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("");
+                        
                     if !msg.is_empty() {
                         match status {
                             "ok" => {

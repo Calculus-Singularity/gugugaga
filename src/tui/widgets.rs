@@ -598,13 +598,13 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
     ) {
         for raw_line in content.lines() {
             for wrapped in wrap_content(raw_line, avail) {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.to_string()),
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.to_string()),
                     Span::styled(wrapped, style),
-                ]));
+                    ]));
+                }
             }
         }
-    }
 
     /// Render markdown content using pulldown-cmark, with styles aligned to Codex.
     ///
@@ -931,7 +931,7 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
             let cmd_wrapped = wrap_content(&cmd_text, cmd_avail);
 
             if let Some(first) = cmd_wrapped.first() {
-                lines.push(Line::from(vec![
+            lines.push(Line::from(vec![
                     Span::styled("• ", bullet_style),
                     Span::styled(title.to_string(), Style::default().add_modifier(Modifier::BOLD)),
                     Span::styled(first.clone(), Style::default().add_modifier(Modifier::DIM)),
@@ -1029,7 +1029,7 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
             MessageRole::Correction => {
                 // Correction prefix on first line
                 if !role_prefix.is_empty() {
-                    lines.push(Line::from(vec![
+        lines.push(Line::from(vec![
                         Span::raw(indent.to_string()),
                         Span::styled(role_prefix, role_style),
                     ]));
@@ -1058,7 +1058,7 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                     let text_len = line_text.width();
                     let pad_len = text_avail.saturating_sub(2).saturating_sub(text_len);
                     if i == 0 {
-                        lines.push(Line::from(vec![
+        lines.push(Line::from(vec![
                             Span::styled(indent.to_string(), user_bg),
                             Span::styled("› ", prefix_style),
                             Span::styled(line_text.clone(), user_text),
@@ -1199,7 +1199,7 @@ fn render_file_change_diff(
             if raw_line.starts_with("[fc:") || raw_line.starts_with("[turn diff]") {
                 continue;
             }
-            lines.push(Line::from(vec![
+        lines.push(Line::from(vec![
                 Span::raw(indent.to_string()),
                 Span::styled(raw_line.to_string(), Theme::dim()),
             ]));
@@ -1240,11 +1240,11 @@ fn render_file_change_diff(
 
         let file_prefix = if file_count > 1 {
             format!("{}  └ ", indent)
-        } else {
+            } else {
             format!("{}• ", indent)
-        };
+            };
 
-        lines.push(Line::from(vec![
+            lines.push(Line::from(vec![
             Span::styled(file_prefix, style_gutter),
             Span::styled(verb.to_string(), Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(" {} ", block.filename)),
@@ -1272,8 +1272,8 @@ fn render_file_change_diff(
                 lines.push(Line::from(vec![
                     Span::styled(spacer, style_gutter),
                     Span::styled("⋮".to_string(), style_gutter),
-                ]));
-            }
+            ]));
+        }
             is_first_hunk = false;
 
             for diff_line in &hunk.lines {
@@ -1310,14 +1310,14 @@ fn render_file_change_diff(
                             Span::styled(format!("{}{}", sign, chunk), line_style),
                         ]));
                         first = false;
-                    } else {
+    } else {
                         let gutter = format!(
                             "{}{:>width$}  ",
                             indent,
                             "",
                             width = gutter_width
                         );
-                        lines.push(Line::from(vec![
+        lines.push(Line::from(vec![
                             Span::styled(gutter, style_gutter),
                             Span::styled(chunk.to_string(), line_style),
                         ]));
