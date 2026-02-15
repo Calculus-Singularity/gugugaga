@@ -137,8 +137,8 @@ impl Interceptor {
             let mut thread_turn_content: HashMap<String, String> = HashMap::new();
             // Track current (main) thread ID for corrections
             let mut current_thread_id: Option<String> = None;
-            // Whether we've already handled session init for the first thread_id
-            let mut session_initialized = false;
+            // Track which thread_id has been session-initialized (None = not yet)
+            let mut initialized_thread_id: Option<String> = None;
             // Track all active threads (main + sub-agents)
             let mut active_threads: HashMap<String, String> = HashMap::new(); // id -> source/label
             // Legacy: single accumulator for when we don't know the thread
@@ -166,11 +166,11 @@ impl Interceptor {
                             .and_then(|t| t.get("id"))
                             .and_then(|id| id.as_str())
                         {
-                            // Per-thread session management: on first thread_id detection,
-                            // either restore a cached session or start clean.
-                            if !session_initialized {
-                                session_initialized = true;
-                                let tid = thread_id.to_string();
+                            // Per-thread session management: restore session when
+                            // we see a NEW thread_id (handles both initial start and resume).
+                            let tid = thread_id.to_string();
+                            if initialized_thread_id.as_deref() != Some(&tid) {
+                                initialized_thread_id = Some(tid.clone());
 
                                 match session_store.load(&tid).await {
                                     Ok(Some(snapshot)) => {
@@ -181,9 +181,18 @@ impl Interceptor {
                                             .iter()
                                             .filter(|t| t.role == TurnRole::Gugugaga)
                                             .map(|t| {
+                                                // Determine status from content prefix
+                                                let status = if t.content.contains("Violation") || t.content.starts_with("⚠️") {
+                                                    "violation"
+                                                } else {
+                                                    "ok"
+                                                };
                                                 serde_json::json!({
                                                     "method": "gugugaga/check",
-                                                    "params": { "message": t.content.clone() }
+                                                    "params": {
+                                                        "status": status,
+                                                        "message": t.content.clone()
+                                                    }
                                                 })
                                                 .to_string()
                                             })
@@ -541,12 +550,7 @@ impl Interceptor {
             }
         }
 
-        // Signal tasks to stop, then wait for them to finish
-        drop(to_server_tx);
-        let _ = stdout_task.await;
-        let _ = stdin_task.await;
-
-        // Save session AFTER all tasks are done, so we capture the final state
+        // Save session BEFORE killing anything, so we capture the final state
         // (including any mistakes/corrections from the last turn).
         {
             let thread_id = self.current_thread_id.read().await;
@@ -561,7 +565,13 @@ impl Interceptor {
             }
         }
 
-        let _ = child.kill().await;
+        // Kill the app-server child and abort background tasks.
+        // Use start_kill() (non-blocking) to avoid waiting for the child to
+        // fully terminate, which can hang if stdout/stdin pipes are still held.
+        let _ = child.start_kill();
+        drop(to_server_tx);
+        stdout_task.abort();
+        stdin_task.abort();
 
         Ok(())
     }

@@ -130,7 +130,7 @@ async fn run_tui_mode(
     app.set_notebook(notebook);
 
     // Run interceptor in background — capture errors so we can log them
-    let interceptor_handle = tokio::spawn(async move {
+    let mut interceptor_handle = tokio::spawn(async move {
         if let Err(e) = interceptor.run(user_input_rx, output_tx).await {
             let msg = format!("Interceptor error: {e}\n");
             let _ = std::fs::write("gugugaga-crash.log", &msg);
@@ -188,8 +188,16 @@ async fn run_tui_mode(
     // Drop app first to restore terminal before printing any error
     drop(app);
 
-    // Cleanup
-    interceptor_handle.abort();
+    // Drop the remaining sender so the interceptor's user_input_rx.recv()
+    // returns None, allowing its main loop to exit and save the session.
+    drop(user_input_tx);
+
+    // Wait for interceptor to finish saving session (with timeout).
+    // If it doesn't finish in time, abort it so the process can exit.
+    let save_timeout = tokio::time::Duration::from_secs(3);
+    if tokio::time::timeout(save_timeout, &mut interceptor_handle).await.is_err() {
+        interceptor_handle.abort();
+    }
 
     // Now check if the TUI run had an error
     if let Err(e) = run_result {

@@ -2406,29 +2406,35 @@ Make it comprehensive but concise."#;
                     // Clear gugugaga status (thinking is done)
                     self.gugugaga_status = None;
 
-                    // Show supervision check result with Markdown support
-                    if let Some(status) = json
+                    let status = json
                         .get("params")
                         .and_then(|p| p.get("status"))
                         .and_then(|s| s.as_str())
-                    {
+                        .unwrap_or("ok");
 
-                        let msg = json
-                            .get("params")
-                            .and_then(|p| p.get("message"))
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("");
-                        
-                        // Use Gugugaga role for Markdown rendering
+                    let msg = json
+                        .get("params")
+                        .and_then(|p| p.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("");
+
+                    if !msg.is_empty() {
                         match status {
-                            "ok" => self.messages.push(Message::gugugaga(&format!("🛡️ {}", msg))),
+                            "ok" => {
+                                // Avoid double-prefixing if message already has emoji
+                                if msg.starts_with("🛡️") {
+                                    self.messages.push(Message::gugugaga(msg));
+                                } else {
+                                    self.messages.push(Message::gugugaga(&format!("🛡️ {}", msg)));
+                                }
+                            }
                             "violation" => {
                                 self.violations_detected += 1;
                                 self.current_turn_violations += 1;
                                 self.messages.push(Message::gugugaga(msg));
                             }
                             "error" => self.messages.push(Message::gugugaga(msg)),
-                            _ => self.messages.push(Message::gugugaga(&format!("🛡️ {}", msg))),
+                            _ => self.messages.push(Message::gugugaga(msg)),
                         }
                         self.scroll_to_bottom();
                     }
@@ -3626,13 +3632,8 @@ Make it comprehensive but concise."#;
     ) -> (Vec<String>, Rect) {
         use ratatui::style::{Color, Modifier};
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Theme::border())
-            .title_top(Line::styled(" Conversation ", Theme::muted()));
-
-        let inner = block.inner(area);
-        f.render_widget(block, area);
+        // No border — clean layout like Codex
+        let inner = area;
 
         // Build all lines with word wrapping
         let content_width = inner.width as usize;

@@ -538,15 +538,15 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
     // Sanitize content: expand tabs, remove control chars
     let content = sanitize_for_display(&msg.content);
 
-    // Role badge (use ASCII-safe badges to avoid emoji width issues)
-    let (badge_text, badge_style) = match msg.role {
-        MessageRole::User => (" You ", Theme::user_badge()),
-        MessageRole::Codex => (" Codex ", Theme::codex_badge()),
-        MessageRole::Thinking => (" Thinking ", Theme::muted()),
-        MessageRole::CommandExec => (" $ Command ", Style::default().fg(Color::Yellow)),
-        MessageRole::FileChange => (" ~ File ", Style::default().fg(Color::Cyan)),
-        MessageRole::Gugugaga => (" Gugugaga ", Theme::gugugaga_badge()),
-        MessageRole::Correction => (" ! Correction ", Theme::correction_badge()),
+    // Codex-style role prefix: minimal markers instead of heavy badges
+    let (role_prefix, role_style) = match msg.role {
+        MessageRole::User => ("› ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::DIM)),
+        MessageRole::Codex => ("", Style::default()),
+        MessageRole::Thinking => ("", Theme::muted()),
+        MessageRole::CommandExec => ("", Style::default().fg(Color::Yellow)),
+        MessageRole::FileChange => ("", Style::default().fg(Color::Cyan)),
+        MessageRole::Gugugaga => ("▹ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM)),
+        MessageRole::Correction => ("! ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         MessageRole::System => ("", Theme::system_badge()),
     };
 
@@ -1011,28 +1011,85 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
             lines.push(Line::from(new_spans));
         }
     } else {
-        // Standard badge + content for User, Codex, Gugugaga, FileChange, Correction
-        lines.push(Line::from(vec![
-            Span::styled(badge_text, badge_style),
-            Span::styled(format!(" {}", msg.timestamp), Theme::muted()),
-        ]));
-
+        // Codex-style rendering: role prefix on first content line, no separate badge row
         match msg.role {
             MessageRole::FileChange => {
-                // Codex-style diff rendering with file headers, line counts, and line numbers
                 render_file_change_diff(&content, text_avail, indent, &mut lines);
             }
             MessageRole::Correction => {
+                // Correction prefix on first line
+                if !role_prefix.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled(role_prefix, role_style),
+                    ]));
+                }
                 add_markdown(&mut lines, &content, text_avail, indent);
             }
-            _ => {
-                // User, Codex, Gugugaga — use markdown for agent messages
-                if matches!(msg.role, MessageRole::Codex | MessageRole::Gugugaga) {
-                    add_markdown(&mut lines, &content, text_avail, indent);
-                } else {
-                    let style = Theme::text();
-                    add_plain(&mut lines, &content, style, text_avail, indent);
+            MessageRole::User => {
+                // Codex-style user message: background color card with "› " prefix
+                // Subtle overlay: slightly lighter than typical dark terminal backgrounds
+                let bg_color = Color::Rgb(55, 55, 60);
+                let user_bg = Style::default().bg(bg_color);
+                let user_text = Style::default().fg(Color::White).bg(bg_color);
+                let prefix_style = Style::default()
+                    .fg(Color::Cyan)
+                    .bg(bg_color)
+                    .add_modifier(Modifier::BOLD);
+
+                // Top padding line with background
+                lines.push(Line::from(Span::styled(
+                    " ".repeat(max_width),
+                    user_bg,
+                )));
+
+                let wrapped = wrap_content(&content, text_avail.saturating_sub(2));
+                for (i, line_text) in wrapped.iter().enumerate() {
+                    let text_len = line_text.width();
+                    let pad_len = text_avail.saturating_sub(2).saturating_sub(text_len);
+                    if i == 0 {
+                        lines.push(Line::from(vec![
+                            Span::styled(indent.to_string(), user_bg),
+                            Span::styled("› ", prefix_style),
+                            Span::styled(line_text.clone(), user_text),
+                            Span::styled(" ".repeat(pad_len), user_bg),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled(indent.to_string(), user_bg),
+                            Span::styled("  ", user_bg),
+                            Span::styled(line_text.clone(), user_text),
+                            Span::styled(" ".repeat(pad_len), user_bg),
+                        ]));
+                    }
                 }
+
+                // Bottom padding line with background
+                lines.push(Line::from(Span::styled(
+                    " ".repeat(max_width),
+                    user_bg,
+                )));
+            }
+            MessageRole::Gugugaga => {
+                // Gugugaga messages: "▹ " prefix inline with first line
+                let mut md_lines = Vec::new();
+                add_markdown(&mut md_lines, &content, text_avail.saturating_sub(2), "  ");
+                for (i, line) in md_lines.into_iter().enumerate() {
+                    if i == 0 {
+                        let mut spans = vec![
+                            Span::raw(indent.to_string()),
+                            Span::styled(role_prefix, role_style),
+                        ];
+                        spans.extend(line.spans.into_iter().skip_while(|s| s.content.is_empty()));
+                        lines.push(Line::from(spans));
+                    } else {
+                        lines.push(line);
+                    }
+                }
+            }
+            _ => {
+                // Codex — clean markdown, no prefix (like Codex's "• " on first line)
+                add_markdown(&mut lines, &content, text_avail, indent);
             }
         }
     }
