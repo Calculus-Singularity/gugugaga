@@ -1634,7 +1634,7 @@ Make it comprehensive but concise."#;
         self.gugugaga_status = Some("Thinking...".to_string());
     }
 
-    async fn execute_gugugaga_command(&mut self, cmd: GugugagaCommand, _args: String) {
+    async fn execute_gugugaga_command(&mut self, cmd: GugugagaCommand, args: String) {
         match cmd {
             GugugagaCommand::Help => {
                 self.messages.push(Message::system("Gugugaga commands (//):"));
@@ -1658,6 +1658,9 @@ Make it comprehensive but concise."#;
                     "Session stats:\n  Violations: {}\n  Corrections: {}\n  Auto-replies: {}",
                     self.violations_detected, self.corrections_made, self.auto_replies
                 )));
+            }
+            GugugagaCommand::Model => {
+                self.handle_gugugaga_model_command(args.trim()).await;
             }
             GugugagaCommand::Notebook => {
                 if let Some(notebook) = &self.notebook {
@@ -1719,11 +1722,120 @@ Make it comprehensive but concise."#;
                     self.messages.push(Message::system("No notebook available (not initialized)."));
                 }
             }
-            GugugagaCommand::Quit => {
-                self.should_quit = true;
-            }
         }
         self.scroll_to_bottom();
+    }
+
+    /// Handle `//model [name]` — view or set gugugaga's model.
+    async fn handle_gugugaga_model_command(&mut self, args: &str) {
+        // Resolve codex home
+        let codex_home = std::env::var("CODEX_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".codex")
+            });
+        let config_path = codex_home.join("config.toml");
+
+        if args.is_empty() {
+            // Show current model info
+            let (gugugaga_model, codex_model, provider) = Self::read_gugugaga_model_info(&config_path).await;
+            let resolved = gugugaga_model
+                .as_deref()
+                .or(codex_model.as_deref())
+                .unwrap_or("gpt-5.2-codex");
+            let source = if gugugaga_model.is_some() {
+                "gugugaga_model"
+            } else if codex_model.is_some() {
+                "model (same as Codex)"
+            } else {
+                "default"
+            };
+            self.messages.push(Message::system(&format!(
+                "Gugugaga model: {}\n  Source: {}\n  Provider: {}\n\nUsage: //model <name> to change",
+                resolved,
+                source,
+                provider.as_deref().unwrap_or("openai"),
+            )));
+        } else {
+            // Set gugugaga_model in config.toml
+            match Self::write_gugugaga_model(&config_path, args).await {
+                Ok(()) => {
+                    self.messages.push(Message::system(&format!(
+                        "Gugugaga model set to: {}\n(Restart gugugaga to apply)",
+                        args
+                    )));
+                }
+                Err(e) => {
+                    self.messages.push(Message::system(&format!(
+                        "Failed to set model: {}",
+                        e
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Read gugugaga model info from config.toml
+    async fn read_gugugaga_model_info(
+        config_path: &std::path::Path,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        if let Ok(content) = tokio::fs::read_to_string(config_path).await {
+            if let Ok(table) = content.parse::<toml::Table>() {
+                let gugugaga_model = table
+                    .get("gugugaga_model")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let codex_model = table
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let provider = table
+                    .get("gugugaga_model_provider")
+                    .or_else(|| table.get("model_provider"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                return (gugugaga_model, codex_model, provider);
+            }
+        }
+        (None, None, None)
+    }
+
+    /// Write gugugaga_model to config.toml (preserving other fields)
+    async fn write_gugugaga_model(
+        config_path: &std::path::Path,
+        model: &str,
+    ) -> std::result::Result<(), String> {
+        let mut table: toml::Table = if config_path.exists() {
+            let content = tokio::fs::read_to_string(config_path)
+                .await
+                .map_err(|e| format!("read config.toml: {}", e))?;
+            content
+                .parse()
+                .map_err(|e| format!("parse config.toml: {}", e))?
+        } else {
+            toml::Table::new()
+        };
+
+        table.insert(
+            "gugugaga_model".to_string(),
+            toml::Value::String(model.to_string()),
+        );
+
+        let output = toml::to_string_pretty(&table)
+            .map_err(|e| format!("serialize config.toml: {}", e))?;
+
+        // Ensure parent dir exists
+        if let Some(parent) = config_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+
+        tokio::fs::write(config_path, output)
+            .await
+            .map_err(|e| format!("write config.toml: {}", e))?;
+
+        Ok(())
     }
 
     async fn check_output(&mut self) {

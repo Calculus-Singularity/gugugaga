@@ -219,31 +219,115 @@ struct TokenData {
     account_id: Option<String>,
 }
 
-/// Partial config.toml parsing for gugugaga
+/// Partial config.toml parsing for gugugaga.
+/// Mirrors Codex's ConfigToml but adds gugugaga-specific fields.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ConfigToml {
-    /// Active model provider name
+    /// Active model provider name (shared with Codex)
     model_provider: Option<String>,
 
-    /// Model to use
+    /// Model Codex uses (shared, used as default for gugugaga)
     model: Option<String>,
 
-    /// Custom model providers
+    /// Gugugaga-specific model override.
+    /// If set, gugugaga uses this model instead of Codex's model.
+    gugugaga_model: Option<String>,
+
+    /// Gugugaga-specific model provider override.
+    /// If set, gugugaga uses this provider instead of Codex's model_provider.
+    gugugaga_model_provider: Option<String>,
+
+    /// Custom model providers (shared with Codex)
     model_providers: Option<std::collections::HashMap<String, ModelProviderConfig>>,
 }
 
-/// Model provider configuration
-#[derive(Debug, Deserialize)]
+/// Model provider configuration — mirrors Codex's ModelProviderInfo (simplified).
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct ModelProviderConfig {
-    /// Provider name
+    /// Provider display name
     name: Option<String>,
 
     /// Base URL for API
     base_url: Option<String>,
 
-    /// Wire API type (responses or chat)
+    /// Wire API type: "responses" or "chat"
     wire_api: Option<String>,
+
+    /// Environment variable for API key
+    env_key: Option<String>,
+}
+
+/// Default Gugugaga model — same as Codex's default
+const GUGUGAGA_DEFAULT_MODEL: &str = "gpt-5.2-codex";
+
+// ─── Built-in model providers (aligned with Codex) ──────────────────
+
+/// Returns built-in model providers, mirroring Codex's model_provider_info.rs.
+fn built_in_model_providers() -> std::collections::HashMap<String, ModelProviderConfig> {
+    let mut map = std::collections::HashMap::new();
+
+    // OpenAI — default provider
+    map.insert(
+        "openai".to_string(),
+        ModelProviderConfig {
+            name: Some("OpenAI".to_string()),
+            base_url: Some(
+                std::env::var("OPENAI_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+            ),
+            wire_api: Some("responses".to_string()),
+            env_key: Some("OPENAI_API_KEY".to_string()),
+        },
+    );
+
+    // Ollama (Responses API)
+    map.insert(
+        "ollama".to_string(),
+        ModelProviderConfig {
+            name: Some("Ollama".to_string()),
+            base_url: Some(
+                std::env::var("CODEX_OSS_BASE_URL").unwrap_or_else(|_| {
+                    let port =
+                        std::env::var("CODEX_OSS_PORT").unwrap_or_else(|_| "11434".to_string());
+                    format!("http://localhost:{}/v1", port)
+                }),
+            ),
+            wire_api: Some("responses".to_string()),
+            env_key: None,
+        },
+    );
+
+    // Ollama (Chat Completions API)
+    map.insert(
+        "ollama-chat".to_string(),
+        ModelProviderConfig {
+            name: Some("Ollama (Chat)".to_string()),
+            base_url: Some(
+                std::env::var("CODEX_OSS_BASE_URL").unwrap_or_else(|_| {
+                    let port =
+                        std::env::var("CODEX_OSS_PORT").unwrap_or_else(|_| "11434".to_string());
+                    format!("http://localhost:{}/v1", port)
+                }),
+            ),
+            wire_api: Some("chat".to_string()),
+            env_key: None,
+        },
+    );
+
+    // LM Studio
+    map.insert(
+        "lmstudio".to_string(),
+        ModelProviderConfig {
+            name: Some("LM Studio".to_string()),
+            base_url: Some("http://localhost:1234/v1".to_string()),
+            wire_api: Some("chat".to_string()),
+            env_key: None,
+        },
+    );
+
+    map
 }
 
 // ─── Implementation ─────────────────────────────────────────────────
@@ -325,69 +409,122 @@ impl Evaluator {
     }
 
     /// Load model, base_url, and wire API from config.toml.
-    /// Defaults depend on auth mode (OAuth → chatgpt.com, API key → api.openai.com).
+    ///
+    /// Resolution mirrors Codex (codex-rs/core/src/config/mod.rs) but with
+    /// gugugaga-specific overrides:
+    ///
+    /// **Model** (precedence):
+    ///   1. `gugugaga_model` in config.toml
+    ///   2. `model` in config.toml (same as Codex)
+    ///   3. `GUGUGAGA_MODEL` environment variable
+    ///   4. default: `gpt-5.2-codex`
+    ///
+    /// **Provider** (precedence):
+    ///   1. `gugugaga_model_provider` in config.toml
+    ///   2. `model_provider` in config.toml (shared with Codex)
+    ///   3. default: `"openai"`
+    ///
+    /// **Providers map**: built-in providers (openai, ollama, ollama-chat,
+    /// lmstudio) are merged with user-defined `[model_providers.*]` entries,
+    /// exactly like Codex.
     async fn load_config(
         codex_home: &Path,
         auth_mode: &EvaluatorAuthMode,
     ) -> Result<(String, String, WireApi)> {
         let config_file = codex_home.join("config.toml");
 
+        // Start with built-in providers
+        let mut providers = built_in_model_providers();
+
+        // Defaults before config
+        let mut model = std::env::var("GUGUGAGA_MODEL")
+            .unwrap_or_else(|_| GUGUGAGA_DEFAULT_MODEL.to_string());
+        let mut provider_id = "openai".to_string();
+
         if config_file.exists() {
-            let content = tokio::fs::read_to_string(&config_file).await?;
-
-            if let Ok(config) = toml::from_str::<ConfigToml>(&content) {
-                let model = config.model.unwrap_or_else(|| "gpt-5.2-codex".to_string());
-
-                // Check for custom model provider
-                if let Some(provider_name) = &config.model_provider {
-                    if let Some(providers) = &config.model_providers {
-                        if let Some(provider) = providers.get(provider_name) {
-                            if let Some(base_url) = &provider.base_url {
-                                info!(
-                                    "Using custom provider '{}' with base_url: {}",
-                                    provider_name, base_url
-                                );
-                                let wire = match provider.wire_api.as_deref() {
-                                    Some("chat") => WireApi::Chat,
-                                    Some("responses") => WireApi::Responses,
-                                    _ => Self::default_wire_api(auth_mode),
-                                };
-                                return Ok((model, base_url.clone(), wire));
-                            }
+            if let Ok(content) = tokio::fs::read_to_string(&config_file).await {
+                if let Ok(config) = toml::from_str::<ConfigToml>(&content) {
+                    // Merge user-defined providers into built-in (user can override)
+                    if let Some(user_providers) = config.model_providers {
+                        for (key, prov) in user_providers {
+                            providers.insert(key, prov);
                         }
                     }
-                }
 
-                let (base_url, wire) = Self::default_endpoint(auth_mode);
-                return Ok((model, base_url, wire));
+                    // Resolve model: gugugaga_model > model (Codex's) > env > default
+                    if let Some(gm) = config.gugugaga_model {
+                        model = gm;
+                    } else if let Some(cm) = config.model {
+                        model = cm;
+                    }
+
+                    // Resolve provider: gugugaga_model_provider > model_provider > "openai"
+                    if let Some(gp) = config.gugugaga_model_provider {
+                        provider_id = gp;
+                    } else if let Some(mp) = config.model_provider {
+                        provider_id = mp;
+                    }
+                }
             }
         }
 
-        let (base_url, wire) = Self::default_endpoint(auth_mode);
-        Ok(("gpt-5.2-codex".to_string(), base_url, wire))
+        // Look up the resolved provider
+        let (base_url, wire_api) = if let Some(provider) = providers.get(&provider_id) {
+            let base_url = provider
+                .base_url
+                .clone()
+                .unwrap_or_else(|| Self::default_base_url(auth_mode));
+
+            let wire = match provider.wire_api.as_deref() {
+                Some("chat") => WireApi::Chat,
+                Some("responses") => WireApi::Responses,
+                _ => Self::default_wire_api(auth_mode),
+            };
+
+            // Special case: "openai" provider with OAuth → route to ChatGPT backend
+            if provider_id == "openai" && *auth_mode == EvaluatorAuthMode::ChatgptOAuth {
+                (
+                    "https://chatgpt.com/backend-api/codex".to_string(),
+                    WireApi::Responses,
+                )
+            } else {
+                (base_url, wire)
+            }
+        } else {
+            warn!(
+                "Model provider '{}' not found, falling back to defaults",
+                provider_id
+            );
+            (Self::default_base_url(auth_mode), Self::default_wire_api(auth_mode))
+        };
+
+        info!(
+            "Config resolved: provider='{}', model='{}', base_url='{}', wire={:?}",
+            provider_id, model, base_url, wire_api
+        );
+
+        Ok((model, base_url, wire_api))
     }
 
-    /// Default base URL and wire API based on auth mode.
-    /// Aligned with Codex's model_provider_info.rs:
-    /// - ChatGPT OAuth → chatgpt.com/backend-api/codex (Responses API)
-    /// - API key → api.openai.com/v1 (Chat Completions API)
-    fn default_endpoint(auth_mode: &EvaluatorAuthMode) -> (String, WireApi) {
+    /// Default base URL based on auth mode.
+    fn default_base_url(auth_mode: &EvaluatorAuthMode) -> String {
         match auth_mode {
-            EvaluatorAuthMode::ChatgptOAuth => (
-                "https://chatgpt.com/backend-api/codex".to_string(),
-                WireApi::Responses,
-            ),
-            EvaluatorAuthMode::ApiKey => (
-                "https://api.openai.com/v1".to_string(),
-                WireApi::Chat,
-            ),
+            EvaluatorAuthMode::ChatgptOAuth => {
+                "https://chatgpt.com/backend-api/codex".to_string()
+            }
+            EvaluatorAuthMode::ApiKey => "https://api.openai.com/v1".to_string(),
         }
     }
 
+    /// Default wire API based on auth mode.
+    /// Aligned with Codex's model_provider_info.rs:
+    /// - ChatGPT OAuth → Responses API
+    /// - API key with openai → Responses API (Codex default)
+    /// - Fallback → Chat API
     fn default_wire_api(auth_mode: &EvaluatorAuthMode) -> WireApi {
         match auth_mode {
             EvaluatorAuthMode::ChatgptOAuth => WireApi::Responses,
-            EvaluatorAuthMode::ApiKey => WireApi::Chat,
+            EvaluatorAuthMode::ApiKey => WireApi::Responses,
         }
     }
 

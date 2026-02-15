@@ -161,10 +161,10 @@ pub enum GugugagaCommand {
     Clear,
     /// Show gugugaga stats
     Stats,
+    /// View or set Gugugaga's model
+    Model,
     /// View Gugugaga notebook
     Notebook,
-    /// Quit gugugaga
-    Quit,
 }
 
 impl GugugagaCommand {
@@ -173,8 +173,8 @@ impl GugugagaCommand {
             GugugagaCommand::Help,
             GugugagaCommand::Clear,
             GugugagaCommand::Stats,
+            GugugagaCommand::Model,
             GugugagaCommand::Notebook,
-            GugugagaCommand::Quit,
         ]
     }
 
@@ -183,8 +183,8 @@ impl GugugagaCommand {
             GugugagaCommand::Help => "help",
             GugugagaCommand::Clear => "clear",
             GugugagaCommand::Stats => "stats",
+            GugugagaCommand::Model => "model",
             GugugagaCommand::Notebook => "notebook",
-            GugugagaCommand::Quit => "quit",
         }
     }
 
@@ -193,13 +193,13 @@ impl GugugagaCommand {
             GugugagaCommand::Help => "Show Gugugaga help",
             GugugagaCommand::Clear => "Clear chat history",
             GugugagaCommand::Stats => "Show monitoring stats",
+            GugugagaCommand::Model => "View or set Gugugaga model",
             GugugagaCommand::Notebook => "View Gugugaga notebook",
-            GugugagaCommand::Quit => "Quit Gugugaga",
         }
     }
 
     pub fn takes_args(&self) -> bool {
-        false
+        matches!(self, GugugagaCommand::Model)
     }
 
     pub fn matches(prefix: &str) -> Vec<GugugagaCommand> {
