@@ -7,7 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::theme::Theme;
 
@@ -129,8 +129,8 @@ impl Picker {
         }
 
         // Calculate picker size and position (centered)
-        let width = (area.width * 2 / 3).min(60).max(40);
-        let height = 12.min(area.height.saturating_sub(4));
+        let width = (area.width * 3 / 4).min(96).max(48);
+        let height = 16.min(area.height.saturating_sub(4));
         let x = area.x + (area.width - width) / 2;
         let y = area.y + (area.height - height) / 2;
 
@@ -150,11 +150,15 @@ impl Picker {
         } else if self.items.is_empty() {
             vec![Line::styled("No items found.", Theme::muted())]
         } else {
-            self.items
+            let show_detail = inner_height >= 6;
+            let detail_reserved = if show_detail { 4 } else { 0 };
+            let list_height = inner_height.saturating_sub(detail_reserved).max(1);
+
+            let mut lines: Vec<Line> = self.items
                 .iter()
                 .enumerate()
                 .skip(self.scroll_offset)
-                .take(inner_height)
+                .take(list_height)
                 .map(|(i, item)| {
                     let is_selected = i == self.selected;
                     let prefix = if is_selected { "> " } else { "  " };
@@ -164,41 +168,37 @@ impl Picker {
                         Theme::text()
                     };
 
-                    // Truncate to fit: prefix(2) + title + " - " + subtitle
+                    // Render compact list rows using title only; full subtitle is
+                    // shown in the detail pane for the selected item.
                     let prefix_w = prefix.width();
-                    let sep = " - ";
-                    let sep_w = sep.width();
-                    let avail_for_text = inner_width.saturating_sub(prefix_w);
-
-                    let title_w = item.title.width();
-                    let sub_w = item.subtitle.width();
-
-                    if title_w + sep_w + sub_w <= avail_for_text {
-                        // Fits
-                        Line::from(vec![
-                            Span::styled(prefix, style),
-                            Span::styled(item.title.clone(), style.bold()),
-                            Span::styled(format!("{}{}", sep, item.subtitle), Theme::muted()),
-                        ])
-                    } else if title_w + sep_w + 3 <= avail_for_text {
-                        // Truncate subtitle
-                        let sub_avail = avail_for_text.saturating_sub(title_w + sep_w);
-                        let truncated_sub = super::widgets::truncate_to_width_str(&item.subtitle, sub_avail);
-                        Line::from(vec![
-                            Span::styled(prefix, style),
-                            Span::styled(item.title.clone(), style.bold()),
-                            Span::styled(format!("{}{}", sep, truncated_sub), Theme::muted()),
-                        ])
-                    } else {
-                        // Just show truncated title
-                        let truncated_title = super::widgets::truncate_to_width_str(&item.title, avail_for_text);
-                        Line::from(vec![
-                            Span::styled(prefix, style),
-                            Span::styled(truncated_title, style.bold()),
-                        ])
-                    }
+                    let avail_for_title = inner_width.saturating_sub(prefix_w);
+                    let truncated_title =
+                        super::widgets::truncate_to_width_str(&item.title, avail_for_title);
+                    Line::from(vec![
+                        Span::styled(prefix, style),
+                        Span::styled(truncated_title, style.bold()),
+                    ])
                 })
                 .collect()
+            ;
+
+            if show_detail {
+                if let Some(selected) = self.items.get(self.selected) {
+                    lines.push(Line::styled("─".repeat(inner_width), Theme::muted()));
+                    lines.push(Line::from(vec![
+                        Span::styled(selected.title.clone(), Theme::accent().bold()),
+                    ]));
+
+                    let subtitle = selected.subtitle.trim();
+                    if !subtitle.is_empty() {
+                        for row in wrap_to_width(subtitle, inner_width, 2) {
+                            lines.push(Line::styled(row, Theme::muted()));
+                        }
+                    }
+                }
+            }
+
+            lines
         };
 
         let title = format!(" {} ", self.title);
@@ -215,4 +215,36 @@ impl Picker {
             .wrap(Wrap { trim: false });
         paragraph.render(picker_area, buf);
     }
+}
+
+fn wrap_to_width(text: &str, max_width: usize, max_lines: usize) -> Vec<String> {
+    if text.is_empty() || max_width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+
+    let mut all_lines: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        if raw.is_empty() {
+            all_lines.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in raw.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(1);
+            if current_width + ch_width > max_width && !current.is_empty() {
+                all_lines.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+        if !current.is_empty() {
+            all_lines.push(current);
+        }
+    }
+
+    all_lines.into_iter().take(max_lines).collect()
 }

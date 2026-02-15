@@ -75,6 +75,9 @@ enum PickerMode {
     None,
     Resume,
     Model,
+    ModelReasoning,   // /model second stage: select reasoning effort
+    GugugagaModel,    // //model — select model for gugugaga supervisor
+    GugugagaModelReasoning, // //model second stage: select reasoning effort
     SkillsMenu,       // First-level: "List skills" / "Enable/Disable"
     SkillsSelect,     // Second-level: select a skill to insert as $mention
     SkillsManage,     // Second-level: toggle individual skills on/off
@@ -93,6 +96,7 @@ enum PendingRequestType {
     ThreadResume(String),
     ThreadRead(String),
     ModelList,
+    GugugagaModelList,
     SkillsList,
     CollabModeList,
     AgentThreadList,
@@ -127,6 +131,22 @@ enum ApprovalType {
     FileChange,
 }
 
+#[derive(Debug, Clone)]
+struct ModelReasoningEffort {
+    effort: String,
+    description: String,
+}
+
+#[derive(Debug, Clone)]
+struct ModelInfoEntry {
+    id: String,
+    display_name: String,
+    description: String,
+    supported_reasoning_efforts: Vec<ModelReasoningEffort>,
+    default_reasoning_effort: Option<String>,
+    is_default: bool,
+}
+
 /// Application state
 pub struct App {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -157,6 +177,12 @@ pub struct App {
     pending_request_type: PendingRequestType,
     /// Request ID counter
     request_counter: u64,
+    /// Cached model catalog from latest model/list response
+    available_models: Vec<ModelInfoEntry>,
+    /// Model temporarily selected in /model before choosing reasoning effort
+    pending_model_for_reasoning: Option<ModelInfoEntry>,
+    /// Model temporarily selected in //model before choosing reasoning effort
+    pending_gugugaga_model_for_reasoning: Option<ModelInfoEntry>,
     /// Current thread ID (from thread/start response)
     thread_id: Option<String>,
     /// Current turn ID (from turn/started notification, needed for interrupt)
@@ -241,6 +267,9 @@ impl App {
             pending_request_id: None,
             pending_request_type: PendingRequestType::None,
             request_counter: 100, // Start after other request IDs
+            available_models: Vec::new(),
+            pending_model_for_reasoning: None,
+            pending_gugugaga_model_for_reasoning: None,
             thread_id: None,
             current_turn_id: None,
             quit_armed: false,
@@ -1057,6 +1086,9 @@ impl App {
         self.picker_mode = PickerMode::Model;
         self.picker.title = "Select Model".to_string();
         self.picker.open_loading();
+        self.available_models.clear();
+        self.pending_model_for_reasoning = None;
+        self.pending_gugugaga_model_for_reasoning = None;
 
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
@@ -1071,6 +1103,39 @@ impl App {
             .to_string();
             let _ = tx.send(msg).await;
         }
+    }
+
+    /// Request model list for gugugaga model picker (reuses Codex's model/list RPC)
+    async fn request_gugugaga_model_list(&mut self) {
+        self.picker_mode = PickerMode::GugugagaModel;
+        self.picker.title = "Select Model".to_string();
+        self.picker.open_loading();
+        self.available_models.clear();
+        self.pending_model_for_reasoning = None;
+        self.pending_gugugaga_model_for_reasoning = None;
+
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::GugugagaModelList;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "model/list",
+                "id": self.request_counter,
+                "params": {}
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+        }
+    }
+
+    /// Directly set gugugaga model by name (//model <name>)
+    async fn handle_gugugaga_model_set(&mut self, model: &str) {
+        self.persist_gugugaga_model_selection(model, None).await;
+        self.messages.push(Message::system(&format!(
+            "Gugugaga model set to: {}\n(Restart gugugaga to apply)",
+            model
+        )));
     }
 
     /// Open skills menu - first level picker
@@ -1494,8 +1559,211 @@ Make it comprehensive but concise."#;
                     }
                 }
                 PickerMode::Model => {
-                    self.messages.push(Message::system(&format!("Model set to: {}", item_title)));
-                    self.write_config("model", &serde_json::json!(item_id)).await;
+                    if let Some(model) = self
+                        .available_models
+                        .iter()
+                        .find(|m| m.id == item_id)
+                        .cloned()
+                    {
+                        let default_effort = model.default_reasoning_effort.clone();
+                        let supported_count = model.supported_reasoning_efforts.len();
+
+                        if supported_count > 1 {
+                            self.pending_model_for_reasoning = Some(model.clone());
+                            self.picker_mode = PickerMode::ModelReasoning;
+                            self.picker.title =
+                                format!("Reasoning Effort ({})", model.display_name);
+
+                            let mut items: Vec<PickerItem> = model
+                                .supported_reasoning_efforts
+                                .iter()
+                                .map(|opt| {
+                                    let is_default = default_effort
+                                        .as_deref()
+                                        .map(|d| d == opt.effort)
+                                        .unwrap_or(false);
+                                    let title = if is_default {
+                                        format!("{} (default)", opt.effort)
+                                    } else {
+                                        opt.effort.clone()
+                                    };
+                                    PickerItem {
+                                        id: opt.effort.clone(),
+                                        title,
+                                        subtitle: if opt.description.is_empty() {
+                                            "Reasoning effort".to_string()
+                                        } else {
+                                            opt.description.clone()
+                                        },
+                                        metadata: None,
+                                    }
+                                })
+                                .collect();
+
+                            if items.is_empty() {
+                                items.push(PickerItem {
+                                    id: "default".to_string(),
+                                    title: "default".to_string(),
+                                    subtitle: "Use model default reasoning effort".to_string(),
+                                    metadata: None,
+                                });
+                            }
+
+                            self.picker.open(items);
+                            self.messages.push(Message::system(&format!(
+                                "Model selected: {}. Choose reasoning effort.",
+                                model.display_name
+                            )));
+                            return;
+                        }
+
+                        // No second stage needed (single effort or no effort metadata).
+                        let selected_effort = model
+                            .supported_reasoning_efforts
+                            .first()
+                            .map(|e| e.effort.clone())
+                            .or(default_effort);
+
+                        self.set_default_model(&item_id, selected_effort.as_deref()).await;
+                        let suffix = selected_effort
+                            .as_deref()
+                            .map(|e| format!(" (reasoning: {e})"))
+                            .unwrap_or_default();
+                        self.messages
+                            .push(Message::system(&format!("Model set to: {}{}", item_title, suffix)));
+                    } else {
+                        // Fallback if model cache is missing for any reason.
+                        self.set_default_model(&item_id, None).await;
+                        self.messages.push(Message::system(&format!(
+                            "Model set to: {}",
+                            item_title
+                        )));
+                    }
+                }
+                PickerMode::ModelReasoning => {
+                    if let Some(model) = self.pending_model_for_reasoning.take() {
+                        let effort = if item_id == "default" {
+                            model.default_reasoning_effort.as_deref()
+                        } else {
+                            Some(item_id.as_str())
+                        };
+                        self.set_default_model(&model.id, effort).await;
+                        let suffix = effort
+                            .map(|e| format!(" (reasoning: {e})"))
+                            .unwrap_or_default();
+                        self.messages.push(Message::system(&format!(
+                            "Model set to: {}{}",
+                            model.display_name, suffix
+                        )));
+                    } else {
+                        self.messages.push(Message::system(
+                            "No model selected for reasoning effort. Please run /model again.",
+                        ));
+                    }
+                }
+                PickerMode::GugugagaModel => {
+                    if let Some(model) = self
+                        .available_models
+                        .iter()
+                        .find(|m| m.id == item_id)
+                        .cloned()
+                    {
+                        let default_effort = model.default_reasoning_effort.clone();
+                        let supported_count = model.supported_reasoning_efforts.len();
+
+                        if supported_count > 1 {
+                            self.pending_gugugaga_model_for_reasoning = Some(model.clone());
+                            self.picker_mode = PickerMode::GugugagaModelReasoning;
+                            self.picker.title =
+                                format!("Reasoning Effort ({})", model.display_name);
+
+                            let mut items: Vec<PickerItem> = model
+                                .supported_reasoning_efforts
+                                .iter()
+                                .map(|opt| {
+                                    let is_default = default_effort
+                                        .as_deref()
+                                        .map(|d| d == opt.effort)
+                                        .unwrap_or(false);
+                                    let title = if is_default {
+                                        format!("{} (default)", opt.effort)
+                                    } else {
+                                        opt.effort.clone()
+                                    };
+                                    PickerItem {
+                                        id: opt.effort.clone(),
+                                        title,
+                                        subtitle: if opt.description.is_empty() {
+                                            "Reasoning effort".to_string()
+                                        } else {
+                                            opt.description.clone()
+                                        },
+                                        metadata: None,
+                                    }
+                                })
+                                .collect();
+
+                            if items.is_empty() {
+                                items.push(PickerItem {
+                                    id: "default".to_string(),
+                                    title: "default".to_string(),
+                                    subtitle: "Use model default reasoning effort".to_string(),
+                                    metadata: None,
+                                });
+                            }
+
+                            self.picker.open(items);
+                            self.messages.push(Message::system(&format!(
+                                "Gugugaga model selected: {}. Choose reasoning effort.",
+                                model.display_name
+                            )));
+                            return;
+                        }
+
+                        let selected_effort = model
+                            .supported_reasoning_efforts
+                            .first()
+                            .map(|e| e.effort.clone())
+                            .or(default_effort);
+
+                        self.persist_gugugaga_model_selection(&item_id, selected_effort.as_deref())
+                            .await;
+                        let suffix = selected_effort
+                            .as_deref()
+                            .map(|e| format!(" (reasoning: {e})"))
+                            .unwrap_or_default();
+                        self.messages.push(Message::system(&format!(
+                            "Gugugaga model set to: {}{}\n(Restart gugugaga to apply)",
+                            item_title, suffix
+                        )));
+                    } else {
+                        self.persist_gugugaga_model_selection(&item_id, None).await;
+                        self.messages.push(Message::system(&format!(
+                            "Gugugaga model set to: {}\n(Restart gugugaga to apply)",
+                            item_title
+                        )));
+                    }
+                }
+                PickerMode::GugugagaModelReasoning => {
+                    if let Some(model) = self.pending_gugugaga_model_for_reasoning.take() {
+                        let effort = if item_id == "default" {
+                            model.default_reasoning_effort.as_deref()
+                        } else {
+                            Some(item_id.as_str())
+                        };
+                        self.persist_gugugaga_model_selection(&model.id, effort).await;
+                        let suffix = effort
+                            .map(|e| format!(" (reasoning: {e})"))
+                            .unwrap_or_default();
+                        self.messages.push(Message::system(&format!(
+                            "Gugugaga model set to: {}{}\n(Restart gugugaga to apply)",
+                            model.display_name, suffix
+                        )));
+                    } else {
+                        self.messages.push(Message::system(
+                            "No Gugugaga model selected for reasoning effort. Please run //model again.",
+                        ));
+                    }
                 }
                 PickerMode::SkillsMenu => {
                     match item_id.as_str() {
@@ -1582,6 +1850,27 @@ Make it comprehensive but concise."#;
         }
     }
     
+    /// Set the default model via Codex's setDefaultModel RPC
+    async fn set_default_model(&mut self, model_id: &str, reasoning_effort: Option<&str>) {
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            let mut params = serde_json::json!({
+                "model": model_id
+            });
+            params["reasoningEffort"] = reasoning_effort
+                .map(|e| serde_json::Value::String(e.to_string()))
+                .unwrap_or(serde_json::Value::Null);
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "setDefaultModel",
+                "id": self.request_counter,
+                "params": params
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+        }
+    }
+
     /// Send a simple approval decision (accept / acceptForSession / cancel)
     async fn respond_to_approval_decision(&mut self, approval: &PendingApproval, decision: &str) {
         if let Some(tx) = &self.input_tx {
@@ -1660,7 +1949,14 @@ Make it comprehensive but concise."#;
                 )));
             }
             GugugagaCommand::Model => {
-                self.handle_gugugaga_model_command(args.trim()).await;
+                let arg = args.trim();
+                if arg.is_empty() {
+                    // Open picker with model list (same as /model but writes to gugugaga_model)
+                    self.request_gugugaga_model_list().await;
+                } else {
+                    // Direct set: //model <name>
+                    self.handle_gugugaga_model_set(arg).await;
+                }
             }
             GugugagaCommand::Notebook => {
                 if let Some(notebook) = &self.notebook {
@@ -1726,9 +2022,11 @@ Make it comprehensive but concise."#;
         self.scroll_to_bottom();
     }
 
-    /// Handle `//model [name]` — view or set gugugaga's model.
-    async fn handle_gugugaga_model_command(&mut self, args: &str) {
-        // Resolve codex home
+    async fn persist_gugugaga_model_selection(
+        &mut self,
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) {
         let codex_home = std::env::var("CODEX_HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
@@ -1737,75 +2035,23 @@ Make it comprehensive but concise."#;
                     .join(".codex")
             });
         let config_path = codex_home.join("config.toml");
-
-        if args.is_empty() {
-            // Show current model info
-            let (gugugaga_model, codex_model, provider) = Self::read_gugugaga_model_info(&config_path).await;
-            let resolved = gugugaga_model
-                .as_deref()
-                .or(codex_model.as_deref())
-                .unwrap_or("gpt-5.2-codex");
-            let source = if gugugaga_model.is_some() {
-                "gugugaga_model"
-            } else if codex_model.is_some() {
-                "model (same as Codex)"
-            } else {
-                "default"
-            };
-            self.messages.push(Message::system(&format!(
-                "Gugugaga model: {}\n  Source: {}\n  Provider: {}\n\nUsage: //model <name> to change",
-                resolved,
-                source,
-                provider.as_deref().unwrap_or("openai"),
-            )));
-        } else {
-            // Set gugugaga_model in config.toml
-            match Self::write_gugugaga_model(&config_path, args).await {
-                Ok(()) => {
-                    self.messages.push(Message::system(&format!(
-                        "Gugugaga model set to: {}\n(Restart gugugaga to apply)",
-                        args
-                    )));
-                }
-                Err(e) => {
-                    self.messages.push(Message::system(&format!(
-                        "Failed to set model: {}",
-                        e
-                    )));
-                }
-            }
+        if let Err(e) = Self::write_gugugaga_model_selection(
+            &config_path,
+            model,
+            reasoning_effort,
+        )
+        .await
+        {
+            self.messages
+                .push(Message::system(&format!("Failed to set Gugugaga model: {}", e)));
         }
     }
 
-    /// Read gugugaga model info from config.toml
-    async fn read_gugugaga_model_info(
-        config_path: &std::path::Path,
-    ) -> (Option<String>, Option<String>, Option<String>) {
-        if let Ok(content) = tokio::fs::read_to_string(config_path).await {
-            if let Ok(table) = content.parse::<toml::Table>() {
-                let gugugaga_model = table
-                    .get("gugugaga_model")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let codex_model = table
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let provider = table
-                    .get("gugugaga_model_provider")
-                    .or_else(|| table.get("model_provider"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                return (gugugaga_model, codex_model, provider);
-            }
-        }
-        (None, None, None)
-    }
-
-    /// Write gugugaga_model to config.toml (preserving other fields)
-    async fn write_gugugaga_model(
+    /// Write gugugaga model selection to config.toml (preserving other fields)
+    async fn write_gugugaga_model_selection(
         config_path: &std::path::Path,
         model: &str,
+        reasoning_effort: Option<&str>,
     ) -> std::result::Result<(), String> {
         let mut table: toml::Table = if config_path.exists() {
             let content = tokio::fs::read_to_string(config_path)
@@ -1822,6 +2068,17 @@ Make it comprehensive but concise."#;
             "gugugaga_model".to_string(),
             toml::Value::String(model.to_string()),
         );
+        match reasoning_effort {
+            Some(effort) => {
+                table.insert(
+                    "gugugaga_model_reasoning_effort".to_string(),
+                    toml::Value::String(effort.to_string()),
+                );
+            }
+            None => {
+                table.remove("gugugaga_model_reasoning_effort");
+            }
+        }
 
         let output = toml::to_string_pretty(&table)
             .map_err(|e| format!("serialize config.toml: {}", e))?;
@@ -2800,37 +3057,64 @@ Make it comprehensive but concise."#;
             }
             PendingRequestType::ModelList => {
                 if let Some(result) = json.get("result") {
-                    if let Some(models) = result.get("data").and_then(|m| m.as_array()) {
-                        let items: Vec<PickerItem> = models
-                            .iter()
-                            .filter_map(|m| {
-                                let id = m.get("id").and_then(|i| i.as_str())?.to_string();
-                                let name = m.get("displayName").and_then(|n| n.as_str())
-                                    .or_else(|| m.get("model").and_then(|n| n.as_str()))
-                                    .unwrap_or(&id)
-                                    .to_string();
-                                let provider = m.get("modelProvider").and_then(|p| p.as_str()).unwrap_or("");
-                                Some(PickerItem {
-                                    id,
-                                    title: name,
-                                    subtitle: provider.to_string(),
-                                    metadata: None,
-                                })
-                            })
-                            .collect();
+                    let parsed_models = Self::parse_model_entries(result);
+                    self.available_models = parsed_models.clone();
+                    let items: Vec<PickerItem> = parsed_models
+                        .iter()
+                        .map(|model| {
+                            let title = if model.is_default {
+                                format!("{} (default)", model.display_name)
+                            } else {
+                                model.display_name.clone()
+                            };
+                            PickerItem {
+                                id: model.id.clone(),
+                                title,
+                                subtitle: Self::model_subtitle(model),
+                                metadata: None,
+                            }
+                        })
+                        .collect();
 
-                        if items.is_empty() {
-                            self.picker.close();
-                            self.picker_mode = PickerMode::None;
-                            self.messages.push(Message::system("No models available."));
-                        } else {
-                            self.picker.set_items(items);
-                        }
-                    } else {
+                    if items.is_empty() {
                         self.picker.close();
                         self.picker_mode = PickerMode::None;
-                        let text = serde_json::to_string_pretty(result).unwrap_or_default();
-                        self.messages.push(Message::system(&format!("Models:\n{}", text)));
+                        self.messages.push(Message::system("No models available."));
+                    } else {
+                        self.picker.set_items(items);
+                    }
+                } else {
+                    self.handle_rpc_error(json, "Failed to load models");
+                }
+            }
+            PendingRequestType::GugugagaModelList => {
+                // Same parsing as ModelList, but for gugugaga model picker
+                if let Some(result) = json.get("result") {
+                    let parsed_models = Self::parse_model_entries(result);
+                    self.available_models = parsed_models.clone();
+                    let items: Vec<PickerItem> = parsed_models
+                        .iter()
+                        .map(|model| {
+                            let title = if model.is_default {
+                                format!("{} (default)", model.display_name)
+                            } else {
+                                model.display_name.clone()
+                            };
+                            PickerItem {
+                                id: model.id.clone(),
+                                title,
+                                subtitle: Self::model_subtitle(model),
+                                metadata: None,
+                            }
+                        })
+                        .collect();
+
+                    if items.is_empty() {
+                        self.picker.close();
+                        self.picker_mode = PickerMode::None;
+                        self.messages.push(Message::system("No models available."));
+                    } else {
+                        self.picker.set_items(items);
                     }
                 } else {
                     self.handle_rpc_error(json, "Failed to load models");
@@ -3125,6 +3409,101 @@ Make it comprehensive but concise."#;
             PendingRequestType::None => {
                 // Unexpected response - ignore
             }
+        }
+    }
+
+    fn parse_model_entries(result: &serde_json::Value) -> Vec<ModelInfoEntry> {
+        let Some(models) = result.get("data").and_then(|m| m.as_array()) else {
+            return Vec::new();
+        };
+
+        models
+            .iter()
+            .filter_map(|m| {
+                let id = m
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .or_else(|| m.get("model").and_then(|i| i.as_str()))?
+                    .to_string();
+                let display_name = m
+                    .get("displayName")
+                    .and_then(|n| n.as_str())
+                    .or_else(|| m.get("model").and_then(|n| n.as_str()))
+                    .unwrap_or(&id)
+                    .to_string();
+                let description = m
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let default_reasoning_effort = m
+                    .get("defaultReasoningEffort")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string());
+                let supported_reasoning_efforts = m
+                    .get("supportedReasoningEfforts")
+                    .and_then(|arr| arr.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|opt| {
+                                let effort = opt
+                                    .get("reasoningEffort")
+                                    .and_then(|e| e.as_str())?
+                                    .to_string();
+                                let description = opt
+                                    .get("description")
+                                    .and_then(|d| d.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                Some(ModelReasoningEffort {
+                                    effort,
+                                    description,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let is_default = m
+                    .get("isDefault")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                Some(ModelInfoEntry {
+                    id,
+                    display_name,
+                    description,
+                    supported_reasoning_efforts,
+                    default_reasoning_effort,
+                    is_default,
+                })
+            })
+            .collect()
+    }
+
+    fn model_subtitle(model: &ModelInfoEntry) -> String {
+        let mut efforts: Vec<String> = model
+            .supported_reasoning_efforts
+            .iter()
+            .map(|e| e.effort.clone())
+            .collect();
+        if let Some(default_effort) = &model.default_reasoning_effort {
+            if !efforts.iter().any(|e| e == default_effort) {
+                efforts.push(default_effort.clone());
+            }
+        }
+
+        let effort_part = if efforts.is_empty() {
+            "effort: unknown".to_string()
+        } else if let Some(default_effort) = &model.default_reasoning_effort {
+            format!("effort: {} (default {})", efforts.join("/"), default_effort)
+        } else {
+            format!("effort: {}", efforts.join("/"))
+        };
+
+        if model.description.is_empty() {
+            effort_part
+        } else {
+            format!("{}\n{}", effort_part, model.description)
         }
     }
 
