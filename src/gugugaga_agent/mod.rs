@@ -104,7 +104,20 @@ impl GugugagaAgent {
     /// Includes compaction aligned with Codex:
     /// - Before first LLM call: compact conversation history if token usage >= 90%
     /// - After each LLM call with tool follow-up: compact tool results if too large
-    pub async fn detect_violation(&self, agent_message: &str) -> Result<CheckResult> {
+    ///
+    /// If `event_tx` is provided, emits real-time `gugugaga/*` notifications so
+    /// the TUI can display thinking and tool-call activity (like Codex does).
+    pub async fn detect_violation(
+        &self,
+        agent_message: &str,
+        event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<CheckResult> {
+        // Helper: fire-and-forget an event to the TUI
+        let emit = |tx: &tokio::sync::mpsc::Sender<String>, method: &str, params: serde_json::Value| {
+            let msg = serde_json::json!({ "method": method, "params": params }).to_string();
+            let _ = tx.try_send(msg);
+        };
+
         // ── Pre-call compaction (aligned with Codex: check at turn start) ──
         {
             let mut memory = self.memory.write().await;
@@ -122,8 +135,21 @@ impl GugugagaAgent {
         let mut last_thinking: Option<String>;
         // Token budget for accumulated tool results before compaction
         const TOOL_RESULTS_MAX_TOKENS: usize = 6_000;
+        let mut iteration = 0u32;
 
         loop {
+            iteration += 1;
+
+            // Notify TUI that we're calling the LLM
+            if let Some(tx) = event_tx {
+                let label = if iteration == 1 {
+                    "Analyzing Codex output...".to_string()
+                } else {
+                    format!("Analyzing (tool follow-up #{})...", iteration - 1)
+                };
+                emit(tx, "gugugaga/thinking", serde_json::json!({ "status": "thinking", "message": label }));
+            }
+
             let prompt = {
                 let memory = self.memory.read().await;
                 let notebook = self.notebook.read().await;
@@ -138,12 +164,23 @@ impl GugugagaAgent {
                 p
             };
 
+            let started = std::time::Instant::now();
             let parsed = self.evaluator.call_llm_with_thinking(&prompt).await?;
-            last_thinking = parsed.thinking;
+            let llm_duration = started.elapsed();
+            last_thinking = parsed.thinking.clone();
             let response = parsed.response.trim();
 
+            // Emit thinking content if present
+            if let (Some(tx), Some(thinking)) = (event_tx, &parsed.thinking) {
+                emit(tx, "gugugaga/thinking", serde_json::json!({
+                    "status": "thought",
+                    "message": thinking,
+                    "duration_ms": llm_duration.as_millis() as u64,
+                }));
+            }
+
             // Check for tool calls
-            if let Some(tool_result) = self.execute_tool_call(response).await {
+            if let Some(tool_result) = self.execute_tool_call_with_events(response, event_tx).await {
                 tool_results.push(tool_result);
 
                 // ── Mid-loop compaction (aligned with Codex: after sampling, if needs follow-up) ──
@@ -161,6 +198,61 @@ impl GugugagaAgent {
             // Parse final response
             return self.parse_check_response(response, last_thinking);
         }
+    }
+
+    /// Execute a tool call, emitting events to the TUI if event_tx is provided.
+    async fn execute_tool_call_with_events(
+        &self,
+        response: &str,
+        event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) -> Option<String> {
+        // Parse tool call first
+        let tool_regex = regex::Regex::new(r"TOOL:\s*(\w+)\s*\((.+)\)").ok()?;
+        let caps = tool_regex.captures(response)?;
+        let tool_name = caps.get(1)?.as_str().to_string();
+        let args = caps.get(2)?.as_str().trim().trim_matches('"').trim_matches('\'').to_string();
+
+        // Notify TUI that a tool call is starting
+        if let Some(tx) = event_tx {
+            let msg = serde_json::json!({
+                "method": "gugugaga/toolCall",
+                "params": {
+                    "status": "started",
+                    "tool": tool_name,
+                    "args": args,
+                }
+            }).to_string();
+            let _ = tx.try_send(msg);
+        }
+
+        let started = std::time::Instant::now();
+        let result = self.execute_tool_call(response).await;
+        let duration = started.elapsed();
+
+        // Notify TUI of tool result
+        if let Some(tx) = event_tx {
+            let output = result.as_deref().unwrap_or("(no result)");
+            // Truncate for display
+            let display_output = if output.len() > 500 {
+                format!("{}...[truncated]", &output[..500])
+            } else {
+                output.to_string()
+            };
+            let msg = serde_json::json!({
+                "method": "gugugaga/toolCall",
+                "params": {
+                    "status": "completed",
+                    "tool": tool_name,
+                    "args": args,
+                    "output": display_output,
+                    "duration_ms": duration.as_millis() as u64,
+                    "success": result.is_some(),
+                }
+            }).to_string();
+            let _ = tx.try_send(msg);
+        }
+
+        result
     }
 
     /// Execute a tool call if present in response

@@ -2394,12 +2394,85 @@ Make it comprehensive but concise."#;
                     }
                 }
                 "gugugaga/thinking" => {
-                    if let Some(msg) = json
-                        .get("params")
-                        .and_then(|p| p.get("message"))
-                        .and_then(|m| m.as_str())
-                    {
-                        self.gugugaga_status = Some(msg.to_string());
+                    let params = json.get("params");
+                    let status = params.and_then(|p| p.get("status")).and_then(|s| s.as_str()).unwrap_or("");
+                    let message = params.and_then(|p| p.get("message")).and_then(|m| m.as_str()).unwrap_or("");
+
+                    match status {
+                        "thinking" => {
+                            // Update status bar only (like Codex's reasoning → status indicator)
+                            self.gugugaga_status = Some(message.to_string());
+                        }
+                        "thought" => {
+                            // Show thinking content in chat (dimmed, like reasoning output)
+                            let duration_ms = params.and_then(|p| p.get("duration_ms")).and_then(|d| d.as_u64()).unwrap_or(0);
+                            let duration_str = if duration_ms >= 1000 {
+                                format!("{:.1}s", duration_ms as f64 / 1000.0)
+                            } else {
+                                format!("{}ms", duration_ms)
+                            };
+                            // Show first meaningful line as status, full content in chat
+                            let first_line = message.lines().next().unwrap_or(message);
+                            let display = if first_line.len() > 80 {
+                                format!("{}...", &first_line[..77])
+                            } else {
+                                first_line.to_string()
+                            };
+                            self.gugugaga_status = Some(format!("Thought ({}): {}", duration_str, display));
+                        }
+                        _ => {
+                            if !message.is_empty() {
+                                self.gugugaga_status = Some(message.to_string());
+                            }
+                        }
+                    }
+                }
+                "gugugaga/toolCall" => {
+                    let params = json.get("params");
+                    let status = params.and_then(|p| p.get("status")).and_then(|s| s.as_str()).unwrap_or("");
+                    let tool = params.and_then(|p| p.get("tool")).and_then(|t| t.as_str()).unwrap_or("?");
+                    let args = params.and_then(|p| p.get("args")).and_then(|a| a.as_str()).unwrap_or("");
+
+                    match status {
+                        "started" => {
+                            // Show tool call start in status bar
+                            self.gugugaga_status = Some(format!("$ {}({})", tool, args));
+                        }
+                        "completed" => {
+                            let output = params.and_then(|p| p.get("output")).and_then(|o| o.as_str()).unwrap_or("");
+                            let duration_ms = params.and_then(|p| p.get("duration_ms")).and_then(|d| d.as_u64()).unwrap_or(0);
+                            let success = params.and_then(|p| p.get("success")).and_then(|s| s.as_bool()).unwrap_or(true);
+
+                            let duration_str = if duration_ms >= 1000 {
+                                format!("{:.1}s", duration_ms as f64 / 1000.0)
+                            } else {
+                                format!("{}ms", duration_ms)
+                            };
+
+                            let icon = if success { "✓" } else { "✗" };
+
+                            // Show tool call + result as a Gugugaga message in chat
+                            // Format like Codex: $ command → output → result
+                            let mut content = format!("$ {}({})\n", tool, args);
+                            if !output.is_empty() {
+                                // Limit output lines for display
+                                let output_lines: Vec<&str> = output.lines().take(8).collect();
+                                content.push_str(&output_lines.join("\n"));
+                                let total_lines = output.lines().count();
+                                if total_lines > 8 {
+                                    content.push_str(&format!("\n... ({} more lines)", total_lines - 8));
+                                }
+                                content.push('\n');
+                            }
+                            content.push_str(&format!("{} {}", icon, duration_str));
+
+                            self.messages.push(Message::gugugaga(&content));
+                            self.scroll_to_bottom();
+
+                            // Update status bar
+                            self.gugugaga_status = Some(format!("{} {}({}) {}", icon, tool, args, duration_str));
+                        }
+                        _ => {}
                     }
                 }
                 "gugugaga/check" => {

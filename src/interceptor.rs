@@ -377,6 +377,7 @@ impl Interceptor {
                             &violation_detector,
                             &config,
                             effective_content,
+                            &output_tx_clone,
                         )
                         .await;
 
@@ -602,6 +603,7 @@ impl Interceptor {
         violation_detector: &ViolationDetector,
         config: &GugugagaConfig,
         current_turn_content: &str,
+        event_tx: &tokio::sync::mpsc::Sender<String>,
     ) -> InterceptAction {
         let method = msg
             .get("method")
@@ -667,8 +669,9 @@ impl Interceptor {
                     ).await;
                 }
                 
-                // Perform LLM evaluation with actual turn content (silently)
-                let eval_result = gugugaga_agent.detect_violation(current_turn_content).await;
+                // Perform LLM evaluation with actual turn content
+                // Pass event_tx so thinking/tool-call activity is streamed to TUI
+                let eval_result = gugugaga_agent.detect_violation(current_turn_content, Some(event_tx)).await;
                 
                 match eval_result {
                     Ok(result) => {
