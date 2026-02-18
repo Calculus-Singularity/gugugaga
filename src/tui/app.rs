@@ -126,6 +126,12 @@ struct PendingApproval {
 }
 
 #[derive(Debug, Clone)]
+struct PendingUserInput {
+    request_id: u64,
+    question_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 enum ApprovalType {
     CommandExecution,
     FileChange,
@@ -193,6 +199,8 @@ pub struct App {
     quit_armed_at: Option<std::time::Instant>,
     /// Pending approval request (waiting for user response)
     pending_approval: Option<PendingApproval>,
+    /// Pending request_user_input prompt from app-server.
+    pending_user_input: Option<PendingUserInput>,
     /// Scroll offset for approval overlay content
     approval_scroll: usize,
     /// Gugugaga notebook reference (for TUI display)
@@ -275,6 +283,7 @@ impl App {
             quit_armed: false,
             quit_armed_at: None,
             pending_approval: None,
+            pending_user_input: None,
             approval_scroll: 0,
             notebook: None,
             notebook_current_activity: None,
@@ -750,6 +759,30 @@ impl App {
             InputAction::Submit(text) => {
                 self.slash_popup.close();
 
+                if let Some(pending) = self.pending_user_input.take() {
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        self.messages.push(Message::system(
+                            "Input required. Enter an answer, or type /cancel to send an empty response.",
+                        ));
+                        self.pending_user_input = Some(pending);
+                        self.scroll_to_bottom();
+                        return;
+                    }
+
+                    if trimmed.eq_ignore_ascii_case("/cancel") || trimmed.eq_ignore_ascii_case("cancel") {
+                        self.respond_to_user_input_request(&pending, None).await;
+                        self.messages
+                            .push(Message::system("Sent empty response for pending user input request."));
+                    } else {
+                        self.respond_to_user_input_request(&pending, Some(trimmed)).await;
+                        self.messages
+                            .push(Message::system("Sent response for pending user input request."));
+                    }
+                    self.scroll_to_bottom();
+                    return;
+                }
+
                 // Parse and handle command
                 if let Some(parsed) = parse_command(&text) {
                     match parsed {
@@ -1131,10 +1164,17 @@ impl App {
 
     /// Directly set gugugaga model by name (//model <name>)
     async fn handle_gugugaga_model_set(&mut self, model: &str) {
-        self.persist_gugugaga_model_selection(model, None).await;
+        let config_path = Self::codex_home_dir().join("config.toml");
+        let effort = Self::read_gugugaga_model_reasoning_effort(&config_path).await;
+        self.persist_gugugaga_model_selection(model, effort.as_deref())
+            .await;
+        let suffix = effort
+            .as_deref()
+            .map(|e| format!(" (reasoning: {e})"))
+            .unwrap_or_default();
         self.messages.push(Message::system(&format!(
-            "Gugugaga model set to: {}\n(Restart gugugaga to apply)",
-            model
+            "Gugugaga model set to: {}{}\n(Restart gugugaga to apply)",
+            model, suffix
         )));
     }
 
@@ -1903,6 +1943,34 @@ Make it comprehensive but concise."#;
         }
     }
 
+    /// Send response for item/tool/requestUserInput
+    async fn respond_to_user_input_request(
+        &mut self,
+        pending: &PendingUserInput,
+        answer: Option<&str>,
+    ) {
+        if let Some(tx) = &self.input_tx {
+            let normalized_answer = answer.map(str::trim).filter(|s| !s.is_empty());
+            let mut answers = serde_json::Map::new();
+            for qid in &pending.question_ids {
+                let answer_value = match normalized_answer {
+                    Some(text) => serde_json::json!({ "answers": [text] }),
+                    None => serde_json::json!({ "answers": [] }),
+                };
+                answers.insert(qid.clone(), answer_value);
+            }
+
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": pending.request_id,
+                "result": {
+                    "answers": serde_json::Value::Object(answers)
+                }
+            });
+            let _ = tx.send(response.to_string()).await;
+        }
+    }
+
     /// Send a direct chat message to Gugugaga via the interceptor
     async fn send_gugugaga_chat(&mut self, message: &str) {
         // Show user's message in chat (with distinct magenta style for Gugugaga)
@@ -2027,14 +2095,7 @@ Make it comprehensive but concise."#;
         model: &str,
         reasoning_effort: Option<&str>,
     ) {
-        let codex_home = std::env::var("CODEX_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".codex")
-            });
-        let config_path = codex_home.join("config.toml");
+        let config_path = Self::codex_home_dir().join("config.toml");
         if let Err(e) = Self::write_gugugaga_model_selection(
             &config_path,
             model,
@@ -2047,41 +2108,58 @@ Make it comprehensive but concise."#;
         }
     }
 
+    fn codex_home_dir() -> std::path::PathBuf {
+        std::env::var("CODEX_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".codex")
+            })
+    }
+
+    async fn read_gugugaga_model_reasoning_effort(
+        config_path: &std::path::Path,
+    ) -> Option<String> {
+        let content = tokio::fs::read_to_string(config_path).await.ok()?;
+        let doc = content.parse::<toml_edit::DocumentMut>().ok()?;
+        doc.get("gugugaga_model_reasoning_effort")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+    }
+
     /// Write gugugaga model selection to config.toml (preserving other fields)
     async fn write_gugugaga_model_selection(
         config_path: &std::path::Path,
         model: &str,
         reasoning_effort: Option<&str>,
     ) -> std::result::Result<(), String> {
-        let mut table: toml::Table = if config_path.exists() {
+        let mut doc = if config_path.exists() {
             let content = tokio::fs::read_to_string(config_path)
                 .await
                 .map_err(|e| format!("read config.toml: {}", e))?;
-            content
-                .parse()
-                .map_err(|e| format!("parse config.toml: {}", e))?
+            if content.trim().is_empty() {
+                toml_edit::DocumentMut::new()
+            } else {
+                content
+                    .parse::<toml_edit::DocumentMut>()
+                    .map_err(|e| format!("parse config.toml: {}", e))?
+            }
         } else {
-            toml::Table::new()
+            toml_edit::DocumentMut::new()
         };
 
-        table.insert(
-            "gugugaga_model".to_string(),
-            toml::Value::String(model.to_string()),
-        );
+        doc["gugugaga_model"] = toml_edit::value(model.to_string());
         match reasoning_effort {
             Some(effort) => {
-                table.insert(
-                    "gugugaga_model_reasoning_effort".to_string(),
-                    toml::Value::String(effort.to_string()),
-                );
+                doc["gugugaga_model_reasoning_effort"] = toml_edit::value(effort.to_string());
             }
             None => {
-                table.remove("gugugaga_model_reasoning_effort");
+                doc.as_table_mut().remove("gugugaga_model_reasoning_effort");
             }
         }
 
-        let output = toml::to_string_pretty(&table)
-            .map_err(|e| format!("serialize config.toml: {}", e))?;
+        let output = doc.to_string();
 
         // Ensure parent dir exists
         if let Some(parent) = config_path.parent() {
@@ -2107,11 +2185,11 @@ Make it comprehensive but concise."#;
         };
 
         for msg in messages {
-            self.handle_output_message(&msg);
+            self.handle_output_message(&msg).await;
         }
     }
 
-    fn handle_output_message(&mut self, msg: &str) {
+    async fn handle_output_message(&mut self, msg: &str) {
         // Debug: show raw message method for troubleshooting
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(msg) {
             if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
@@ -2128,6 +2206,67 @@ Make it comprehensive but concise."#;
             // These are approval requests that need our response
             if let (Some(id), Some(method)) = (json.get("id").and_then(|i| i.as_u64()), json.get("method").and_then(|m| m.as_str())) {
                 match method {
+                    "item/tool/requestUserInput" => {
+                        let params = json.get("params").cloned().unwrap_or_default();
+                        let questions = crate::protocol::extract_user_input_questions(&params)
+                            .unwrap_or_default();
+                        let question_ids: Vec<String> = questions
+                            .iter()
+                            .filter_map(|q| q.get("id").and_then(|v| v.as_str()).map(ToOwned::to_owned))
+                            .collect();
+
+                        if question_ids.is_empty() {
+                            let empty_pending = PendingUserInput {
+                                request_id: id,
+                                question_ids: Vec::new(),
+                            };
+                            self.respond_to_user_input_request(&empty_pending, None).await;
+                            self.messages.push(Message::system(
+                                "Received a tool user-input request without questions; sent empty response.",
+                            ));
+                            self.scroll_to_bottom();
+                            return;
+                        }
+
+                        self.pending_user_input = Some(PendingUserInput {
+                            request_id: id,
+                            question_ids: question_ids.clone(),
+                        });
+
+                        let mut lines = Vec::new();
+                        lines.push("Codex requested user input:".to_string());
+                        for (idx, q) in questions.iter().enumerate() {
+                            let header = q
+                                .get("header")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Question");
+                            let question = q
+                                .get("question")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            lines.push(format!("{}. {}: {}", idx + 1, header, question));
+
+                            if let Some(options) = q.get("options").and_then(|v| v.as_array()) {
+                                let labels: Vec<String> = options
+                                    .iter()
+                                    .filter_map(|opt| {
+                                        opt.get("label")
+                                            .and_then(|v| v.as_str())
+                                            .map(ToOwned::to_owned)
+                                    })
+                                    .collect();
+                                if !labels.is_empty() {
+                                    lines.push(format!("   options: {}", labels.join(" / ")));
+                                }
+                            }
+                        }
+                        lines.push(
+                            "Type your answer and press Enter. It will be used for all questions in this request. Type /cancel to send an empty response.".to_string(),
+                        );
+                        self.messages.push(Message::system(&lines.join("\n")));
+                        self.scroll_to_bottom();
+                        return;
+                    }
                     "item/commandExecution/requestApproval" => {
                         // Command execution approval request
                         let params = json.get("params").cloned().unwrap_or_default();

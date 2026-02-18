@@ -61,6 +61,7 @@ struct AuthCredentials {
 pub struct Evaluator {
     client: Client,
     model: String,
+    reasoning_effort: Option<String>,
     base_url: String,
     wire_api: WireApi,
     codex_home: PathBuf,
@@ -139,7 +140,15 @@ struct ResponsesRequest {
     input: Vec<ResponsesInputItem>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesReasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -230,9 +239,16 @@ struct ConfigToml {
     /// Model Codex uses (shared, used as default for gugugaga)
     model: Option<String>,
 
+    /// Reasoning effort Codex uses.
+    model_reasoning_effort: Option<String>,
+
     /// Gugugaga-specific model override.
     /// If set, gugugaga uses this model instead of Codex's model.
     gugugaga_model: Option<String>,
+
+    /// Gugugaga-specific reasoning effort override.
+    /// If set, gugugaga uses this effort instead of Codex's model_reasoning_effort.
+    gugugaga_model_reasoning_effort: Option<String>,
 
     /// Gugugaga-specific model provider override.
     /// If set, gugugaga uses this provider instead of Codex's model_provider.
@@ -392,16 +408,18 @@ impl Evaluator {
         let auth_mode = creds.mode.clone();
 
         // Load config to get model provider settings
-        let (model, base_url, wire_api) = Self::load_config(codex_home, &auth_mode).await?;
+        let (model, reasoning_effort, base_url, wire_api) =
+            Self::load_config(codex_home, &auth_mode).await?;
 
         info!(
-            "Gugugaga evaluator: mode={:?}, model={}, base_url={}, wire={:?}",
-            auth_mode, model, base_url, wire_api
+            "Gugugaga evaluator: mode={:?}, model={}, effort={:?}, base_url={}, wire={:?}",
+            auth_mode, model, reasoning_effort, base_url, wire_api
         );
 
         Ok(Self {
             client,
             model,
+            reasoning_effort,
             base_url,
             wire_api,
             codex_home: codex_home.to_path_buf(),
@@ -430,7 +448,7 @@ impl Evaluator {
     async fn load_config(
         codex_home: &Path,
         auth_mode: &EvaluatorAuthMode,
-    ) -> Result<(String, String, WireApi)> {
+    ) -> Result<(String, Option<String>, String, WireApi)> {
         let config_file = codex_home.join("config.toml");
 
         // Start with built-in providers
@@ -439,6 +457,7 @@ impl Evaluator {
         // Defaults before config
         let mut model = std::env::var("GUGUGAGA_MODEL")
             .unwrap_or_else(|_| GUGUGAGA_DEFAULT_MODEL.to_string());
+        let mut reasoning_effort: Option<String> = None;
         let mut provider_id = "openai".to_string();
 
         if config_file.exists() {
@@ -456,6 +475,14 @@ impl Evaluator {
                         model = gm;
                     } else if let Some(cm) = config.model {
                         model = cm;
+                    }
+
+                    // Resolve reasoning effort:
+                    // gugugaga_model_reasoning_effort > model_reasoning_effort
+                    if let Some(ge) = config.gugugaga_model_reasoning_effort {
+                        reasoning_effort = Some(ge);
+                    } else if let Some(ce) = config.model_reasoning_effort {
+                        reasoning_effort = Some(ce);
                     }
 
                     // Resolve provider: gugugaga_model_provider > model_provider > "openai"
@@ -499,11 +526,11 @@ impl Evaluator {
         };
 
         info!(
-            "Config resolved: provider='{}', model='{}', base_url='{}', wire={:?}",
-            provider_id, model, base_url, wire_api
+            "Config resolved: provider='{}', model='{}', effort={:?}, base_url='{}', wire={:?}",
+            provider_id, model, reasoning_effort, base_url, wire_api
         );
 
-        Ok((model, base_url, wire_api))
+        Ok((model, reasoning_effort, base_url, wire_api))
     }
 
     /// Default base URL based on auth mode.
@@ -749,6 +776,9 @@ impl Evaluator {
             model: self.model.clone(),
             input,
             stream: true, // Responses API is streaming-only
+            reasoning: self.reasoning_effort.as_ref().map(|effort| ResponsesReasoning {
+                effort: Some(effort.clone()),
+            }),
             instructions: None,
         };
 
@@ -1088,6 +1118,9 @@ impl Evaluator {
             model: self.model.clone(),
             input,
             stream: true,
+            reasoning: self.reasoning_effort.as_ref().map(|effort| ResponsesReasoning {
+                effort: Some(effort.clone()),
+            }),
             instructions: None,
         };
 

@@ -387,6 +387,7 @@ impl Interceptor {
                             &config,
                             effective_content,
                             &output_tx_clone,
+                            &correction_tx,
                         )
                         .await;
 
@@ -656,6 +657,7 @@ impl Interceptor {
         config: &GugugagaConfig,
         current_turn_content: &str,
         event_tx: &tokio::sync::mpsc::Sender<String>,
+        server_tx: &tokio::sync::mpsc::Sender<String>,
     ) -> InterceptAction {
         let method = msg
             .get("method")
@@ -791,17 +793,60 @@ impl Interceptor {
             notifications::REQUEST_USER_INPUT => {
                 if let Some(params) = msg.get("params") {
                     let request_str = serde_json::to_string(params).unwrap_or_default();
+                    let request_id = msg.get("id").and_then(|v| v.as_u64());
+                    let question_ids: Vec<String> = protocol::extract_user_input_questions(params)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|q| q.get("id").and_then(|v| v.as_str()).map(ToOwned::to_owned))
+                        .collect();
 
                     // Evaluate with gugugaga agent
                     match gugugaga_agent.evaluate_request(&request_str).await {
                         Ok(EvaluationResult::AutoReply(reply)) => {
                             info!("Auto-replying to request: {}", reply);
-                            // TODO: Send auto-reply back to app-server
-                            // For now, forward to user with a hint
+                            // Conservative policy: only auto-answer when there is exactly
+                            // one question and we have a non-empty answer.
+                            let reply = reply.trim();
+                            if let (Some(req_id), [qid]) = (request_id, question_ids.as_slice()) {
+                                if !reply.is_empty() {
+                                    let response = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req_id,
+                                        "result": {
+                                            "answers": {
+                                                qid.clone(): {
+                                                    "answers": [reply]
+                                                }
+                                            }
+                                        }
+                                    })
+                                    .to_string();
+
+                                    if server_tx.send(response).await.is_ok() {
+                                        let notify = serde_json::json!({
+                                            "method": "gugugaga/auto_reply",
+                                            "params": {
+                                                "message": reply
+                                            }
+                                        })
+                                        .to_string();
+                                        return InterceptAction::Replace(notify);
+                                    }
+                                }
+                            }
                             InterceptAction::Forward
                         }
                         Ok(EvaluationResult::Correct(correction)) => {
-                            InterceptAction::Interrupt(correction)
+                            // Show correction context, but keep the original request so
+                            // the user can still provide an explicit answer.
+                            InterceptAction::InjectBefore(vec![
+                                serde_json::json!({
+                                    "method": "gugugaga/correction",
+                                    "params": {
+                                        "message": correction
+                                    }
+                                }).to_string()
+                            ])
                         }
                         Ok(EvaluationResult::ForwardToUser) => InterceptAction::Forward,
                         Err(e) => {
