@@ -11,16 +11,19 @@ use crate::{GugugagaError, Result};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Retry config aligned with Codex: codex-rs/core/src/model_provider_info.rs
 const MAX_RETRY_ATTEMPTS: u32 = 4;
 const RETRY_BASE_DELAY_MS: u64 = 200;
 /// Request timeout (Codex uses reqwest defaults ~30s, we set explicitly)
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Responses API requires an instructions field; use a neutral fallback.
+const DEFAULT_RESPONSES_INSTRUCTIONS: &str = "Follow the user's request exactly.";
 
 // ─── Auth mode ───────────────────────────────────────────────────────
 
@@ -63,6 +66,7 @@ pub struct Evaluator {
     model: String,
     reasoning_effort: Option<String>,
     base_url: String,
+    provider_headers: Vec<(String, String)>,
     wire_api: WireApi,
     codex_home: PathBuf,
 }
@@ -137,12 +141,16 @@ struct StreamDelta {
 #[derive(Debug, Serialize)]
 struct ResponsesRequest {
     model: String,
+    instructions: String,
     input: Vec<ResponsesInputItem>,
+    tools: Vec<serde_json::Value>,
+    tool_choice: &'static str,
+    parallel_tool_calls: bool,
+    store: bool,
     stream: bool,
+    include: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ResponsesReasoning>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -255,7 +263,7 @@ struct ConfigToml {
     gugugaga_model_provider: Option<String>,
 
     /// Custom model providers (shared with Codex)
-    model_providers: Option<std::collections::HashMap<String, ModelProviderConfig>>,
+    model_providers: Option<HashMap<String, ModelProviderConfig>>,
 }
 
 /// Model provider configuration — mirrors Codex's ModelProviderInfo (simplified).
@@ -273,6 +281,12 @@ struct ModelProviderConfig {
 
     /// Environment variable for API key
     env_key: Option<String>,
+
+    /// Additional static HTTP headers
+    http_headers: Option<HashMap<String, String>>,
+
+    /// Additional HTTP headers sourced from environment variables
+    env_http_headers: Option<HashMap<String, String>>,
 }
 
 /// Default Gugugaga model — same as Codex's default
@@ -281,8 +295,8 @@ const GUGUGAGA_DEFAULT_MODEL: &str = "gpt-5.2-codex";
 // ─── Built-in model providers (aligned with Codex) ──────────────────
 
 /// Returns built-in model providers, mirroring Codex's model_provider_info.rs.
-fn built_in_model_providers() -> std::collections::HashMap<String, ModelProviderConfig> {
-    let mut map = std::collections::HashMap::new();
+fn built_in_model_providers() -> HashMap<String, ModelProviderConfig> {
+    let mut map = HashMap::new();
 
     // OpenAI — default provider
     map.insert(
@@ -295,6 +309,17 @@ fn built_in_model_providers() -> std::collections::HashMap<String, ModelProvider
             ),
             wire_api: Some("responses".to_string()),
             env_key: Some("OPENAI_API_KEY".to_string()),
+            http_headers: Some(HashMap::from([(
+                "version".to_string(),
+                env!("CARGO_PKG_VERSION").to_string(),
+            )])),
+            env_http_headers: Some(HashMap::from([
+                (
+                    "OpenAI-Organization".to_string(),
+                    "OPENAI_ORGANIZATION".to_string(),
+                ),
+                ("OpenAI-Project".to_string(), "OPENAI_PROJECT".to_string()),
+            ])),
         },
     );
 
@@ -312,6 +337,8 @@ fn built_in_model_providers() -> std::collections::HashMap<String, ModelProvider
             ),
             wire_api: Some("responses".to_string()),
             env_key: None,
+            http_headers: None,
+            env_http_headers: None,
         },
     );
 
@@ -329,6 +356,8 @@ fn built_in_model_providers() -> std::collections::HashMap<String, ModelProvider
             ),
             wire_api: Some("chat".to_string()),
             env_key: None,
+            http_headers: None,
+            env_http_headers: None,
         },
     );
 
@@ -340,6 +369,8 @@ fn built_in_model_providers() -> std::collections::HashMap<String, ModelProvider
             base_url: Some("http://localhost:1234/v1".to_string()),
             wire_api: Some("chat".to_string()),
             env_key: None,
+            http_headers: None,
+            env_http_headers: None,
         },
     );
 
@@ -408,12 +439,17 @@ impl Evaluator {
         let auth_mode = creds.mode.clone();
 
         // Load config to get model provider settings
-        let (model, reasoning_effort, base_url, wire_api) =
+        let (model, reasoning_effort, base_url, provider_headers, wire_api) =
             Self::load_config(codex_home, &auth_mode).await?;
 
         info!(
-            "Gugugaga evaluator: mode={:?}, model={}, effort={:?}, base_url={}, wire={:?}",
-            auth_mode, model, reasoning_effort, base_url, wire_api
+            "Gugugaga evaluator: mode={:?}, model={}, effort={:?}, base_url={}, headers={}, wire={:?}",
+            auth_mode,
+            model,
+            reasoning_effort,
+            base_url,
+            provider_headers.len(),
+            wire_api
         );
 
         Ok(Self {
@@ -421,6 +457,7 @@ impl Evaluator {
             model,
             reasoning_effort,
             base_url,
+            provider_headers,
             wire_api,
             codex_home: codex_home.to_path_buf(),
         })
@@ -448,7 +485,7 @@ impl Evaluator {
     async fn load_config(
         codex_home: &Path,
         auth_mode: &EvaluatorAuthMode,
-    ) -> Result<(String, Option<String>, String, WireApi)> {
+    ) -> Result<(String, Option<String>, String, Vec<(String, String)>, WireApi)> {
         let config_file = codex_home.join("config.toml");
 
         // Start with built-in providers
@@ -496,11 +533,22 @@ impl Evaluator {
         }
 
         // Look up the resolved provider
-        let (base_url, wire_api) = if let Some(provider) = providers.get(&provider_id) {
+        let (base_url, provider_headers, wire_api) =
+            if let Some(provider) = providers.get(&provider_id) {
             let base_url = provider
                 .base_url
                 .clone()
                 .unwrap_or_else(|| Self::default_base_url(auth_mode));
+            let mut provider_headers = Self::resolve_provider_headers(provider);
+            if provider_id == "openai" {
+                if let Some(codex_version) = Self::resolve_codex_cli_version(codex_home).await {
+                    Self::upsert_header(&mut provider_headers, "version", &codex_version);
+                } else {
+                    // Avoid sending gugugaga's own crate version (e.g. 0.1.0),
+                    // which can fail model min-version checks on ChatGPT backend.
+                    provider_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("version"));
+                }
+            }
 
             let wire = match provider.wire_api.as_deref() {
                 Some("chat") => WireApi::Chat,
@@ -512,25 +560,83 @@ impl Evaluator {
             if provider_id == "openai" && *auth_mode == EvaluatorAuthMode::ChatgptOAuth {
                 (
                     "https://chatgpt.com/backend-api/codex".to_string(),
+                    provider_headers,
                     WireApi::Responses,
                 )
             } else {
-                (base_url, wire)
+                (base_url, provider_headers, wire)
             }
         } else {
             warn!(
                 "Model provider '{}' not found, falling back to defaults",
                 provider_id
             );
-            (Self::default_base_url(auth_mode), Self::default_wire_api(auth_mode))
+            (
+                Self::default_base_url(auth_mode),
+                Vec::new(),
+                Self::default_wire_api(auth_mode),
+            )
         };
 
         info!(
-            "Config resolved: provider='{}', model='{}', effort={:?}, base_url='{}', wire={:?}",
-            provider_id, model, reasoning_effort, base_url, wire_api
+            "Config resolved: provider='{}', model='{}', effort={:?}, base_url='{}', headers={}, wire={:?}",
+            provider_id,
+            model,
+            reasoning_effort,
+            base_url,
+            provider_headers.len(),
+            wire_api
         );
 
-        Ok((model, reasoning_effort, base_url, wire_api))
+        Ok((model, reasoning_effort, base_url, provider_headers, wire_api))
+    }
+
+    fn resolve_provider_headers(provider: &ModelProviderConfig) -> Vec<(String, String)> {
+        let mut headers = Vec::new();
+
+        if let Some(static_headers) = &provider.http_headers {
+            for (name, value) in static_headers {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    headers.push((name.clone(), trimmed.to_string()));
+                }
+            }
+        }
+
+        if let Some(env_headers) = &provider.env_http_headers {
+            for (name, env_var) in env_headers {
+                if let Ok(value) = std::env::var(env_var) {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() {
+                        headers.push((name.clone(), trimmed.to_string()));
+                    }
+                }
+            }
+        }
+
+        headers
+    }
+
+    async fn resolve_codex_cli_version(codex_home: &Path) -> Option<String> {
+        let version_file = codex_home.join("version.json");
+        let content = tokio::fs::read_to_string(version_file).await.ok()?;
+        let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+        let version = value.get("latest_version")?.as_str()?.trim();
+        if version.is_empty() {
+            return None;
+        }
+        Some(version.to_string())
+    }
+
+    fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+        if let Some((_, existing_value)) = headers
+            .iter_mut()
+            .find(|(existing_name, _)| existing_name.eq_ignore_ascii_case(name))
+        {
+            *existing_value = value.to_string();
+            return;
+        }
+        headers.push((name.to_string(), value.to_string()));
     }
 
     /// Default base URL based on auth mode.
@@ -719,6 +825,9 @@ impl Evaluator {
             .post(&url)
             .header("Content-Type", "application/json");
 
+        for (name, value) in &self.provider_headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
         for (name, value) in &headers {
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
@@ -729,7 +838,7 @@ impl Evaluator {
             .await
             .map_err(Self::map_reqwest_error)?;
 
-        Self::check_response_status(&response)?;
+        let response = Self::check_response_status(response).await?;
 
         let chat_response: ChatResponse = response
             .json()
@@ -752,34 +861,34 @@ impl Evaluator {
     ) -> Result<String> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
 
-        let mut input = Vec::new();
-        if let Some(sys) = system_prompt {
-            input.push(ResponsesInputItem {
-                item_type: "message".to_string(),
-                role: "developer".to_string(),
-                content: vec![ResponsesContentItem {
-                    content_type: "input_text".to_string(),
-                    text: sys.to_string(),
-                }],
-            });
-        }
-        input.push(ResponsesInputItem {
+        let instructions = system_prompt
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_RESPONSES_INSTRUCTIONS)
+            .to_string();
+
+        let input = vec![ResponsesInputItem {
             item_type: "message".to_string(),
             role: "user".to_string(),
             content: vec![ResponsesContentItem {
                 content_type: "input_text".to_string(),
                 text: user_prompt.to_string(),
             }],
-        });
+        }];
 
         let request = ResponsesRequest {
             model: self.model.clone(),
+            instructions,
             input,
+            tools: Vec::new(),
+            tool_choice: "auto",
+            parallel_tool_calls: false,
+            store: false,
             stream: true, // Responses API is streaming-only
+            include: Vec::new(),
             reasoning: self.reasoning_effort.as_ref().map(|effort| ResponsesReasoning {
                 effort: Some(effort.clone()),
             }),
-            instructions: None,
         };
 
         let headers = self.fresh_auth_headers().await?;
@@ -789,6 +898,9 @@ impl Evaluator {
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
 
+        for (name, value) in &self.provider_headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
         for (name, value) in &headers {
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
@@ -799,7 +911,7 @@ impl Evaluator {
             .await
             .map_err(Self::map_reqwest_error)?;
 
-        Self::check_response_status(&response)?;
+        let response = Self::check_response_status(response).await?;
 
         Self::collect_responses_stream(response).await
     }
@@ -860,17 +972,70 @@ impl Evaluator {
         Ok(result_text)
     }
 
-    fn check_response_status(response: &reqwest::Response) -> Result<()> {
-        if response.status().is_success() {
-            return Ok(());
-        }
+    async fn check_response_status(response: reqwest::Response) -> Result<reqwest::Response> {
         let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let body = response.text().await.unwrap_or_default();
+        let detail = Self::extract_error_detail(&body);
+        let detail = Self::truncate_error_detail(&detail, 500);
         if Self::is_retryable_status(status) {
+            if !detail.is_empty() {
+                return Err(GugugagaError::LlmEvaluation(format!(
+                    "retryable API error {status}: {detail}"
+                )));
+            }
             return Err(GugugagaError::LlmEvaluation(format!(
                 "retryable API error {status}"
             )));
         }
+        if !detail.is_empty() {
+            return Err(GugugagaError::LlmEvaluation(format!(
+                "API error {status}: {detail}"
+            )));
+        }
         Err(GugugagaError::LlmEvaluation(format!("API error {status}")))
+    }
+
+    fn extract_error_detail(body: &str) -> String {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(msg) = value
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                return msg.to_string();
+            }
+            if let Some(msg) = value.get("message").and_then(|m| m.as_str()) {
+                return msg.to_string();
+            }
+            if let Some(msg) = value
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                return msg.to_string();
+            }
+        }
+
+        trimmed.to_string()
+    }
+
+    fn truncate_error_detail(detail: &str, max_chars: usize) -> String {
+        if detail.chars().count() <= max_chars {
+            return detail.to_string();
+        }
+
+        let mut truncated = detail.chars().take(max_chars).collect::<String>();
+        truncated.push_str("... [truncated]");
+        truncated
     }
 
     fn map_reqwest_error(e: reqwest::Error) -> GugugagaError {
@@ -1005,6 +1170,9 @@ impl Evaluator {
             .post(&url)
             .header("Content-Type", "application/json");
 
+        for (name, value) in &self.provider_headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
         for (name, value) in &headers {
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
@@ -1015,15 +1183,7 @@ impl Evaluator {
             .await
             .map_err(|e| GugugagaError::LlmEvaluation(e.to_string()))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            error!("LLM API error: {} - {}", status, text);
-            return Err(GugugagaError::LlmEvaluation(format!(
-                "API error {}: {}",
-                status, text
-            )));
-        }
+        let response = Self::check_response_status(response).await?;
 
         let mut stream = response.bytes_stream();
         tokio::spawn(async move {
@@ -1095,33 +1255,34 @@ impl Evaluator {
 
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
 
-        let input = vec![
-            ResponsesInputItem {
-                item_type: "message".to_string(),
-                role: "developer".to_string(),
-                content: vec![ResponsesContentItem {
-                    content_type: "input_text".to_string(),
-                    text: system_prompt.to_string(),
-                }],
-            },
-            ResponsesInputItem {
-                item_type: "message".to_string(),
-                role: "user".to_string(),
-                content: vec![ResponsesContentItem {
-                    content_type: "input_text".to_string(),
-                    text: user_prompt.to_string(),
-                }],
-            },
-        ];
+        let instructions = if system_prompt.trim().is_empty() {
+            DEFAULT_RESPONSES_INSTRUCTIONS.to_string()
+        } else {
+            system_prompt.to_string()
+        };
+
+        let input = vec![ResponsesInputItem {
+            item_type: "message".to_string(),
+            role: "user".to_string(),
+            content: vec![ResponsesContentItem {
+                content_type: "input_text".to_string(),
+                text: user_prompt.to_string(),
+            }],
+        }];
 
         let request = ResponsesRequest {
             model: self.model.clone(),
+            instructions,
             input,
+            tools: Vec::new(),
+            tool_choice: "auto",
+            parallel_tool_calls: false,
+            store: false,
             stream: true,
+            include: Vec::new(),
             reasoning: self.reasoning_effort.as_ref().map(|effort| ResponsesReasoning {
                 effort: Some(effort.clone()),
             }),
-            instructions: None,
         };
 
         let headers = self.fresh_auth_headers().await?;
@@ -1131,6 +1292,9 @@ impl Evaluator {
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
 
+        for (name, value) in &self.provider_headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
         for (name, value) in &headers {
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
@@ -1141,15 +1305,7 @@ impl Evaluator {
             .await
             .map_err(|e| GugugagaError::LlmEvaluation(e.to_string()))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            error!("LLM API error: {} - {}", status, text);
-            return Err(GugugagaError::LlmEvaluation(format!(
-                "API error {}: {}",
-                status, text
-            )));
-        }
+        let response = Self::check_response_status(response).await?;
 
         let mut stream = response.bytes_stream();
         tokio::spawn(async move {
