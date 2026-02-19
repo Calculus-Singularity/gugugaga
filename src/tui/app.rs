@@ -87,6 +87,93 @@ const MIN_ANIMATION_WIDTH: u16 = 44;
 const MIN_ANIMATION_HEIGHT: u16 = 20;
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
     ["model-with-reasoning", "context-remaining", "current-dir"];
+const STATUS_LINE_AVAILABLE_ITEMS: [(&str, &str, &str, &str); 15] = [
+    (
+        "model-name",
+        "Model Name",
+        "Current model name",
+        "gpt-5.2-codex",
+    ),
+    (
+        "model-with-reasoning",
+        "Model + Reasoning",
+        "Current model with reasoning level",
+        "gpt-5.2-codex medium",
+    ),
+    (
+        "current-dir",
+        "Current Dir",
+        "Current working directory",
+        "~/project/path",
+    ),
+    (
+        "project-root",
+        "Project Root",
+        "Project root directory (when available)",
+        "~/project",
+    ),
+    (
+        "git-branch",
+        "Git Branch",
+        "Current git branch (when available)",
+        "feat/alignment",
+    ),
+    (
+        "context-remaining",
+        "Context Remaining",
+        "Remaining context percent (when known)",
+        "18% left",
+    ),
+    (
+        "context-used",
+        "Context Used",
+        "Used context percent (when known)",
+        "82% used",
+    ),
+    (
+        "five-hour-limit",
+        "5h Limit",
+        "5-hour rate limit remaining (when available)",
+        "5h 100%",
+    ),
+    (
+        "weekly-limit",
+        "Weekly Limit",
+        "Weekly rate limit remaining (when available)",
+        "weekly 98%",
+    ),
+    ("codex-version", "Codex Version", "Codex version", "v0.93.0"),
+    (
+        "context-window-size",
+        "Context Window Size",
+        "Model context window size",
+        "258K window",
+    ),
+    (
+        "used-tokens",
+        "Used Tokens",
+        "Total tokens used in session",
+        "27.3K used",
+    ),
+    (
+        "total-input-tokens",
+        "Total Input Tokens",
+        "Total input tokens",
+        "17,588 in",
+    ),
+    (
+        "total-output-tokens",
+        "Total Output Tokens",
+        "Total output tokens",
+        "265 out",
+    ),
+    (
+        "session-id",
+        "Session ID",
+        "Current session identifier",
+        "019c19bd-ceb6-73b0-adc8-8ec0397b85cf",
+    ),
+];
 
 /// Current picker mode
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +215,7 @@ enum PendingRequestType {
     ConfigRead,
     DebugConfigRead,
     StatusRead,
+    StatuslineConfigRead,
     FeedbackUpload,
     NewThread,
     ForkThread,
@@ -195,6 +283,31 @@ struct ActiveTerminal {
     recent_output: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RateLimitWindowSnapshot {
+    used_percent: f64,
+    window_duration_mins: Option<i64>,
+    resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RateLimitSnapshotCache {
+    limit_id: Option<String>,
+    limit_name: Option<String>,
+    plan_type: Option<String>,
+    primary: Option<RateLimitWindowSnapshot>,
+    secondary: Option<RateLimitWindowSnapshot>,
+    credits_has_credits: Option<bool>,
+    credits_unlimited: Option<bool>,
+    credits_balance: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StatuslineEditorState {
+    enabled_items: Vec<String>,
+    selected_item: Option<String>,
+}
+
 /// Application state
 pub struct App {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -258,8 +371,12 @@ pub struct App {
     pending_session_restore: Option<Vec<serde_json::Value>>,
     /// Latest token usage snapshot from thread/tokenUsage/updated.
     token_usage_snapshot: Option<TokenUsageSnapshot>,
+    /// Latest account rate limits snapshot from account/rateLimits/updated.
+    rate_limit_snapshot: Option<RateLimitSnapshotCache>,
     /// Active command execution terminals keyed by item_id.
     active_terminals: HashMap<String, ActiveTerminal>,
+    /// In-progress state for /statusline editor UI.
+    statusline_editor: Option<StatuslineEditorState>,
     /// When the current turn started processing (for elapsed time display)
     turn_start_time: Option<std::time::Instant>,
     /// Current application phase (Welcome animation → Chat).
@@ -343,7 +460,9 @@ impl App {
             gugugaga_status: None,
             pending_session_restore: None,
             token_usage_snapshot: None,
+            rate_limit_snapshot: None,
             active_terminals: HashMap::new(),
+            statusline_editor: None,
             turn_start_time: None,
             // Skip the Welcome animation if trust is already established
             phase: if trust_ctx.is_some() {
@@ -748,6 +867,9 @@ impl App {
                 }
                 crossterm::event::KeyCode::Esc => {
                     self.picker.close();
+                    if matches!(self.picker_mode, PickerMode::Statusline) {
+                        self.statusline_editor = None;
+                    }
                     self.picker_mode = PickerMode::None;
                     return;
                 }
@@ -860,7 +982,15 @@ impl App {
                 if let Some(parsed) = parse_command(&text) {
                     match parsed {
                         ParsedCommand::Codex(cmd, args) => {
-                            // Forward to Codex
+                            if self.is_processing && !Self::codex_command_available_during_task(cmd)
+                            {
+                                self.messages.push(Message::system(&format!(
+                                    "`/{}` is unavailable while a task is running.",
+                                    cmd.name()
+                                )));
+                                self.scroll_to_bottom();
+                                return;
+                            }
                             self.forward_codex_command(cmd, args).await;
                         }
                         ParsedCommand::Gugugaga(cmd, args) => {
@@ -1013,6 +1143,75 @@ impl App {
         }
     }
 
+    fn codex_command_available_during_task(cmd: CodexCommand) -> bool {
+        matches!(
+            cmd,
+            CodexCommand::Diff
+                | CodexCommand::Rename
+                | CodexCommand::Mention
+                | CodexCommand::Skills
+                | CodexCommand::Status
+                | CodexCommand::DebugConfig
+                | CodexCommand::Ps
+                | CodexCommand::Clean
+                | CodexCommand::Mcp
+                | CodexCommand::Apps
+                | CodexCommand::Feedback
+                | CodexCommand::Quit
+                | CodexCommand::Exit
+                | CodexCommand::Rollout
+                | CodexCommand::Collab
+                | CodexCommand::Agent
+        )
+    }
+
+    fn statusline_item_is_known(item_id: &str) -> bool {
+        STATUS_LINE_AVAILABLE_ITEMS
+            .iter()
+            .any(|(id, _, _, _)| *id == item_id)
+    }
+
+    fn default_statusline_items() -> Vec<String> {
+        DEFAULT_STATUS_LINE_ITEMS
+            .iter()
+            .map(|item| (*item).to_string())
+            .collect()
+    }
+
+    fn normalize_statusline_item_id(item_id: &str) -> Option<String> {
+        let normalized = match item_id {
+            "5h-limit" => "five-hour-limit",
+            other => other,
+        };
+        Self::statusline_item_is_known(normalized).then(|| normalized.to_string())
+    }
+
+    fn parse_statusline_items_from_config(config_result: &serde_json::Value) -> Vec<String> {
+        let config = config_result.get("config").unwrap_or(config_result);
+        let raw = config
+            .get("tui_status_line")
+            .or_else(|| config.pointer("/tui/status_line"))
+            .or_else(|| config.get("tui").and_then(|tui| tui.get("status_line")));
+
+        let mut dedup = Vec::<String>::new();
+        if let Some(items) = raw.and_then(|value| value.as_array()) {
+            for value in items {
+                if let Some(item) = value.as_str() {
+                    if let Some(normalized) = Self::normalize_statusline_item_id(item) {
+                        if !dedup.iter().any(|existing| existing == &normalized) {
+                            dedup.push(normalized);
+                        }
+                    }
+                }
+            }
+        }
+        if dedup.is_empty() {
+            Self::default_statusline_items()
+        } else {
+            dedup
+        }
+    }
+
     async fn forward_codex_command(&mut self, cmd: CodexCommand, args: String) {
         match cmd {
             // === Local commands (handled in TUI) ===
@@ -1117,9 +1316,20 @@ impl App {
                 self.input.cursor += 1;
             }
             CodexCommand::SandboxReadRoot => {
-                self.messages.push(Message::system(
-                    "Usage: /sandbox-add-read-dir <absolute-directory-path>",
-                ));
+                let trimmed = args.trim();
+                if trimmed.is_empty() {
+                    self.messages.push(Message::system(
+                        "Usage: /sandbox-add-read-dir <absolute-directory-path>",
+                    ));
+                } else if cfg!(target_os = "windows") {
+                    self.messages.push(Message::system(
+                        "/sandbox-add-read-dir is not yet implemented in this TUI. Use Codex CLI on Windows for now.",
+                    ));
+                } else {
+                    self.messages.push(Message::system(
+                        "/sandbox-add-read-dir is only available on Windows.",
+                    ));
+                }
             }
             CodexCommand::ElevateSandbox => {
                 self.messages.push(Message::system(
@@ -1203,41 +1413,51 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("-");
 
+        let permissions = if approval == "on-request" && sandbox == "workspace-write" {
+            "Default".to_string()
+        } else if approval == "never" && sandbox == "danger-full-access" {
+            "Full Access".to_string()
+        } else {
+            format!("Custom ({}, {})", sandbox, approval)
+        };
+
         let mut lines = vec![
-            "Session status:".to_string(),
-            format!("  thread: {}", self.thread_id.as_deref().unwrap_or("none")),
+            "Status:".to_string(),
             format!(
-                "  model: {} (provider: {}, reasoning: {})",
-                model, provider, reasoning
+                "  Model: {} (reasoning {}, provider {})",
+                model, reasoning, provider
             ),
-            format!("  approvals: {}", approval),
-            format!("  sandbox: {}", sandbox),
-            format!("  collaboration: {}", collab),
-            format!("  violations: {}", self.violations_detected),
-            format!("  corrections: {}", self.corrections_made),
-            format!("  auto_replies: {}", self.auto_replies),
+            format!("  Directory: {}", self.cwd),
+            format!("  Permissions: {}", permissions),
+            format!("  Collaboration: {}", collab),
+            format!(
+                "  Session ID: {}",
+                self.thread_id.as_deref().unwrap_or("none")
+            ),
         ];
 
         if let Some(usage) = &self.token_usage_snapshot {
+            let non_cached_input = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
             lines.push("  token usage (total):".to_string());
-            lines.push(format!("    total: {}", usage.total_tokens));
             lines.push(format!(
-                "    input: {} (cached: {})",
-                usage.input_tokens, usage.cached_input_tokens
+                "    {} total ({} input + {} output)",
+                usage.total_tokens, non_cached_input, usage.output_tokens
             ));
+            lines.push(format!("    cached input: {}", usage.cached_input_tokens));
             lines.push(format!(
-                "    output: {} (reasoning: {})",
-                usage.output_tokens, usage.reasoning_output_tokens
+                "    reasoning output: {}",
+                usage.reasoning_output_tokens
             ));
             if let Some(window) = usage.model_context_window {
-                let used_pct = if window > 0 {
-                    ((usage.total_tokens as f64 / window as f64) * 100.0).clamp(0.0, 100.0)
+                let remaining_pct = if window > 0 {
+                    (100.0 - ((usage.total_tokens as f64 / window as f64) * 100.0))
+                        .clamp(0.0, 100.0)
                 } else {
-                    0.0
+                    100.0
                 };
                 lines.push(format!(
-                    "    context window: {} ({:.1}% used)",
-                    window, used_pct
+                    "    context window: {:.1}% left ({} / {})",
+                    remaining_pct, usage.total_tokens, window
                 ));
             }
             if let Some(turn_id) = &usage.turn_id {
@@ -1247,10 +1467,162 @@ impl App {
             lines.push("  token usage: unavailable (no turn usage update yet)".to_string());
         }
 
+        if let Some(snapshot) = &self.rate_limit_snapshot {
+            if let Some(limit_name) = &snapshot.limit_name {
+                lines.push(format!("  limits profile: {}", limit_name));
+            } else if let Some(limit_id) = &snapshot.limit_id {
+                lines.push(format!("  limits profile: {}", limit_id));
+            }
+            let primary_label = snapshot
+                .primary
+                .as_ref()
+                .and_then(|window| window.window_duration_mins)
+                .map(Self::format_limit_duration_label)
+                .unwrap_or_else(|| "5h".to_string());
+            if let Some(window) = &snapshot.primary {
+                lines.push(format!(
+                    "  {} limit: {}",
+                    primary_label,
+                    Self::format_limit_window_summary(window)
+                ));
+            }
+            if let Some(window) = &snapshot.secondary {
+                lines.push(format!(
+                    "  weekly limit: {}",
+                    Self::format_limit_window_summary(window)
+                ));
+            }
+
+            if snapshot.credits_has_credits == Some(true) {
+                if snapshot.credits_unlimited == Some(true) {
+                    lines.push("  credits: unlimited".to_string());
+                } else if let Some(balance) = &snapshot.credits_balance {
+                    lines.push(format!("  credits: {}", balance));
+                }
+            }
+
+            if let Some(plan_type) = &snapshot.plan_type {
+                lines.push(format!("  plan: {}", plan_type));
+            }
+        }
+
+        lines.push(format!("  violations: {}", self.violations_detected));
+        lines.push(format!("  corrections: {}", self.corrections_made));
+        lines.push(format!("  auto_replies: {}", self.auto_replies));
+
         lines.join("\n")
     }
 
+    fn format_limit_duration_label(window_mins: i64) -> String {
+        if window_mins % (60 * 24 * 7) == 0 {
+            "weekly".to_string()
+        } else if window_mins % 60 == 0 {
+            format!("{}h", window_mins / 60)
+        } else {
+            format!("{}m", window_mins)
+        }
+    }
+
+    fn format_limit_window_summary(window: &RateLimitWindowSnapshot) -> String {
+        let remaining = (100.0 - window.used_percent).clamp(0.0, 100.0);
+        let mut summary = format!("{remaining:.0}% left");
+        if let Some(resets_at) = window.resets_at {
+            summary.push_str(&Self::format_reset_delta(resets_at));
+        }
+        summary
+    }
+
+    fn format_reset_delta(raw_ts: i64) -> String {
+        let timestamp = if raw_ts > 10_000_000_000 {
+            raw_ts / 1000
+        } else {
+            raw_ts
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(timestamp);
+        if timestamp <= now_secs {
+            return " (resetting now)".to_string();
+        }
+        let delta = timestamp - now_secs;
+        if delta < 3600 {
+            format!(" (resets in {}m)", (delta + 59) / 60)
+        } else if delta < 86_400 {
+            format!(" (resets in {}h)", (delta + 3599) / 3600)
+        } else {
+            format!(" (resets in {}d)", (delta + 86_399) / 86_400)
+        }
+    }
+
+    fn parse_rate_limit_window(value: &serde_json::Value) -> Option<RateLimitWindowSnapshot> {
+        if !value.is_object() {
+            return None;
+        }
+        Some(RateLimitWindowSnapshot {
+            used_percent: value
+                .get("usedPercent")
+                .or_else(|| value.get("used_percent"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            window_duration_mins: value
+                .get("windowDurationMins")
+                .or_else(|| value.get("window_duration_mins"))
+                .and_then(|v| v.as_i64()),
+            resets_at: value
+                .get("resetsAt")
+                .or_else(|| value.get("resets_at"))
+                .and_then(|v| v.as_i64()),
+        })
+    }
+
+    fn parse_rate_limit_snapshot(value: &serde_json::Value) -> Option<RateLimitSnapshotCache> {
+        if !value.is_object() {
+            return None;
+        }
+        let credits = value.get("credits");
+        Some(RateLimitSnapshotCache {
+            limit_id: value
+                .get("limitId")
+                .or_else(|| value.get("limit_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            limit_name: value
+                .get("limitName")
+                .or_else(|| value.get("limit_name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            plan_type: value
+                .get("planType")
+                .or_else(|| value.get("plan_type"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            primary: value.get("primary").and_then(Self::parse_rate_limit_window),
+            secondary: value
+                .get("secondary")
+                .and_then(Self::parse_rate_limit_window),
+            credits_has_credits: credits
+                .and_then(|v| v.get("hasCredits").or_else(|| v.get("has_credits")))
+                .and_then(|v| v.as_bool()),
+            credits_unlimited: credits
+                .and_then(|v| v.get("unlimited"))
+                .and_then(|v| v.as_bool()),
+            credits_balance: credits
+                .and_then(|v| v.get("balance"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        })
+    }
+
     async fn run_git_capture(&self, args: &[&str]) -> Result<String, String> {
+        self.run_git_capture_allowing_diff_exit(args, false).await
+    }
+
+    async fn run_git_capture_allowing_diff_exit(
+        &self,
+        args: &[&str],
+        allow_diff_exit_code: bool,
+    ) -> Result<String, String> {
         let output = tokio::process::Command::new("git")
             .args(args)
             .current_dir(&self.cwd)
@@ -1258,14 +1630,15 @@ impl App {
             .await
             .map_err(|e| e.to_string())?;
 
-        if output.status.success() {
+        let is_diff_exit = output.status.code() == Some(1);
+        if output.status.success() || (allow_diff_exit_code && is_diff_exit) {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
             Err(String::from_utf8_lossy(&output.stderr).to_string())
         }
     }
 
-    /// Show git diff (full patch with staged/unstaged and untracked files list).
+    /// Show git diff, including untracked file patches.
     async fn show_git_diff(&mut self) {
         match self
             .run_git_capture(&["rev-parse", "--is-inside-work-tree"])
@@ -1279,41 +1652,42 @@ impl App {
             }
         }
 
-        let unstaged = self
+        let tracked = self
             .run_git_capture(&["--no-pager", "diff", "--no-ext-diff"])
             .await
             .unwrap_or_default();
-        let staged = self
-            .run_git_capture(&["--no-pager", "diff", "--cached", "--no-ext-diff"])
-            .await
-            .unwrap_or_default();
-        let untracked = self
+        let untracked_files = self
             .run_git_capture(&["ls-files", "--others", "--exclude-standard"])
             .await
             .unwrap_or_default();
 
-        let mut sections = Vec::new();
-        if !unstaged.trim().is_empty() {
-            sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
-        }
-        if !staged.trim().is_empty() {
-            sections.push(format!("Staged changes:\n{}", staged.trim_end()));
-        }
-        if !untracked.trim().is_empty() {
-            let files = untracked
-                .lines()
-                .map(|line| format!("  - {}", line))
-                .collect::<Vec<_>>()
-                .join("\n");
-            sections.push(format!("Untracked files:\n{}", files));
+        let mut untracked_patches = String::new();
+        let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        for file in untracked_files
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let args = [
+                "--no-pager",
+                "diff",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                null_path,
+                file,
+            ];
+            if let Ok(patch) = self.run_git_capture_allowing_diff_exit(&args, true).await {
+                untracked_patches.push_str(&patch);
+            }
         }
 
-        if sections.is_empty() {
+        let mut body = format!("{}{}", tracked, untracked_patches);
+        if body.trim().is_empty() {
             self.messages.push(Message::system("Working tree clean."));
             return;
         }
 
-        let mut body = sections.join("\n\n");
         const MAX_DIFF_CHARS: usize = 24_000;
         if body.len() > MAX_DIFF_CHARS {
             body = format!(
@@ -1326,42 +1700,52 @@ impl App {
 
     /// Show currently active command execution terminals.
     fn show_background_processes(&mut self) {
+        let mut lines = vec!["Background terminals".to_string(), String::new()];
+
         if self.active_terminals.is_empty() {
-            self.messages
-                .push(Message::system("No background terminals are running."));
+            lines.push("  • No background terminals running.".to_string());
+            self.messages.push(Message::system(lines.join("\n")));
             return;
         }
 
         let mut entries: Vec<(&String, &ActiveTerminal)> = self.active_terminals.iter().collect();
         entries.sort_by(|(_, a), (_, b)| a.command.cmp(&b.command));
+        let max_processes = 16usize;
 
-        let lines = entries
-            .iter()
-            .enumerate()
-            .map(|(idx, (item_id, term))| {
-                let short_id = truncate_utf8(item_id, 8);
-                let output_preview = term
-                    .recent_output
-                    .lines()
-                    .rev()
-                    .find(|line| !line.trim().is_empty())
-                    .map(|line| truncate_utf8(line, 80).to_string())
-                    .unwrap_or_else(|| "(no output yet)".to_string());
-                format!(
-                    "  [{}] {} [{}]\n      {}",
-                    idx + 1,
-                    term.command,
-                    short_id,
-                    output_preview
-                )
-            })
-            .collect::<Vec<_>>();
+        for (_, term) in entries.iter().take(max_processes) {
+            let first_line = term.command.lines().next().unwrap_or(term.command.as_str());
+            let mut command_preview = truncate_utf8(first_line, 80).to_string();
+            if term.command.contains('\n') || first_line.len() > command_preview.len() {
+                command_preview.push_str(" [...]");
+            }
+            lines.push(format!("  • {}", command_preview));
 
-        self.messages.push(Message::system(&format!(
-            "Background terminals ({}):\n{}",
-            entries.len(),
-            lines.join("\n")
-        )));
+            let mut chunks: Vec<String> = term
+                .recent_output
+                .lines()
+                .map(str::trim_end)
+                .filter(|line| !line.trim().is_empty())
+                .rev()
+                .take(2)
+                .map(|line| truncate_utf8(line, 120).to_string())
+                .collect();
+            chunks.reverse();
+            if chunks.is_empty() {
+                lines.push("    ↳ (no output yet)".to_string());
+            } else {
+                for (idx, chunk) in chunks.iter().enumerate() {
+                    let prefix = if idx == 0 { "    ↳ " } else { "      " };
+                    lines.push(format!("{}{}", prefix, chunk));
+                }
+            }
+        }
+
+        let remaining = entries.len().saturating_sub(max_processes);
+        if remaining > 0 {
+            lines.push(format!("  • ... and {} more running", remaining));
+        }
+
+        self.messages.push(Message::system(lines.join("\n")));
     }
 
     /// Trigger thread compaction via app-server.
@@ -1923,37 +2307,128 @@ impl App {
         }
     }
 
-    /// Open status line preset picker.
+    /// Open status line editor by reading current config first.
     async fn open_statusline_picker(&mut self) {
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::StatuslineConfigRead;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "config/read",
+                "id": self.request_counter,
+                "params": {
+                    "includeLayers": false,
+                    "cwd": self.cwd.clone()
+                }
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+            self.messages
+                .push(Message::system("Opening status line editor..."));
+        } else {
+            self.open_statusline_editor_with_items(Self::default_statusline_items());
+        }
+    }
+
+    fn open_statusline_editor_with_items(&mut self, enabled_items: Vec<String>) {
+        let selected_item = enabled_items.first().cloned();
+        self.statusline_editor = Some(StatuslineEditorState {
+            enabled_items,
+            selected_item,
+        });
         self.picker_mode = PickerMode::Statusline;
         self.picker.title = "Status Line".to_string();
-        let items = vec![
-            PickerItem {
-                id: "default".to_string(),
-                title: "Default".to_string(),
-                subtitle: "model-with-reasoning, context-remaining, current-dir".to_string(),
+        self.refresh_statusline_editor_picker();
+    }
+
+    fn refresh_statusline_editor_picker(&mut self) {
+        let Some(editor) = self.statusline_editor.as_ref() else {
+            self.picker.close();
+            self.picker_mode = PickerMode::None;
+            return;
+        };
+
+        let selected_item = editor.selected_item.clone();
+        let selected_idx = selected_item
+            .as_ref()
+            .and_then(|id| editor.enabled_items.iter().position(|it| it == id));
+
+        let mut items = Vec::new();
+        items.push(PickerItem {
+            id: "__statusline:save".to_string(),
+            title: "Save changes".to_string(),
+            subtitle: "Persist current selection and order".to_string(),
+            metadata: None,
+        });
+        items.push(PickerItem {
+            id: "__statusline:cancel".to_string(),
+            title: "Cancel".to_string(),
+            subtitle: "Discard unsaved status line edits".to_string(),
+            metadata: None,
+        });
+        items.push(PickerItem {
+            id: "__statusline:reset".to_string(),
+            title: "Reset to default".to_string(),
+            subtitle: "model-with-reasoning, context-remaining, current-dir".to_string(),
+            metadata: None,
+        });
+
+        let up_hint = match selected_idx {
+            Some(0) => "Selected item is already first".to_string(),
+            Some(_) => "Move selected enabled item earlier".to_string(),
+            None => "Select an enabled item first".to_string(),
+        };
+        items.push(PickerItem {
+            id: "__statusline:up".to_string(),
+            title: "Move selected up".to_string(),
+            subtitle: up_hint,
+            metadata: None,
+        });
+
+        let down_hint = match selected_idx {
+            Some(idx) if idx + 1 >= editor.enabled_items.len() => {
+                "Selected item is already last".to_string()
+            }
+            Some(_) => "Move selected enabled item later".to_string(),
+            None => "Select an enabled item first".to_string(),
+        };
+        items.push(PickerItem {
+            id: "__statusline:down".to_string(),
+            title: "Move selected down".to_string(),
+            subtitle: down_hint,
+            metadata: None,
+        });
+
+        for (id, title, description, example) in STATUS_LINE_AVAILABLE_ITEMS {
+            let enabled_idx = editor.enabled_items.iter().position(|item| item == id);
+            let enabled = enabled_idx.is_some();
+            let selected = selected_item.as_deref() == Some(id);
+            let order = enabled_idx
+                .map(|idx| format!("{:>2}. ", idx + 1))
+                .unwrap_or_else(|| " -- ".to_string());
+            let selected_marker = if selected { "  <- selected" } else { "" };
+            let row_title = format!(
+                "[{}] {}{}{}",
+                if enabled { "x" } else { " " },
+                order,
+                title,
+                selected_marker
+            );
+            let row_subtitle = format!("{} (example: {})", description, example);
+            items.push(PickerItem {
+                id: format!("item:{}", id),
+                title: row_title,
+                subtitle: row_subtitle,
                 metadata: None,
-            },
-            PickerItem {
-                id: "minimal".to_string(),
-                title: "Minimal".to_string(),
-                subtitle: "model-name, current-dir".to_string(),
-                metadata: None,
-            },
-            PickerItem {
-                id: "verbose".to_string(),
-                title: "Verbose".to_string(),
-                subtitle: "model-with-reasoning + context/tokens + current-dir".to_string(),
-                metadata: None,
-            },
-            PickerItem {
-                id: "off".to_string(),
-                title: "Off".to_string(),
-                subtitle: "Disable custom status line items".to_string(),
-                metadata: None,
-            },
-        ];
-        self.picker.open(items);
+            });
+        }
+
+        if self.picker.visible {
+            self.picker.set_items(items);
+        } else {
+            self.picker.open(items);
+        }
     }
 
     /// Execute /init command - creates AGENTS.md
@@ -2017,6 +2492,7 @@ Make it comprehensive but concise."#;
             let item_id = item.id.clone();
             let item_title = item.title.clone();
             let item_metadata = item.metadata.clone();
+            let mut keep_picker_open = false;
 
             match self.picker_mode {
                 PickerMode::Resume => {
@@ -2333,44 +2809,110 @@ Make it comprehensive but concise."#;
                     self.set_active_thread_id(item_id);
                 }
                 PickerMode::Statusline => {
-                    let items: Vec<&str> = match item_id.as_str() {
-                        "default" => DEFAULT_STATUS_LINE_ITEMS.to_vec(),
-                        "minimal" => vec!["model-name", "current-dir"],
-                        "verbose" => vec![
-                            "model-with-reasoning",
-                            "context-remaining",
-                            "context-window-size",
-                            "used-tokens",
-                            "total-input-tokens",
-                            "total-output-tokens",
-                            "current-dir",
-                        ],
-                        "off" => Vec::new(),
-                        _ => DEFAULT_STATUS_LINE_ITEMS.to_vec(),
-                    };
-
-                    let value = serde_json::Value::Array(
-                        items
-                            .iter()
-                            .map(|item| serde_json::Value::String((*item).to_string()))
-                            .collect(),
-                    );
-                    self.write_config("tui.status_line", &value).await;
-                    let summary = if items.is_empty() {
-                        "disabled".to_string()
+                    if item_id == "__statusline:cancel" {
+                        self.statusline_editor = None;
+                        self.messages
+                            .push(Message::system("Status line edit cancelled."));
+                    } else if item_id == "__statusline:save" {
+                        if let Some(editor) = &self.statusline_editor {
+                            let saved_items = editor.enabled_items.clone();
+                            let value = serde_json::Value::Array(
+                                saved_items
+                                    .iter()
+                                    .map(|item| serde_json::Value::String(item.clone()))
+                                    .collect(),
+                            );
+                            self.write_config("tui.status_line", &value).await;
+                            let summary = if saved_items.is_empty() {
+                                "disabled".to_string()
+                            } else {
+                                saved_items.join(", ")
+                            };
+                            self.messages
+                                .push(Message::system(&format!("Status line saved: {}", summary)));
+                        }
+                        self.statusline_editor = None;
+                    } else if let Some(editor) = self.statusline_editor.as_mut() {
+                        keep_picker_open = true;
+                        match item_id.as_str() {
+                            "__statusline:reset" => {
+                                editor.enabled_items = Self::default_statusline_items();
+                                editor.selected_item = editor.enabled_items.first().cloned();
+                            }
+                            "__statusline:up" => {
+                                if let Some(selected_id) = editor.selected_item.clone() {
+                                    if let Some(idx) = editor
+                                        .enabled_items
+                                        .iter()
+                                        .position(|item| item == &selected_id)
+                                    {
+                                        if idx > 0 {
+                                            editor.enabled_items.swap(idx, idx - 1);
+                                        }
+                                    }
+                                }
+                            }
+                            "__statusline:down" => {
+                                if let Some(selected_id) = editor.selected_item.clone() {
+                                    if let Some(idx) = editor
+                                        .enabled_items
+                                        .iter()
+                                        .position(|item| item == &selected_id)
+                                    {
+                                        if idx + 1 < editor.enabled_items.len() {
+                                            editor.enabled_items.swap(idx, idx + 1);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                if let Some(raw_id) = item_id.strip_prefix("item:") {
+                                    if let Some(normalized_id) =
+                                        Self::normalize_statusline_item_id(raw_id)
+                                    {
+                                        if let Some(idx) = editor
+                                            .enabled_items
+                                            .iter()
+                                            .position(|item| item == &normalized_id)
+                                        {
+                                            editor.enabled_items.remove(idx);
+                                            if editor.selected_item.as_deref()
+                                                == Some(normalized_id.as_str())
+                                            {
+                                                editor.selected_item =
+                                                    editor.enabled_items.first().cloned();
+                                            }
+                                        } else {
+                                            editor.enabled_items.push(normalized_id.clone());
+                                            editor.selected_item = Some(normalized_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        self.refresh_statusline_editor_picker();
                     } else {
-                        items.join(", ")
-                    };
-                    self.messages.push(Message::system(&format!(
-                        "Status line preset: {} ({})",
-                        item_title, summary
-                    )));
+                        self.messages.push(Message::system(
+                            "Status line editor state missing. Run /statusline again.",
+                        ));
+                        self.picker_mode = PickerMode::None;
+                        self.picker.close();
+                        return;
+                    }
                 }
                 PickerMode::None => {}
+            }
+
+            if keep_picker_open {
+                self.scroll_to_bottom();
+                return;
             }
         }
 
         self.picker.close();
+        if matches!(self.picker_mode, PickerMode::Statusline) {
+            self.statusline_editor = None;
+        }
         self.picker_mode = PickerMode::None;
         self.scroll_to_bottom();
     }
@@ -3561,6 +4103,17 @@ Make it comprehensive but concise."#;
                         });
                     }
                 }
+                "account/rateLimits/updated" => {
+                    if let Some(params) = json.get("params") {
+                        let snapshot = params
+                            .get("rateLimits")
+                            .or_else(|| params.get("rate_limits"))
+                            .and_then(Self::parse_rate_limit_snapshot);
+                        if snapshot.is_some() {
+                            self.rate_limit_snapshot = snapshot;
+                        }
+                    }
+                }
                 "thread/started" => {
                     // Extract thread ID from notification
                     if let Some(thread) = json.get("params").and_then(|p| p.get("thread")) {
@@ -4380,6 +4933,14 @@ Make it comprehensive but concise."#;
                     self.messages.push(Message::system(&summary));
                 } else {
                     self.handle_rpc_error(json, "Failed to load status");
+                }
+            }
+            PendingRequestType::StatuslineConfigRead => {
+                if let Some(result) = json.get("result") {
+                    let items = Self::parse_statusline_items_from_config(result);
+                    self.open_statusline_editor_with_items(items);
+                } else {
+                    self.handle_rpc_error(json, "Failed to open status line editor");
                 }
             }
             PendingRequestType::FeedbackUpload => {

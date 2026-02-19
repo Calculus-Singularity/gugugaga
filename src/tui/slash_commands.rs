@@ -161,7 +161,7 @@ impl CodexCommand {
         let prefix = prefix.to_lowercase();
         Self::all()
             .iter()
-            .filter(|cmd| cmd.name().starts_with(&prefix))
+            .filter(|cmd| cmd.is_visible() && cmd.name().starts_with(&prefix))
             .copied()
             .collect()
     }
@@ -169,6 +169,14 @@ impl CodexCommand {
     pub fn parse(name: &str) -> Option<CodexCommand> {
         let name = name.to_lowercase();
         Self::all().iter().find(|cmd| cmd.name() == name).copied()
+    }
+
+    fn is_visible(&self) -> bool {
+        match self {
+            CodexCommand::SandboxReadRoot => cfg!(target_os = "windows"),
+            CodexCommand::Rollout => cfg!(debug_assertions),
+            _ => true,
+        }
     }
 }
 
