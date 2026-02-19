@@ -2,12 +2,15 @@
 //!
 //! A gugugaga agent that wraps Codex to monitor and correct its behavior.
 
-use clap::Parser;
-use gugugaga::{Interceptor, GugugagaConfig};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use gugugaga::issues::{
+    self, CreateIssueInput, IssueStore, ListIssuesOptions, ListSort, UpdateIssueInput,
+};
 use gugugaga::trust;
 use gugugaga::tui::App;
+use gugugaga::{GugugagaConfig, Interceptor};
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -37,9 +40,132 @@ struct Cli {
     #[arg(long)]
     no_tui: bool,
 
+    /// Extra command groups
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Initial prompt to send to Codex
     #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Built-in local issue tracker
+    Issues(IssuesArgs),
+}
+
+#[derive(Args, Debug)]
+struct IssuesArgs {
+    /// Print JSONL output for machine consumption
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Remove existing lock before write operations
+    #[arg(long, global = true)]
+    force: bool,
+
+    /// Disable ANSI colors in text output
+    #[arg(long, global = true)]
+    no_color: bool,
+
+    #[command(subcommand)]
+    command: IssuesCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum IssuesCommand {
+    /// Initialize .issues/issues.jsonl in the workspace
+    Init,
+    /// Print AGENTS.md onboarding snippet
+    Onboard,
+    /// Print workflow guidance prompt
+    Prime,
+    /// Start local web viewer
+    Serve {
+        /// Bind address
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Bind port
+        #[arg(long, default_value_t = 7385)]
+        port: u16,
+    },
+    /// Create a new issue
+    Create {
+        /// Issue title
+        #[arg(required = true, num_args = 1..)]
+        title: Vec<String>,
+        /// Description
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Priority (smaller means more important)
+        #[arg(short = 'p', long, default_value_t = 2)]
+        priority: u8,
+        /// Dependencies (repeat or pass comma-separated values)
+        #[arg(long, value_delimiter = ',')]
+        deps: Vec<String>,
+        /// Notes
+        #[arg(long, default_value = "")]
+        notes: String,
+    },
+    /// List issues
+    List {
+        /// Filter by status (open, in_progress, blocked, closed)
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by priority
+        #[arg(short = 'p', long)]
+        priority: Option<u8>,
+        /// Only show ready issues (all deps closed)
+        #[arg(long)]
+        ready: bool,
+        /// Include closed issues when --status is not set
+        #[arg(long)]
+        all: bool,
+        /// Search in title/description/notes
+        #[arg(long)]
+        search: Option<String>,
+        /// Sort mode (supports: priority)
+        #[arg(long)]
+        sort: Option<String>,
+    },
+    /// Show a single issue
+    Show { id: String },
+    /// Mark issue status
+    Status { id: String, status: String },
+    /// Mark issue closed
+    Close { id: String },
+    /// List ready issues
+    Ready,
+    /// Update fields on an issue
+    Update {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        append_notes: Option<String>,
+        #[arg(short = 'p', long)]
+        priority: Option<u8>,
+    },
+    /// Delete an issue
+    Delete { id: String },
+    /// Manage dependencies
+    Dep {
+        #[command(subcommand)]
+        command: DepCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DepCommand {
+    /// Add dependency child -> parent
+    Add { child: String, parent: String },
+    /// Remove dependency child -> parent
+    Remove { child: String, parent: String },
 }
 
 #[tokio::main]
@@ -48,10 +174,7 @@ async fn main() -> anyhow::Result<()> {
     // so we can debug "flash-exit" issues.
     std::panic::set_hook(Box::new(|info| {
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen
-        );
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         let msg = format!(
             "gugugaga crashed!\n{}\nBacktrace:\n{:?}\n",
             info,
@@ -62,6 +185,22 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     let cli = Cli::parse();
+
+    // Treat stray top-level words as unknown commands in normal mode.
+    // This avoids accidentally treating `gugugaga xxx` as a prompt.
+    if cli.command.is_none() && !cli.prompt.is_empty() && !cli.no_tui {
+        eprintln!("error: unrecognized command '{}'\n", cli.prompt[0]);
+        let mut cmd = Cli::command();
+        let _ = cmd.write_help(&mut std::io::stderr());
+        eprintln!();
+        std::process::exit(2);
+    }
+
+    if let Some(Commands::Issues(args)) = &cli.command {
+        let root = gugugaga::issues::workspace_root(&cli.cwd)?;
+        run_issues_command(&root, args)?;
+        return Ok(());
+    }
 
     // Resolve paths
     let cwd = std::fs::canonicalize(&cli.cwd)?;
@@ -195,7 +334,10 @@ async fn run_tui_mode(
     // Wait for interceptor to finish saving session (with timeout).
     // If it doesn't finish in time, abort it so the process can exit.
     let save_timeout = tokio::time::Duration::from_secs(3);
-    if tokio::time::timeout(save_timeout, &mut interceptor_handle).await.is_err() {
+    if tokio::time::timeout(save_timeout, &mut interceptor_handle)
+        .await
+        .is_err()
+    {
         interceptor_handle.abort();
     }
 
@@ -287,6 +429,200 @@ async fn run_plain_mode(cli: Cli, cwd: PathBuf, codex_home: PathBuf) -> anyhow::
     // Run the interceptor
     interceptor.run(user_input_rx, output_tx).await?;
 
+    Ok(())
+}
+
+fn run_issues_command(workspace_root: &Path, args: &IssuesArgs) -> anyhow::Result<()> {
+    let store = IssueStore::new(workspace_root);
+    let color = !args.no_color;
+
+    match &args.command {
+        IssuesCommand::Init => {
+            let (path, doc_change) = store.init(args.force)?;
+            if args.json {
+                write_json_line(&serde_json::json!({
+                    "action": "init",
+                    "path": path.to_string_lossy(),
+                    "agents": doc_change,
+                }))?;
+            } else {
+                println!("initialized {}", path.display());
+                if let Some(msg) = doc_change {
+                    println!("{msg}");
+                }
+            }
+        }
+        IssuesCommand::Onboard => {
+            print!("{}", issues::onboard_text());
+        }
+        IssuesCommand::Prime => {
+            print!("{}", issues::prime_prompt());
+        }
+        IssuesCommand::Serve { host, port } => {
+            println!("serving http://{}:{}", host, port);
+            issues::serve(&store, host, *port)?;
+        }
+        IssuesCommand::Create {
+            title,
+            description,
+            priority,
+            deps,
+            notes,
+        } => {
+            let issue = store.with_lock(args.force, |s| {
+                s.create_issue(
+                    &title.join(" "),
+                    CreateIssueInput {
+                        description: description.clone(),
+                        priority: *priority,
+                        deps: deps.clone(),
+                        notes: notes.clone(),
+                    },
+                )
+            })?;
+            if args.json {
+                write_json_line(&issue)?;
+            } else {
+                println!("{}", issue.id);
+            }
+        }
+        IssuesCommand::List {
+            status,
+            priority,
+            ready,
+            all,
+            search,
+            sort,
+        } => {
+            let sort_mode = match sort.as_deref() {
+                None => ListSort::CreatedDesc,
+                Some("priority") => ListSort::Priority,
+                Some(other) => return Err(anyhow::anyhow!("unknown sort: {other}")),
+            };
+            let issues = store.list_issues(&ListIssuesOptions {
+                status: status.clone(),
+                priority: *priority,
+                ready_only: *ready,
+                include_closed: *all,
+                search: search.clone(),
+                sort: sort_mode,
+            })?;
+            if issues.is_empty() && !args.json {
+                println!("no issues");
+                return Ok(());
+            }
+            for issue in &issues {
+                if args.json {
+                    write_json_line(issue)?;
+                } else {
+                    println!("{}", issues::format_issue_line(issue, color));
+                }
+            }
+        }
+        IssuesCommand::Show { id } => {
+            let issue = store
+                .get_issue(id)?
+                .ok_or_else(|| anyhow::anyhow!("issue not found: {id}"))?;
+            if args.json {
+                write_json_line(&issue)?;
+            } else {
+                for line in issues::format_issue_details(&issue, color) {
+                    println!("{line}");
+                }
+            }
+        }
+        IssuesCommand::Status { id, status } => {
+            let issue = store.with_lock(args.force, |s| s.set_status(id, status))?;
+            if args.json {
+                write_json_line(&issue)?;
+            } else {
+                println!("updated {} -> {}", issue.id, issue.status);
+            }
+        }
+        IssuesCommand::Close { id } => {
+            let issue = store.with_lock(args.force, |s| s.close_issue(id))?;
+            if args.json {
+                write_json_line(&issue)?;
+            } else {
+                println!("updated {} -> {}", issue.id, issue.status);
+            }
+        }
+        IssuesCommand::Ready => {
+            let issues = store.ready_issues()?;
+            if issues.is_empty() && !args.json {
+                println!("no ready issues");
+                return Ok(());
+            }
+            for issue in &issues {
+                if args.json {
+                    write_json_line(issue)?;
+                } else {
+                    println!("{}", issues::format_issue_line(issue, color));
+                }
+            }
+        }
+        IssuesCommand::Update {
+            id,
+            title,
+            description,
+            notes,
+            append_notes,
+            priority,
+        } => {
+            let issue = store.with_lock(args.force, |s| {
+                s.update_issue(
+                    id,
+                    UpdateIssueInput {
+                        title: title.clone(),
+                        description: description.clone(),
+                        notes: notes.clone(),
+                        append_notes: append_notes.clone(),
+                        priority: *priority,
+                    },
+                )
+            })?;
+            if args.json {
+                write_json_line(&issue)?;
+            } else {
+                println!("updated {}", issue.id);
+            }
+        }
+        IssuesCommand::Delete { id } => {
+            store.with_lock(args.force, |s| s.delete_issue(id))?;
+            if args.json {
+                write_json_line(&serde_json::json!({
+                    "action": "delete",
+                    "id": id,
+                }))?;
+            } else {
+                println!("deleted {}", id);
+            }
+        }
+        IssuesCommand::Dep { command } => match command {
+            DepCommand::Add { child, parent } => {
+                let issue = store.with_lock(args.force, |s| s.add_dependency(child, parent))?;
+                if args.json {
+                    write_json_line(&issue)?;
+                } else {
+                    println!("added dependency {} -> {}", child, parent);
+                }
+            }
+            DepCommand::Remove { child, parent } => {
+                let issue = store.with_lock(args.force, |s| s.remove_dependency(child, parent))?;
+                if args.json {
+                    write_json_line(&issue)?;
+                } else {
+                    println!("removed dependency {} -> {}", child, parent);
+                }
+            }
+        },
+    }
+
+    Ok(())
+}
+
+fn write_json_line<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string(value)?);
     Ok(())
 }
 

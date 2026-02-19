@@ -10,6 +10,7 @@ pub mod memory;
 pub mod protocol;
 pub mod rules;
 pub mod gugugaga_agent;
+pub mod issues;
 pub mod trust;
 pub mod tui;
 
