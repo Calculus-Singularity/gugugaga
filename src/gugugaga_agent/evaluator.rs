@@ -24,6 +24,8 @@ const RETRY_BASE_DELAY_MS: u64 = 200;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Responses API requires an instructions field; use a neutral fallback.
 const DEFAULT_RESPONSES_INSTRUCTIONS: &str = "Follow the user's request exactly.";
+const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
+const THINKING_RESPONSE_DELIMITER: &str = "---RESPONSE---";
 
 // ─── Auth mode ───────────────────────────────────────────────────────
 
@@ -65,6 +67,7 @@ pub struct Evaluator {
     client: Client,
     model: String,
     reasoning_effort: Option<String>,
+    responses_prompt_cache_key: String,
     base_url: String,
     provider_headers: Vec<(String, String)>,
     wire_api: WireApi,
@@ -151,12 +154,18 @@ struct ResponsesRequest {
     include: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ResponsesReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
 struct ResponsesReasoning {
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,6 +192,9 @@ struct ResponsesSseEvent {
     /// Text delta (for response.output_text.delta)
     #[serde(default)]
     delta: Option<String>,
+    /// Output item payload (for response.output_item.done)
+    #[serde(default)]
+    item: Option<serde_json::Value>,
     /// Response wrapper (for response.completed / response.failed)
     #[serde(default)]
     response: Option<serde_json::Value>,
@@ -309,10 +321,10 @@ fn built_in_model_providers() -> HashMap<String, ModelProviderConfig> {
             ),
             wire_api: Some("responses".to_string()),
             env_key: Some("OPENAI_API_KEY".to_string()),
-            http_headers: Some(HashMap::from([(
-                "version".to_string(),
-                env!("CARGO_PKG_VERSION").to_string(),
-            )])),
+            http_headers: Some(HashMap::from([
+                ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+                ("originator".to_string(), "codex_cli_rs".to_string()),
+            ])),
             env_http_headers: Some(HashMap::from([
                 (
                     "OpenAI-Organization".to_string(),
@@ -328,13 +340,10 @@ fn built_in_model_providers() -> HashMap<String, ModelProviderConfig> {
         "ollama".to_string(),
         ModelProviderConfig {
             name: Some("Ollama".to_string()),
-            base_url: Some(
-                std::env::var("CODEX_OSS_BASE_URL").unwrap_or_else(|_| {
-                    let port =
-                        std::env::var("CODEX_OSS_PORT").unwrap_or_else(|_| "11434".to_string());
-                    format!("http://localhost:{}/v1", port)
-                }),
-            ),
+            base_url: Some(std::env::var("CODEX_OSS_BASE_URL").unwrap_or_else(|_| {
+                let port = std::env::var("CODEX_OSS_PORT").unwrap_or_else(|_| "11434".to_string());
+                format!("http://localhost:{}/v1", port)
+            })),
             wire_api: Some("responses".to_string()),
             env_key: None,
             http_headers: None,
@@ -347,13 +356,10 @@ fn built_in_model_providers() -> HashMap<String, ModelProviderConfig> {
         "ollama-chat".to_string(),
         ModelProviderConfig {
             name: Some("Ollama (Chat)".to_string()),
-            base_url: Some(
-                std::env::var("CODEX_OSS_BASE_URL").unwrap_or_else(|_| {
-                    let port =
-                        std::env::var("CODEX_OSS_PORT").unwrap_or_else(|_| "11434".to_string());
-                    format!("http://localhost:{}/v1", port)
-                }),
-            ),
+            base_url: Some(std::env::var("CODEX_OSS_BASE_URL").unwrap_or_else(|_| {
+                let port = std::env::var("CODEX_OSS_PORT").unwrap_or_else(|_| "11434".to_string());
+                format!("http://localhost:{}/v1", port)
+            })),
             wire_api: Some("chat".to_string()),
             env_key: None,
             http_headers: None,
@@ -456,6 +462,7 @@ impl Evaluator {
             client,
             model,
             reasoning_effort,
+            responses_prompt_cache_key: format!("gugugaga-evaluator-{}", std::process::id()),
             base_url,
             provider_headers,
             wire_api,
@@ -485,15 +492,21 @@ impl Evaluator {
     async fn load_config(
         codex_home: &Path,
         auth_mode: &EvaluatorAuthMode,
-    ) -> Result<(String, Option<String>, String, Vec<(String, String)>, WireApi)> {
+    ) -> Result<(
+        String,
+        Option<String>,
+        String,
+        Vec<(String, String)>,
+        WireApi,
+    )> {
         let config_file = codex_home.join("config.toml");
 
         // Start with built-in providers
         let mut providers = built_in_model_providers();
 
         // Defaults before config
-        let mut model = std::env::var("GUGUGAGA_MODEL")
-            .unwrap_or_else(|_| GUGUGAGA_DEFAULT_MODEL.to_string());
+        let mut model =
+            std::env::var("GUGUGAGA_MODEL").unwrap_or_else(|_| GUGUGAGA_DEFAULT_MODEL.to_string());
         let mut reasoning_effort: Option<String> = None;
         let mut provider_id = "openai".to_string();
 
@@ -535,48 +548,48 @@ impl Evaluator {
         // Look up the resolved provider
         let (base_url, provider_headers, wire_api) =
             if let Some(provider) = providers.get(&provider_id) {
-            let base_url = provider
-                .base_url
-                .clone()
-                .unwrap_or_else(|| Self::default_base_url(auth_mode));
-            let mut provider_headers = Self::resolve_provider_headers(provider);
-            if provider_id == "openai" {
-                if let Some(codex_version) = Self::resolve_codex_cli_version(codex_home).await {
-                    Self::upsert_header(&mut provider_headers, "version", &codex_version);
-                } else {
-                    // Avoid sending gugugaga's own crate version (e.g. 0.1.0),
-                    // which can fail model min-version checks on ChatGPT backend.
-                    provider_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("version"));
+                let base_url = provider
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| Self::default_base_url(auth_mode));
+                let mut provider_headers = Self::resolve_provider_headers(provider);
+                if provider_id == "openai" {
+                    if let Some(codex_version) = Self::resolve_codex_cli_version(codex_home).await {
+                        Self::upsert_header(&mut provider_headers, "version", &codex_version);
+                    } else {
+                        // Avoid sending gugugaga's own crate version (e.g. 0.1.0),
+                        // which can fail model min-version checks on ChatGPT backend.
+                        provider_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("version"));
+                    }
                 }
-            }
 
-            let wire = match provider.wire_api.as_deref() {
-                Some("chat") => WireApi::Chat,
-                Some("responses") => WireApi::Responses,
-                _ => Self::default_wire_api(auth_mode),
-            };
+                let wire = match provider.wire_api.as_deref() {
+                    Some("chat") => WireApi::Chat,
+                    Some("responses") => WireApi::Responses,
+                    _ => Self::default_wire_api(auth_mode),
+                };
 
-            // Special case: "openai" provider with OAuth → route to ChatGPT backend
-            if provider_id == "openai" && *auth_mode == EvaluatorAuthMode::ChatgptOAuth {
-                (
-                    "https://chatgpt.com/backend-api/codex".to_string(),
-                    provider_headers,
-                    WireApi::Responses,
-                )
+                // Special case: "openai" provider with OAuth → route to ChatGPT backend
+                if provider_id == "openai" && *auth_mode == EvaluatorAuthMode::ChatgptOAuth {
+                    (
+                        "https://chatgpt.com/backend-api/codex".to_string(),
+                        provider_headers,
+                        WireApi::Responses,
+                    )
+                } else {
+                    (base_url, provider_headers, wire)
+                }
             } else {
-                (base_url, provider_headers, wire)
-            }
-        } else {
-            warn!(
-                "Model provider '{}' not found, falling back to defaults",
-                provider_id
-            );
-            (
-                Self::default_base_url(auth_mode),
-                Vec::new(),
-                Self::default_wire_api(auth_mode),
-            )
-        };
+                warn!(
+                    "Model provider '{}' not found, falling back to defaults",
+                    provider_id
+                );
+                (
+                    Self::default_base_url(auth_mode),
+                    Vec::new(),
+                    Self::default_wire_api(auth_mode),
+                )
+            };
 
         info!(
             "Config resolved: provider='{}', model='{}', effort={:?}, base_url='{}', headers={}, wire={:?}",
@@ -588,7 +601,13 @@ impl Evaluator {
             wire_api
         );
 
-        Ok((model, reasoning_effort, base_url, provider_headers, wire_api))
+        Ok((
+            model,
+            reasoning_effort,
+            base_url,
+            provider_headers,
+            wire_api,
+        ))
     }
 
     fn resolve_provider_headers(provider: &ModelProviderConfig) -> Vec<(String, String)> {
@@ -642,9 +661,7 @@ impl Evaluator {
     /// Default base URL based on auth mode.
     fn default_base_url(auth_mode: &EvaluatorAuthMode) -> String {
         match auth_mode {
-            EvaluatorAuthMode::ChatgptOAuth => {
-                "https://chatgpt.com/backend-api/codex".to_string()
-            }
+            EvaluatorAuthMode::ChatgptOAuth => "https://chatgpt.com/backend-api/codex".to_string(),
             EvaluatorAuthMode::ApiKey => "https://api.openai.com/v1".to_string(),
         }
     }
@@ -774,11 +791,7 @@ impl Evaluator {
     // ─── Request building ───────────────────────────────────────────
 
     /// Build a request and send it based on the wire API type.
-    async fn send_request(
-        &self,
-        system_prompt: Option<&str>,
-        user_prompt: &str,
-    ) -> Result<String> {
+    async fn send_request(&self, system_prompt: Option<&str>, user_prompt: &str) -> Result<String> {
         match self.wire_api {
             WireApi::Chat => {
                 self.send_chat_completions_request(system_prompt, user_prompt)
@@ -867,29 +880,7 @@ impl Evaluator {
             .unwrap_or(DEFAULT_RESPONSES_INSTRUCTIONS)
             .to_string();
 
-        let input = vec![ResponsesInputItem {
-            item_type: "message".to_string(),
-            role: "user".to_string(),
-            content: vec![ResponsesContentItem {
-                content_type: "input_text".to_string(),
-                text: user_prompt.to_string(),
-            }],
-        }];
-
-        let request = ResponsesRequest {
-            model: self.model.clone(),
-            instructions,
-            input,
-            tools: Vec::new(),
-            tool_choice: "auto",
-            parallel_tool_calls: false,
-            store: false,
-            stream: true, // Responses API is streaming-only
-            include: Vec::new(),
-            reasoning: self.reasoning_effort.as_ref().map(|effort| ResponsesReasoning {
-                effort: Some(effort.clone()),
-            }),
-        };
+        let request = self.build_responses_request(instructions, user_prompt);
 
         let headers = self.fresh_auth_headers().await?;
         let mut req_builder = self
@@ -916,11 +907,104 @@ impl Evaluator {
         Self::collect_responses_stream(response).await
     }
 
+    fn build_responses_request(&self, instructions: String, user_prompt: &str) -> ResponsesRequest {
+        let input = vec![ResponsesInputItem {
+            item_type: "message".to_string(),
+            role: "user".to_string(),
+            content: vec![ResponsesContentItem {
+                content_type: "input_text".to_string(),
+                text: user_prompt.to_string(),
+            }],
+        }];
+
+        let reasoning = self
+            .reasoning_effort
+            .as_ref()
+            .map(|effort| ResponsesReasoning {
+                effort: Some(effort.clone()),
+                summary: None,
+            });
+        let include = if reasoning.is_some() {
+            vec![RESPONSES_REASONING_INCLUDE.to_string()]
+        } else {
+            Vec::new()
+        };
+
+        ResponsesRequest {
+            model: self.model.clone(),
+            instructions,
+            input,
+            tools: Vec::new(),
+            tool_choice: "auto",
+            parallel_tool_calls: false,
+            store: false,
+            stream: true, // Responses API is streaming-only
+            include,
+            reasoning,
+            prompt_cache_key: Some(self.responses_prompt_cache_key.clone()),
+            text: None,
+        }
+    }
+
+    fn responses_event_error(event: &ResponsesSseEvent, fallback: &str) -> String {
+        event
+            .response
+            .as_ref()
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or(fallback)
+            .to_string()
+    }
+
+    fn responses_event_incomplete_reason(event: &ResponsesSseEvent) -> Option<String> {
+        event.response.as_ref().and_then(|r| {
+            r.get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+    }
+
+    fn responses_output_item_text(event: &ResponsesSseEvent) -> Option<String> {
+        event
+            .item
+            .as_ref()
+            .and_then(Self::extract_response_item_text)
+    }
+
+    fn extract_response_item_text(item: &serde_json::Value) -> Option<String> {
+        let mut collected = String::new();
+        if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+            for block in content {
+                let block_type = block
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default();
+                if block_type == "output_text" || block_type == "text" {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        collected.push_str(text);
+                    } else if let Some(text) = block.get("value").and_then(|t| t.as_str()) {
+                        collected.push_str(text);
+                    }
+                }
+            }
+        }
+        if !collected.is_empty() {
+            return Some(collected);
+        }
+
+        item.get("text")
+            .and_then(|text| text.as_str())
+            .map(|s| s.to_string())
+    }
+
     /// Collect a Responses API SSE stream into the full text response.
     async fn collect_responses_stream(response: reqwest::Response) -> Result<String> {
         let mut stream = response.bytes_stream();
         let mut result_text = String::new();
         let mut line_buffer = String::new();
+        let mut saw_output_text_delta = false;
 
         while let Some(chunk_result) = stream.next().await {
             let bytes = chunk_result
@@ -944,23 +1028,32 @@ impl Evaluator {
                 if let Ok(event) = serde_json::from_str::<ResponsesSseEvent>(data) {
                     match event.event_type.as_str() {
                         "response.output_text.delta" => {
+                            saw_output_text_delta = true;
                             if let Some(delta) = &event.delta {
                                 result_text.push_str(delta);
+                            }
+                        }
+                        "response.output_item.done" => {
+                            if !saw_output_text_delta {
+                                if let Some(text) = Self::responses_output_item_text(&event) {
+                                    result_text.push_str(&text);
+                                }
                             }
                         }
                         "response.completed" | "response.done" => {
                             return Ok(result_text);
                         }
                         "response.failed" => {
-                            let error_msg = event
-                                .response
-                                .as_ref()
-                                .and_then(|r| r.get("error"))
-                                .and_then(|e| e.get("message"))
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("unknown error");
+                            let error_msg = Self::responses_event_error(&event, "response.failed");
                             return Err(GugugagaError::LlmEvaluation(format!(
                                 "Responses API error: {error_msg}"
+                            )));
+                        }
+                        "response.incomplete" => {
+                            let reason = Self::responses_event_incomplete_reason(&event)
+                                .unwrap_or_else(|| "unknown".to_string());
+                            return Err(GugugagaError::LlmEvaluation(format!(
+                                "Responses API incomplete: {reason}"
                             )));
                         }
                         _ => {}
@@ -1092,7 +1185,10 @@ impl Evaluator {
 
     /// Call LLM and return both thinking and response (with retry).
     pub async fn call_llm_with_thinking(&self, prompt: &str) -> Result<ParsedResponse> {
-        debug!("Calling LLM (with thinking) prompt length: {}", prompt.len());
+        debug!(
+            "Calling LLM (with thinking) prompt length: {}",
+            prompt.len()
+        );
 
         let mut last_err = None;
         for attempt in 0..MAX_RETRY_ATTEMPTS {
@@ -1138,7 +1234,10 @@ impl Evaluator {
         user_prompt: &str,
     ) -> Result<mpsc::Receiver<GugugagaThinking>> {
         match self.wire_api {
-            WireApi::Chat => self.stream_chat_completions(system_prompt, user_prompt).await,
+            WireApi::Chat => {
+                self.stream_chat_completions(system_prompt, user_prompt)
+                    .await
+            }
             WireApi::Responses => self.stream_responses_api(system_prompt, user_prompt).await,
         }
     }
@@ -1207,10 +1306,11 @@ impl Evaluator {
                                         if let Some(content) = &choice.delta.content {
                                             buffer.push_str(content);
 
-                                            if buffer.contains("---RESPONSE---") {
+                                            if buffer.contains(THINKING_RESPONSE_DELIMITER) {
                                                 in_thinking = false;
-                                                let parts: Vec<&str> =
-                                                    buffer.splitn(2, "---RESPONSE---").collect();
+                                                let parts: Vec<&str> = buffer
+                                                    .splitn(2, THINKING_RESPONSE_DELIMITER)
+                                                    .collect();
                                                 if parts.len() == 2 {
                                                     buffer = parts[1].to_string();
                                                 }
@@ -1261,29 +1361,7 @@ impl Evaluator {
             system_prompt.to_string()
         };
 
-        let input = vec![ResponsesInputItem {
-            item_type: "message".to_string(),
-            role: "user".to_string(),
-            content: vec![ResponsesContentItem {
-                content_type: "input_text".to_string(),
-                text: user_prompt.to_string(),
-            }],
-        }];
-
-        let request = ResponsesRequest {
-            model: self.model.clone(),
-            instructions,
-            input,
-            tools: Vec::new(),
-            tool_choice: "auto",
-            parallel_tool_calls: false,
-            store: false,
-            stream: true,
-            include: Vec::new(),
-            reasoning: self.reasoning_effort.as_ref().map(|effort| ResponsesReasoning {
-                effort: Some(effort.clone()),
-            }),
-        };
+        let request = self.build_responses_request(instructions, user_prompt);
 
         let headers = self.fresh_auth_headers().await?;
         let mut req_builder = self
@@ -1312,6 +1390,7 @@ impl Evaluator {
             let mut in_thinking = true;
             let mut buffer = String::new();
             let mut line_buffer = String::new();
+            let mut saw_output_text_delta = false;
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
@@ -1336,13 +1415,14 @@ impl Evaluator {
                             if let Ok(event) = serde_json::from_str::<ResponsesSseEvent>(data) {
                                 match event.event_type.as_str() {
                                     "response.output_text.delta" => {
+                                        saw_output_text_delta = true;
                                         if let Some(delta) = &event.delta {
                                             buffer.push_str(delta);
 
-                                            if buffer.contains("---RESPONSE---") {
+                                            if buffer.contains(THINKING_RESPONSE_DELIMITER) {
                                                 in_thinking = false;
                                                 let parts: Vec<&str> = buffer
-                                                    .splitn(2, "---RESPONSE---")
+                                                    .splitn(2, THINKING_RESPONSE_DELIMITER)
                                                     .collect();
                                                 if parts.len() == 2 {
                                                     buffer = parts[1].to_string();
@@ -1357,20 +1437,50 @@ impl Evaluator {
                                             let _ = tx.send(event).await;
                                         }
                                     }
+                                    "response.output_item.done" => {
+                                        if !saw_output_text_delta {
+                                            if let Some(text) =
+                                                Self::responses_output_item_text(&event)
+                                            {
+                                                buffer.push_str(&text);
+
+                                                if buffer.contains(THINKING_RESPONSE_DELIMITER) {
+                                                    in_thinking = false;
+                                                    let parts: Vec<&str> = buffer
+                                                        .splitn(2, THINKING_RESPONSE_DELIMITER)
+                                                        .collect();
+                                                    if parts.len() == 2 {
+                                                        buffer = parts[1].to_string();
+                                                    }
+                                                }
+
+                                                let stream_event = if in_thinking {
+                                                    GugugagaThinking::Thinking(text)
+                                                } else {
+                                                    GugugagaThinking::Response(text)
+                                                };
+                                                let _ = tx.send(stream_event).await;
+                                            }
+                                        }
+                                    }
                                     "response.completed" | "response.done" => {
                                         let _ = tx.send(GugugagaThinking::Done).await;
                                         return;
                                     }
                                     "response.failed" => {
-                                        let error_msg = event
-                                            .response
-                                            .as_ref()
-                                            .and_then(|r| r.get("error"))
-                                            .and_then(|e| e.get("message"))
-                                            .and_then(|m| m.as_str())
-                                            .unwrap_or("unknown error");
+                                        let error_msg =
+                                            Self::responses_event_error(&event, "response.failed");
+                                        let _ = tx.send(GugugagaThinking::Error(error_msg)).await;
+                                        return;
+                                    }
+                                    "response.incomplete" => {
+                                        let reason =
+                                            Self::responses_event_incomplete_reason(&event)
+                                                .unwrap_or_else(|| "unknown".to_string());
                                         let _ = tx
-                                            .send(GugugagaThinking::Error(error_msg.to_string()))
+                                            .send(GugugagaThinking::Error(format!(
+                                                "Responses API incomplete: {reason}"
+                                            )))
                                             .await;
                                         return;
                                     }
