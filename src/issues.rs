@@ -24,12 +24,6 @@ pub const STATUS_CLOSED: &str = "closed";
 const ONBOARD_SECTION: &str = "## Gugugaga Issues\n\nThis project uses `gugugaga issues` for issue tracking.\nRun `gugugaga issues prime` for workflow context.\n";
 const ONBOARD_FILE: &str = "# AGENTS.md\n\nThis project uses `gugugaga issues` for issue tracking.\nRun `gugugaga issues prime` for workflow context.\n";
 
-const LEGACY_MOONISSUES_SECTION: &str = "## Moonissues\n\nThis project uses moonissues for issue tracking.\nRun `moonissues prime` for workflow context.\n";
-const LEGACY_MOONISSUES_FILE: &str = "# AGENTS.md\n\nThis project uses moonissues for issue tracking.\nRun `moonissues prime` for workflow context.\n";
-
-const LEGACY_MOONBEAD_SECTION: &str = "## Moonbead\n\nThis project uses moonbead for issue tracking.\nRun `moonbead prime` for workflow context.\n";
-const LEGACY_MOONBEAD_FILE: &str = "# AGENTS.md\n\nThis project uses moonbead for issue tracking.\nRun `moonbead prime` for workflow context.\n";
-
 const PRIME_PROMPT: &str = "# gugugaga issues prime\n\nGugugaga issues is a local issue tracker for AI-assisted work.\nIDs: gugugaga-xxxxx\n\nWorkflow:\n1. Pick work: `gugugaga issues ready --json`\n2. Create issues for new work: `gugugaga issues create \"...\" --description \"...\"`\n3. Mark in progress: `gugugaga issues status <id> in_progress`\n4. Update details: `gugugaga issues update <id> --description \"...\" --notes \"...\" --priority 1`\n5. Link dependencies: `gugugaga issues dep add <child> <parent>`\n6. Close when done: `gugugaga issues close <id>`\n\nUseful:\n- `gugugaga issues list [--status <status>] [--ready] [--all]`\n- `gugugaga issues show <id>`\n- Use `--json` for machine parsing\n\nNotes:\n- `list` hides closed by default; add `--all` to include them.\n- If lock is stale, retry with `--force`.\n- Do not read or edit issue storage directly; use `gugugaga issues` commands.\n";
 
 fn default_status() -> String {
@@ -519,11 +513,6 @@ pub fn ensure_agents_doc(root: &Path) -> Result<Option<String>> {
         let content =
             fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
 
-        if let Some(updated) = replace_legacy_onboard(&content) {
-            fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
-            return Ok(Some("updated AGENTS.md".to_string()));
-        }
-
         if content.contains("gugugaga issues") || content.contains("gugugaga issues prime") {
             return Ok(None);
         }
@@ -539,22 +528,6 @@ pub fn ensure_agents_doc(root: &Path) -> Result<Option<String>> {
 
     fs::write(&path, ONBOARD_FILE).with_context(|| format!("write {}", path.display()))?;
     Ok(Some("created AGENTS.md".to_string()))
-}
-
-fn replace_legacy_onboard(content: &str) -> Option<String> {
-    if content.contains(LEGACY_MOONISSUES_SECTION) {
-        return Some(content.replace(LEGACY_MOONISSUES_SECTION, ONBOARD_SECTION));
-    }
-    if content.contains(LEGACY_MOONISSUES_FILE) {
-        return Some(content.replace(LEGACY_MOONISSUES_FILE, ONBOARD_FILE));
-    }
-    if content.contains(LEGACY_MOONBEAD_SECTION) {
-        return Some(content.replace(LEGACY_MOONBEAD_SECTION, ONBOARD_SECTION));
-    }
-    if content.contains(LEGACY_MOONBEAD_FILE) {
-        return Some(content.replace(LEGACY_MOONBEAD_FILE, ONBOARD_FILE));
-    }
-    None
 }
 
 pub fn normalize_status(input: &str) -> Option<&'static str> {
@@ -991,13 +964,13 @@ mod tests {
         let created = store
             .with_lock(false, |s| {
                 s.create_issue(
-                    "add issue tracker",
-                    CreateIssueInput {
-                        description: "rewrite moonissues in Rust".to_string(),
-                        priority: 1,
-                        deps: vec![],
-                        notes: "ship mvp first".to_string(),
-                    },
+                "add issue tracker",
+                CreateIssueInput {
+                        description: "rewrite issues in Rust".to_string(),
+                    priority: 1,
+                    deps: vec![],
+                    notes: "ship mvp first".to_string(),
+                },
                 )
             })
             .expect("create");
