@@ -12,6 +12,7 @@ pub enum CodexCommand {
     Approvals,
     Permissions,
     ElevateSandbox,
+    SandboxReadRoot,
     Experimental,
     Skills,
     Review,
@@ -20,19 +21,24 @@ pub enum CodexCommand {
     Resume,
     Fork,
     Init,
+    Compact,
     Plan,
     Collab,
     Agent,
     Diff,
     Mention,
     Status,
+    DebugConfig,
+    Statusline,
     Mcp,
     Apps,
     Logout,
     Quit,
     Exit,
     Feedback,
+    Rollout,
     Ps,
+    Clean,
     Personality,
 }
 
@@ -44,6 +50,7 @@ impl CodexCommand {
             CodexCommand::Approvals,
             CodexCommand::Permissions,
             CodexCommand::ElevateSandbox,
+            CodexCommand::SandboxReadRoot,
             CodexCommand::Experimental,
             CodexCommand::Skills,
             CodexCommand::Review,
@@ -52,19 +59,24 @@ impl CodexCommand {
             CodexCommand::Resume,
             CodexCommand::Fork,
             CodexCommand::Init,
+            CodexCommand::Compact,
             CodexCommand::Plan,
             CodexCommand::Collab,
             CodexCommand::Agent,
             CodexCommand::Diff,
             CodexCommand::Mention,
             CodexCommand::Status,
+            CodexCommand::DebugConfig,
+            CodexCommand::Statusline,
             CodexCommand::Mcp,
             CodexCommand::Apps,
             CodexCommand::Logout,
             CodexCommand::Quit,
             CodexCommand::Exit,
             CodexCommand::Feedback,
+            CodexCommand::Rollout,
             CodexCommand::Ps,
+            CodexCommand::Clean,
             CodexCommand::Personality,
         ]
     }
@@ -74,7 +86,8 @@ impl CodexCommand {
             CodexCommand::Model => "model",
             CodexCommand::Approvals => "approvals",
             CodexCommand::Permissions => "permissions",
-            CodexCommand::ElevateSandbox => "setup-elevated-sandbox",
+            CodexCommand::ElevateSandbox => "setup-default-sandbox",
+            CodexCommand::SandboxReadRoot => "sandbox-add-read-dir",
             CodexCommand::Experimental => "experimental",
             CodexCommand::Skills => "skills",
             CodexCommand::Review => "review",
@@ -83,19 +96,24 @@ impl CodexCommand {
             CodexCommand::Resume => "resume",
             CodexCommand::Fork => "fork",
             CodexCommand::Init => "init",
+            CodexCommand::Compact => "compact",
             CodexCommand::Plan => "plan",
             CodexCommand::Collab => "collab",
             CodexCommand::Agent => "agent",
             CodexCommand::Diff => "diff",
             CodexCommand::Mention => "mention",
             CodexCommand::Status => "status",
+            CodexCommand::DebugConfig => "debug-config",
+            CodexCommand::Statusline => "statusline",
             CodexCommand::Mcp => "mcp",
             CodexCommand::Apps => "apps",
             CodexCommand::Logout => "logout",
             CodexCommand::Quit => "quit",
             CodexCommand::Exit => "exit",
             CodexCommand::Feedback => "feedback",
+            CodexCommand::Rollout => "rollout",
             CodexCommand::Ps => "ps",
+            CodexCommand::Clean => "clean",
             CodexCommand::Personality => "personality",
         }
     }
@@ -103,9 +121,12 @@ impl CodexCommand {
     pub fn description(&self) -> &'static str {
         match self {
             CodexCommand::Model => "choose model and reasoning effort",
-            CodexCommand::Approvals => "choose what Codex can do without approval",
+            CodexCommand::Approvals => "choose what Codex is allowed to do",
             CodexCommand::Permissions => "choose what Codex is allowed to do",
             CodexCommand::ElevateSandbox => "set up elevated agent sandbox",
+            CodexCommand::SandboxReadRoot => {
+                "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
+            }
             CodexCommand::Experimental => "toggle experimental features",
             CodexCommand::Skills => "use skills to improve Codex",
             CodexCommand::Review => "review current changes and find issues",
@@ -114,19 +135,24 @@ impl CodexCommand {
             CodexCommand::Resume => "resume a saved chat",
             CodexCommand::Fork => "fork the current chat",
             CodexCommand::Init => "create AGENTS.md file",
+            CodexCommand::Compact => "summarize conversation to avoid context limit",
             CodexCommand::Plan => "switch to Plan mode",
             CodexCommand::Collab => "change collaboration mode",
             CodexCommand::Agent => "switch the active agent thread",
             CodexCommand::Diff => "show git diff",
             CodexCommand::Mention => "mention a file",
             CodexCommand::Status => "show session config and token usage",
+            CodexCommand::DebugConfig => "show config layers for debugging",
+            CodexCommand::Statusline => "configure status line items",
             CodexCommand::Mcp => "list configured MCP tools",
             CodexCommand::Apps => "manage apps",
             CodexCommand::Logout => "log out of Codex",
             CodexCommand::Quit => "exit Codex",
             CodexCommand::Exit => "exit Codex",
             CodexCommand::Feedback => "send logs to maintainers",
+            CodexCommand::Rollout => "print rollout file path",
             CodexCommand::Ps => "list background terminals",
+            CodexCommand::Clean => "stop all background terminals",
             CodexCommand::Personality => "choose communication style",
         }
     }
@@ -431,7 +457,6 @@ impl SlashPopup {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +466,24 @@ mod tests {
         match parse_command("/resume") {
             Some(ParsedCommand::Codex(CodexCommand::Resume, _)) => {}
             _ => panic!("Should parse as Codex resume"),
+        }
+    }
+
+    #[test]
+    fn test_parse_codex_kebab_case_command() {
+        match parse_command("/debug-config") {
+            Some(ParsedCommand::Codex(CodexCommand::DebugConfig, _)) => {}
+            _ => panic!("Should parse as Codex debug-config"),
+        }
+    }
+
+    #[test]
+    fn test_parse_codex_sandbox_read_root_command() {
+        match parse_command("/sandbox-add-read-dir /tmp") {
+            Some(ParsedCommand::Codex(CodexCommand::SandboxReadRoot, args)) => {
+                assert_eq!(args, "/tmp")
+            }
+            _ => panic!("Should parse as Codex sandbox-add-read-dir"),
         }
     }
 

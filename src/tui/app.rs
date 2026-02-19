@@ -1,11 +1,12 @@
 //! Main TUI application
 
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, MouseEventKind, MouseButton},
+    event::{self, Event, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -14,7 +15,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Stylize,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, RwLock};
@@ -37,7 +40,9 @@ fn make_relative_path(raw_path: &str, cwd: &str) -> String {
 use super::ascii_animation::AsciiAnimation;
 use super::input::{InputAction, InputState};
 use super::picker::{Picker, PickerItem};
-use super::slash_commands::{parse_command, CodexCommand, ParsedCommand, SlashPopup, GugugagaCommand};
+use super::slash_commands::{
+    parse_command, CodexCommand, GugugagaCommand, ParsedCommand, SlashPopup,
+};
 use super::theme::Theme;
 use super::widgets::{
     render_message_lines, HeaderBar, HelpBar, InputBox, Message, MessageRole, StatusBar,
@@ -57,6 +62,18 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Keep at most the last `max_bytes` bytes, aligned to a UTF-8 char boundary.
+fn tail_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len().saturating_sub(max_bytes);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 /// Application phase — welcome screen or main chat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppPhase {
@@ -68,6 +85,8 @@ enum AppPhase {
 /// Frame is 17 rows × 42 cols; leave room for 3 lines of text below.
 const MIN_ANIMATION_WIDTH: u16 = 44;
 const MIN_ANIMATION_HEIGHT: u16 = 20;
+const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
+    ["model-with-reasoning", "context-remaining", "current-dir"];
 
 /// Current picker mode
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,17 +94,18 @@ enum PickerMode {
     None,
     Resume,
     Model,
-    ModelReasoning,   // /model second stage: select reasoning effort
-    GugugagaModel,    // //model — select model for gugugaga supervisor
+    ModelReasoning,         // /model second stage: select reasoning effort
+    GugugagaModel,          // //model — select model for gugugaga supervisor
     GugugagaModelReasoning, // //model second stage: select reasoning effort
-    SkillsMenu,       // First-level: "List skills" / "Enable/Disable"
-    SkillsSelect,     // Second-level: select a skill to insert as $mention
-    SkillsManage,     // Second-level: toggle individual skills on/off
+    SkillsMenu,             // First-level: "List skills" / "Enable/Disable"
+    SkillsSelect,           // Second-level: select a skill to insert as $mention
+    SkillsManage,           // Second-level: toggle individual skills on/off
     Approvals,
     Permissions,
     Personality,
     Collab,
     Agent,
+    Statusline,
 }
 
 /// Type of pending request
@@ -95,6 +115,9 @@ enum PendingRequestType {
     ThreadList,
     ThreadResume(String),
     ThreadRead(String),
+    RolloutPathLookup(String),
+    ThreadCompactStart,
+    ThreadBackgroundTerminalsClean,
     ModelList,
     GugugagaModelList,
     SkillsList,
@@ -103,6 +126,8 @@ enum PendingRequestType {
     McpServerList,
     AppsList,
     ConfigRead,
+    DebugConfigRead,
+    StatusRead,
     FeedbackUpload,
     NewThread,
     ForkThread,
@@ -151,6 +176,23 @@ struct ModelInfoEntry {
     supported_reasoning_efforts: Vec<ModelReasoningEffort>,
     default_reasoning_effort: Option<String>,
     is_default: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TokenUsageSnapshot {
+    total_tokens: i64,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    model_context_window: Option<i64>,
+    turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ActiveTerminal {
+    command: String,
+    recent_output: String,
 }
 
 /// Application state
@@ -214,6 +256,10 @@ pub struct App {
     gugugaga_status: Option<String>,
     /// Pending session restore data from gugugaga/sessionRestore (arrives before thread/resume)
     pending_session_restore: Option<Vec<serde_json::Value>>,
+    /// Latest token usage snapshot from thread/tokenUsage/updated.
+    token_usage_snapshot: Option<TokenUsageSnapshot>,
+    /// Active command execution terminals keyed by item_id.
+    active_terminals: HashMap<String, ActiveTerminal>,
     /// When the current turn started processing (for elapsed time display)
     turn_start_time: Option<std::time::Instant>,
     /// Current application phase (Welcome animation → Chat).
@@ -249,7 +295,11 @@ impl App {
     ) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
 
@@ -292,6 +342,8 @@ impl App {
             notebook_mistakes_count: 0,
             gugugaga_status: None,
             pending_session_restore: None,
+            token_usage_snapshot: None,
+            active_terminals: HashMap::new(),
             turn_start_time: None,
             // Skip the Welcome animation if trust is already established
             phase: if trust_ctx.is_some() {
@@ -320,9 +372,15 @@ impl App {
             let nb = notebook.read().await;
             self.notebook_current_activity = nb.current_activity.clone();
             self.notebook_completed_count = nb.completed.len();
-            self.notebook_attention_items = nb.attention
+            self.notebook_attention_items = nb
+                .attention
                 .iter()
-                .map(|item| (item.content.clone(), item.priority == crate::memory::Priority::High))
+                .map(|item| {
+                    (
+                        item.content.clone(),
+                        item.priority == crate::memory::Priority::High,
+                    )
+                })
                 .collect();
             self.notebook_mistakes_count = nb.mistakes.len();
         }
@@ -345,7 +403,7 @@ impl App {
         let animation_poll = Duration::from_millis(80); // Match animation frame rate
         let mut last_spinner_update = std::time::Instant::now();
         let spinner_interval = Duration::from_millis(80);
-        
+
         // Drain any events queued during terminal setup so they don't
         // trigger an immediate transition out of the Welcome screen.
         while event::poll(Duration::from_millis(0))? {
@@ -385,14 +443,16 @@ impl App {
                                     match key.code {
                                         KeyCode::Char('1') => {
                                             if let Some(ctx) = self.trust_ctx.take() {
-                                                let _ = crate::trust::write_trust_decision(&ctx, true);
+                                                let _ =
+                                                    crate::trust::write_trust_decision(&ctx, true);
                                             }
                                             self.phase = AppPhase::Chat;
                                             self.terminal.clear()?;
                                         }
                                         KeyCode::Char('2') => {
                                             if let Some(ctx) = self.trust_ctx.take() {
-                                                let _ = crate::trust::write_trust_decision(&ctx, false);
+                                                let _ =
+                                                    crate::trust::write_trust_decision(&ctx, false);
                                             }
                                             self.phase = AppPhase::Chat;
                                             self.terminal.clear()?;
@@ -412,31 +472,34 @@ impl App {
                 }
                 AppPhase::Chat => {
                     // ── Main chat phase ──────────────────────────────────
-            // Check for new messages first (non-blocking)
-            self.check_output().await;
-            
-            // Update notebook cache for display
-            self.update_notebook_cache().await;
-            
-            // Update spinner at fixed interval
-            if last_spinner_update.elapsed() >= spinner_interval {
-                self.spinner_frame = self.spinner_frame.wrapping_add(1);
-                last_spinner_update = std::time::Instant::now();
-            }
-            
+                    // Check for new messages first (non-blocking)
+                    self.check_output().await;
+
+                    // Update notebook cache for display
+                    self.update_notebook_cache().await;
+
+                    // Update spinner at fixed interval
+                    if last_spinner_update.elapsed() >= spinner_interval {
+                        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                        last_spinner_update = std::time::Instant::now();
+                    }
+
                     // Draw UI — wrap error for better diagnostics
                     if let Err(e) = self.draw() {
-                        let msg = format!("draw() error: {e}\nmessage_count: {}\n", self.messages.len());
+                        let msg = format!(
+                            "draw() error: {e}\nmessage_count: {}\n",
+                            self.messages.len()
+                        );
                         let _ = std::fs::write("gugugaga-crash.log", &msg);
                         return Err(e);
                     }
 
                     // Poll for keyboard/mouse events with short timeout
-            if event::poll(poll_timeout)? {
+                    if event::poll(poll_timeout)? {
                         match event::read()? {
                             Event::Key(key) => {
-                    self.handle_input(key).await;
-                }
+                                self.handle_input(key).await;
+                            }
                             Event::Mouse(mouse) => {
                                 self.handle_mouse(mouse);
                             }
@@ -560,10 +623,7 @@ impl App {
     fn copy_to_clipboard(text: &str) {
         use std::process::{Command, Stdio};
         // macOS
-        if let Ok(mut child) = Command::new("pbcopy")
-            .stdin(Stdio::piped())
-            .spawn()
-        {
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
             if let Some(mut stdin) = child.stdin.take() {
                 use std::io::Write;
                 let _ = stdin.write_all(text.as_bytes());
@@ -584,16 +644,18 @@ impl App {
             let _ = child.wait();
         }
     }
-    
+
     async fn handle_input(&mut self, key: event::KeyEvent) {
         // Handle approval dialog first (highest priority — modal overlay)
         if let Some(approval) = self.pending_approval.take() {
             match key.code {
                 // y / Enter — Accept (approve this time)
-                crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') |
-                crossterm::event::KeyCode::Enter => {
+                crossterm::event::KeyCode::Char('y')
+                | crossterm::event::KeyCode::Char('Y')
+                | crossterm::event::KeyCode::Enter => {
                     let cmd_display = approval.command.as_deref().unwrap_or("command");
-                    self.messages.push(Message::system(&format!("✓ Approved: {}", cmd_display)));
+                    self.messages
+                        .push(Message::system(&format!("✓ Approved: {}", cmd_display)));
                     self.respond_to_approval_decision(&approval, "accept").await;
                     return;
                 }
@@ -605,29 +667,36 @@ impl App {
                     let amendment = approval.proposed_execpolicy_amendment.clone().unwrap();
                     let prefix = amendment.join(" ");
                     self.messages.push(Message::system(&format!(
-                        "✓ Approved (won't ask again for `{}`)", prefix
+                        "✓ Approved (won't ask again for `{}`)",
+                        prefix
                     )));
-                    self.respond_to_approval_with_amendment(&approval, &amendment).await;
+                    self.respond_to_approval_with_amendment(&approval, &amendment)
+                        .await;
                     return;
                 }
                 // a — Accept for session (file changes: don't ask again for these files)
                 crossterm::event::KeyCode::Char('a') | crossterm::event::KeyCode::Char('A')
                     if matches!(approval.approval_type, ApprovalType::FileChange) =>
                 {
-                    self.messages.push(Message::system("✓ Approved (for session)"));
-                    self.respond_to_approval_decision(&approval, "acceptForSession").await;
+                    self.messages
+                        .push(Message::system("✓ Approved (for session)"));
+                    self.respond_to_approval_decision(&approval, "acceptForSession")
+                        .await;
                     return;
                 }
                 // n / Esc — Cancel (reject + interrupt turn)
-                crossterm::event::KeyCode::Char('n') | crossterm::event::KeyCode::Char('N') |
-                crossterm::event::KeyCode::Esc => {
+                crossterm::event::KeyCode::Char('n')
+                | crossterm::event::KeyCode::Char('N')
+                | crossterm::event::KeyCode::Esc => {
                     self.messages.push(Message::system("✗ Cancelled"));
                     self.respond_to_approval_decision(&approval, "cancel").await;
                     return;
                 }
                 // Ctrl+C during approval — also cancel (same as Codex)
                 crossterm::event::KeyCode::Char('c')
-                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     self.messages.push(Message::system("✗ Cancelled"));
                     self.respond_to_approval_decision(&approval, "cancel").await;
@@ -661,7 +730,7 @@ impl App {
                 }
             }
         }
-        
+
         // Handle picker keys
         if self.picker.visible {
             match key.code {
@@ -745,14 +814,13 @@ impl App {
                     self.send_turn_interrupt().await;
                 } else if self.quit_armed {
                     // Second press within timeout — actually quit
-                self.should_quit = true;
+                    self.should_quit = true;
                 } else {
                     // First press — arm the quit
                     self.quit_armed = true;
                     self.quit_armed_at = Some(std::time::Instant::now());
-                    self.messages.push(Message::system(
-                        "Press Ctrl+C again to quit."
-                    ));
+                    self.messages
+                        .push(Message::system("Press Ctrl+C again to quit."));
                     self.scroll_to_bottom();
                 }
             }
@@ -770,14 +838,19 @@ impl App {
                         return;
                     }
 
-                    if trimmed.eq_ignore_ascii_case("/cancel") || trimmed.eq_ignore_ascii_case("cancel") {
+                    if trimmed.eq_ignore_ascii_case("/cancel")
+                        || trimmed.eq_ignore_ascii_case("cancel")
+                    {
                         self.respond_to_user_input_request(&pending, None).await;
-                        self.messages
-                            .push(Message::system("Sent empty response for pending user input request."));
+                        self.messages.push(Message::system(
+                            "Sent empty response for pending user input request.",
+                        ));
                     } else {
-                        self.respond_to_user_input_request(&pending, Some(trimmed)).await;
-                        self.messages
-                            .push(Message::system("Sent response for pending user input request."));
+                        self.respond_to_user_input_request(&pending, Some(trimmed))
+                            .await;
+                        self.messages.push(Message::system(
+                            "Sent response for pending user input request.",
+                        ));
                     }
                     self.scroll_to_bottom();
                     return;
@@ -806,14 +879,15 @@ impl App {
                 } else {
                     // Regular message to Codex - block if already processing
                     if self.is_processing {
-                        self.messages.push(Message::system("⏳ Please wait for current processing"));
+                        self.messages
+                            .push(Message::system("⏳ Please wait for current processing"));
                         return;
                     }
                     self.messages.push(Message::user(&text));
                     self.scroll_to_bottom();
                     self.start_processing();
 
-                        let msg = self.create_turn_message(&text);
+                    let msg = self.create_turn_message(&text);
                     if let Some(tx) = &self.input_tx {
                         let _ = tx.send(msg).await;
                     }
@@ -841,7 +915,7 @@ impl App {
             InputAction::Escape => {
                 // Priority: slash_popup > running turn > nothing
                 if self.slash_popup.visible {
-                self.slash_popup.close();
+                    self.slash_popup.close();
                 } else if self.is_processing && self.current_turn_id.is_some() {
                     self.send_turn_interrupt().await;
                 }
@@ -930,6 +1004,15 @@ impl App {
         }
     }
 
+    fn set_active_thread_id(&mut self, thread_id: String) {
+        let changed = self.thread_id.as_deref() != Some(thread_id.as_str());
+        self.thread_id = Some(thread_id);
+        if changed {
+            self.active_terminals.clear();
+            self.token_usage_snapshot = None;
+        }
+    }
+
     async fn forward_codex_command(&mut self, cmd: CodexCommand, args: String) {
         match cmd {
             // === Local commands (handled in TUI) ===
@@ -943,13 +1026,16 @@ impl App {
                 self.request_new_thread().await;
             }
             CodexCommand::Status => {
-                self.show_status();
+                self.request_status().await;
             }
             CodexCommand::Diff => {
                 self.show_git_diff().await;
             }
             CodexCommand::Ps => {
                 self.show_background_processes();
+            }
+            CodexCommand::Rollout => {
+                self.show_rollout_path().await;
             }
 
             // === RPC commands (forward to Codex with correct method) ===
@@ -964,7 +1050,8 @@ impl App {
             }
             CodexCommand::Rename => {
                 if args.is_empty() {
-                    self.messages.push(Message::system("Usage: /rename <new name>"));
+                    self.messages
+                        .push(Message::system("Usage: /rename <new name>"));
                 } else {
                     self.request_rename(&args).await;
                 }
@@ -1007,6 +1094,18 @@ impl App {
             CodexCommand::Agent => {
                 self.open_agent_picker().await;
             }
+            CodexCommand::Compact => {
+                self.request_thread_compaction().await;
+            }
+            CodexCommand::Clean => {
+                self.request_background_terminals_clean().await;
+            }
+            CodexCommand::DebugConfig => {
+                self.request_debug_config().await;
+            }
+            CodexCommand::Statusline => {
+                self.open_statusline_picker().await;
+            }
 
             // === Special commands ===
             CodexCommand::Init => {
@@ -1017,9 +1116,14 @@ impl App {
                 self.input.buffer.push('@');
                 self.input.cursor += 1;
             }
+            CodexCommand::SandboxReadRoot => {
+                self.messages.push(Message::system(
+                    "Usage: /sandbox-add-read-dir <absolute-directory-path>",
+                ));
+            }
             CodexCommand::ElevateSandbox => {
                 self.messages.push(Message::system(
-                    "/setup-elevated-sandbox is only available on Windows"
+                    "/setup-default-sandbox is only available on Windows",
                 ));
             }
         }
@@ -1046,71 +1150,321 @@ impl App {
             .to_string();
             let _ = tx.send(msg).await;
             self.messages.clear();
-            self.messages.push(Message::system("Starting new session..."));
+            self.messages
+                .push(Message::system("Starting new session..."));
         }
     }
 
-    /// Show status information
-    fn show_status(&mut self) {
-        let status = format!(
-            "Session Status:\n  Violations detected: {}\n  Corrections made: {}\n  Auto-replies: {}",
-            self.violations_detected,
-            self.corrections_made,
-            self.auto_replies,
-        );
-        self.messages.push(Message::system(&status));
+    /// Request status details from app-server config and combine with local token usage snapshot.
+    async fn request_status(&mut self) {
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::StatusRead;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "config/read",
+                "id": self.request_counter,
+                "params": {
+                    "includeLayers": false,
+                    "cwd": self.cwd.clone()
+                }
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+            self.messages.push(Message::system("Fetching status..."));
+        }
     }
 
-    /// Show git diff
-    async fn show_git_diff(&mut self) {
-        // Run git diff command
-        match tokio::process::Command::new("git")
-            .args(["diff", "--stat"])
+    fn render_status_summary(&self, config_result: &serde_json::Value) -> String {
+        let config = config_result.get("config").unwrap_or(config_result);
+        let model = config
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let provider = config
+            .get("model_provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let reasoning = config
+            .get("model_reasoning_effort")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        let approval = config
+            .get("approval_policy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let sandbox = config
+            .get("sandbox_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let collab = config
+            .get("collaboration_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+
+        let mut lines = vec![
+            "Session status:".to_string(),
+            format!("  thread: {}", self.thread_id.as_deref().unwrap_or("none")),
+            format!(
+                "  model: {} (provider: {}, reasoning: {})",
+                model, provider, reasoning
+            ),
+            format!("  approvals: {}", approval),
+            format!("  sandbox: {}", sandbox),
+            format!("  collaboration: {}", collab),
+            format!("  violations: {}", self.violations_detected),
+            format!("  corrections: {}", self.corrections_made),
+            format!("  auto_replies: {}", self.auto_replies),
+        ];
+
+        if let Some(usage) = &self.token_usage_snapshot {
+            lines.push("  token usage (total):".to_string());
+            lines.push(format!("    total: {}", usage.total_tokens));
+            lines.push(format!(
+                "    input: {} (cached: {})",
+                usage.input_tokens, usage.cached_input_tokens
+            ));
+            lines.push(format!(
+                "    output: {} (reasoning: {})",
+                usage.output_tokens, usage.reasoning_output_tokens
+            ));
+            if let Some(window) = usage.model_context_window {
+                let used_pct = if window > 0 {
+                    ((usage.total_tokens as f64 / window as f64) * 100.0).clamp(0.0, 100.0)
+                } else {
+                    0.0
+                };
+                lines.push(format!(
+                    "    context window: {} ({:.1}% used)",
+                    window, used_pct
+                ));
+            }
+            if let Some(turn_id) = &usage.turn_id {
+                lines.push(format!("    last_turn: {}", turn_id));
+            }
+        } else {
+            lines.push("  token usage: unavailable (no turn usage update yet)".to_string());
+        }
+
+        lines.join("\n")
+    }
+
+    async fn run_git_capture(&self, args: &[&str]) -> Result<String, String> {
+        let output = tokio::process::Command::new("git")
+            .args(args)
             .current_dir(&self.cwd)
             .output()
             .await
-        {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stdout.is_empty() {
-                    self.messages.push(Message::system(&format!("Git diff:\n{}", stdout)));
-                } else if !stderr.is_empty() {
-                    self.messages.push(Message::system(&format!("Git error: {}", stderr)));
-                } else {
-                    self.messages.push(Message::system("No changes detected"));
-                }
-            }
-            Err(e) => {
-                self.messages.push(Message::system(&format!("Failed to run git: {}", e)));
-            }
+            .map_err(|e| e.to_string())?;
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
         }
     }
 
-    /// Show background processes - lists recent command executions from message history
-    fn show_background_processes(&mut self) {
-        let running: Vec<&str> = self.messages.iter()
-            .filter(|m| m.role == MessageRole::CommandExec)
-            .map(|m| m.content.as_str())
-            .collect();
+    /// Show git diff (full patch with staged/unstaged and untracked files list).
+    async fn show_git_diff(&mut self) {
+        match self
+            .run_git_capture(&["rev-parse", "--is-inside-work-tree"])
+            .await
+        {
+            Ok(s) if s.trim() == "true" => {}
+            _ => {
+                self.messages
+                    .push(Message::system("`/diff` — not inside a git repository."));
+                return;
+            }
+        }
 
-        if running.is_empty() {
-            self.messages.push(Message::system("No command executions in this session."));
-        } else {
-            let last_n = running.len().min(10);
-            let display: Vec<String> = running[running.len() - last_n..]
-                .iter()
-                .enumerate()
-                .map(|(i, cmd)| {
-                    let preview = truncate_utf8(cmd, 60);
-                    format!("  [{}] {}", i + 1, preview)
-                })
-                .collect();
-            self.messages.push(Message::system(&format!(
-                "Recent command executions ({}):\n{}",
-                running.len(),
-                display.join("\n")
-            )));
+        let unstaged = self
+            .run_git_capture(&["--no-pager", "diff", "--no-ext-diff"])
+            .await
+            .unwrap_or_default();
+        let staged = self
+            .run_git_capture(&["--no-pager", "diff", "--cached", "--no-ext-diff"])
+            .await
+            .unwrap_or_default();
+        let untracked = self
+            .run_git_capture(&["ls-files", "--others", "--exclude-standard"])
+            .await
+            .unwrap_or_default();
+
+        let mut sections = Vec::new();
+        if !unstaged.trim().is_empty() {
+            sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
+        }
+        if !staged.trim().is_empty() {
+            sections.push(format!("Staged changes:\n{}", staged.trim_end()));
+        }
+        if !untracked.trim().is_empty() {
+            let files = untracked
+                .lines()
+                .map(|line| format!("  - {}", line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            sections.push(format!("Untracked files:\n{}", files));
+        }
+
+        if sections.is_empty() {
+            self.messages.push(Message::system("Working tree clean."));
+            return;
+        }
+
+        let mut body = sections.join("\n\n");
+        const MAX_DIFF_CHARS: usize = 24_000;
+        if body.len() > MAX_DIFF_CHARS {
+            body = format!(
+                "{}\n... (diff truncated)",
+                truncate_utf8(&body, MAX_DIFF_CHARS)
+            );
+        }
+        self.messages.push(Message::system(&body));
+    }
+
+    /// Show currently active command execution terminals.
+    fn show_background_processes(&mut self) {
+        if self.active_terminals.is_empty() {
+            self.messages
+                .push(Message::system("No background terminals are running."));
+            return;
+        }
+
+        let mut entries: Vec<(&String, &ActiveTerminal)> = self.active_terminals.iter().collect();
+        entries.sort_by(|(_, a), (_, b)| a.command.cmp(&b.command));
+
+        let lines = entries
+            .iter()
+            .enumerate()
+            .map(|(idx, (item_id, term))| {
+                let short_id = truncate_utf8(item_id, 8);
+                let output_preview = term
+                    .recent_output
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .map(|line| truncate_utf8(line, 80).to_string())
+                    .unwrap_or_else(|| "(no output yet)".to_string());
+                format!(
+                    "  [{}] {} [{}]\n      {}",
+                    idx + 1,
+                    term.command,
+                    short_id,
+                    output_preview
+                )
+            })
+            .collect::<Vec<_>>();
+
+        self.messages.push(Message::system(&format!(
+            "Background terminals ({}):\n{}",
+            entries.len(),
+            lines.join("\n")
+        )));
+    }
+
+    /// Trigger thread compaction via app-server.
+    async fn request_thread_compaction(&mut self) {
+        let Some(thread_id) = self.thread_id.clone() else {
+            self.messages.push(Message::system(
+                "No active thread. Start or resume a session first.",
+            ));
+            return;
+        };
+
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::ThreadCompactStart;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "thread/compact/start",
+                "id": self.request_counter,
+                "params": {
+                    "threadId": thread_id
+                }
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+            self.messages
+                .push(Message::system("Context compaction requested..."));
+        }
+    }
+
+    /// Stop all background terminals for current thread.
+    async fn request_background_terminals_clean(&mut self) {
+        let Some(thread_id) = self.thread_id.clone() else {
+            self.messages.push(Message::system(
+                "No active thread. Start or resume a session first.",
+            ));
+            return;
+        };
+
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::ThreadBackgroundTerminalsClean;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "thread/backgroundTerminals/clean",
+                "id": self.request_counter,
+                "params": {
+                    "threadId": thread_id
+                }
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+            self.messages
+                .push(Message::system("Stopping background terminals..."));
+        }
+    }
+
+    /// Request full config with layers for /debug-config.
+    async fn request_debug_config(&mut self) {
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::DebugConfigRead;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "config/read",
+                "id": self.request_counter,
+                "params": {
+                    "includeLayers": true,
+                    "cwd": self.cwd.clone()
+                }
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+            self.messages
+                .push(Message::system("Fetching config layers..."));
+        }
+    }
+
+    /// Show rollout path for the current thread by looking it up in thread/list.
+    async fn show_rollout_path(&mut self) {
+        let Some(thread_id) = self.thread_id.clone() else {
+            self.messages.push(Message::system(
+                "No active thread. Start or resume a session first.",
+            ));
+            return;
+        };
+
+        if let Some(tx) = &self.input_tx {
+            self.request_counter += 1;
+            self.pending_request_id = Some(self.request_counter);
+            self.pending_request_type = PendingRequestType::RolloutPathLookup(thread_id);
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "thread/list",
+                "id": self.request_counter,
+                "params": {}
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+            self.messages
+                .push(Message::system("Fetching rollout path..."));
         }
     }
 
@@ -1183,8 +1537,18 @@ impl App {
         self.picker_mode = PickerMode::SkillsMenu;
         self.picker.title = "Skills".to_string();
         let items = vec![
-            PickerItem { id: "list".to_string(), title: "List skills".to_string(), subtitle: "Show all available skills".to_string(), metadata: None },
-            PickerItem { id: "manage".to_string(), title: "Enable/Disable skills".to_string(), subtitle: "Toggle individual skills on/off".to_string(), metadata: None },
+            PickerItem {
+                id: "list".to_string(),
+                title: "List skills".to_string(),
+                subtitle: "Show all available skills".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "manage".to_string(),
+                title: "Enable/Disable skills".to_string(),
+                subtitle: "Toggle individual skills on/off".to_string(),
+                metadata: None,
+            },
         ];
         self.picker.open(items);
     }
@@ -1224,39 +1588,50 @@ impl App {
             })
             .to_string();
             let _ = tx.send(msg).await;
-            let action = if currently_enabled { "Disabled" } else { "Enabled" };
+            let action = if currently_enabled {
+                "Disabled"
+            } else {
+                "Enabled"
+            };
             // Extract just the skill name from the path for display
             let display_name = std::path::Path::new(skill_path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(skill_path);
-            self.messages.push(Message::system(&format!("{} skill: {}", action, display_name)));
+            self.messages.push(Message::system(&format!(
+                "{} skill: {}",
+                action, display_name
+            )));
         }
     }
 
     /// Request code review
     async fn request_review(&mut self) {
         if let Some(thread_id) = &self.thread_id {
-        if let Some(tx) = &self.input_tx {
-            self.request_counter += 1;
-            let msg = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "review/start",
-                "id": self.request_counter,
-                    "params": {
-                        "threadId": thread_id,
-                        "target": {
-                            "type": "uncommittedChanges"
+            if let Some(tx) = &self.input_tx {
+                self.request_counter += 1;
+                let msg = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "review/start",
+                    "id": self.request_counter,
+                        "params": {
+                            "threadId": thread_id,
+                            "target": {
+                                "type": "uncommittedChanges"
+                            }
                         }
-                    }
-            })
-            .to_string();
-            let _ = tx.send(msg).await;
-                self.messages.push(Message::system("Starting code review (uncommitted changes)..."));
+                })
+                .to_string();
+                let _ = tx.send(msg).await;
+                self.messages.push(Message::system(
+                    "Starting code review (uncommitted changes)...",
+                ));
                 self.start_processing();
             }
         } else {
-            self.messages.push(Message::system("No active thread. Start a conversation first."));
+            self.messages.push(Message::system(
+                "No active thread. Start a conversation first.",
+            ));
         }
     }
 
@@ -1278,10 +1653,12 @@ impl App {
                 })
                 .to_string();
                 let _ = tx.send(msg).await;
-                self.messages.push(Message::system(&format!("Renaming to: {}", name)));
+                self.messages
+                    .push(Message::system(&format!("Renaming to: {}", name)));
             }
         } else {
-            self.messages.push(Message::system("No active thread to rename"));
+            self.messages
+                .push(Message::system("No active thread to rename"));
         }
     }
 
@@ -1305,7 +1682,8 @@ impl App {
                 self.messages.push(Message::system("Forking session..."));
             }
         } else {
-            self.messages.push(Message::system("No active thread to fork"));
+            self.messages
+                .push(Message::system("No active thread to fork"));
         }
     }
 
@@ -1364,7 +1742,8 @@ impl App {
             })
             .to_string();
             let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Fetching MCP servers..."));
+            self.messages
+                .push(Message::system("Fetching MCP servers..."));
         }
     }
 
@@ -1391,9 +1770,24 @@ impl App {
         self.picker_mode = PickerMode::Approvals;
         self.picker.title = "Approval Mode".to_string();
         let items = vec![
-            PickerItem { id: "suggest".to_string(), title: "Suggest".to_string(), subtitle: "Approve everything".to_string(), metadata: None },
-            PickerItem { id: "auto-edit".to_string(), title: "Auto Edit".to_string(), subtitle: "Auto-approve file edits".to_string(), metadata: None },
-            PickerItem { id: "full-auto".to_string(), title: "Full Auto".to_string(), subtitle: "Auto-approve everything".to_string(), metadata: None },
+            PickerItem {
+                id: "suggest".to_string(),
+                title: "Suggest".to_string(),
+                subtitle: "Approve everything".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "auto-edit".to_string(),
+                title: "Auto Edit".to_string(),
+                subtitle: "Auto-approve file edits".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "full-auto".to_string(),
+                title: "Full Auto".to_string(),
+                subtitle: "Auto-approve everything".to_string(),
+                metadata: None,
+            },
         ];
         self.picker.open(items);
     }
@@ -1403,9 +1797,24 @@ impl App {
         self.picker_mode = PickerMode::Permissions;
         self.picker.title = "Permissions".to_string();
         let items = vec![
-            PickerItem { id: "read-only".to_string(), title: "Read Only".to_string(), subtitle: "Can only read files".to_string(), metadata: None },
-            PickerItem { id: "workspace-write".to_string(), title: "Workspace Write".to_string(), subtitle: "Can write in workspace".to_string(), metadata: None },
-            PickerItem { id: "full-access".to_string(), title: "Full Access".to_string(), subtitle: "Full system access".to_string(), metadata: None },
+            PickerItem {
+                id: "read-only".to_string(),
+                title: "Read Only".to_string(),
+                subtitle: "Can only read files".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "workspace-write".to_string(),
+                title: "Workspace Write".to_string(),
+                subtitle: "Can write in workspace".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "full-access".to_string(),
+                title: "Full Access".to_string(),
+                subtitle: "Full system access".to_string(),
+                metadata: None,
+            },
         ];
         self.picker.open(items);
     }
@@ -1415,8 +1824,18 @@ impl App {
         self.picker_mode = PickerMode::Personality;
         self.picker.title = "Personality".to_string();
         let items = vec![
-            PickerItem { id: "friendly".to_string(), title: "Friendly".to_string(), subtitle: "Warm and encouraging".to_string(), metadata: None },
-            PickerItem { id: "pragmatic".to_string(), title: "Pragmatic".to_string(), subtitle: "Direct and efficient".to_string(), metadata: None },
+            PickerItem {
+                id: "friendly".to_string(),
+                title: "Friendly".to_string(),
+                subtitle: "Warm and encouraging".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "pragmatic".to_string(),
+                title: "Pragmatic".to_string(),
+                subtitle: "Direct and efficient".to_string(),
+                metadata: None,
+            },
         ];
         self.picker.open(items);
     }
@@ -1435,7 +1854,8 @@ impl App {
             })
             .to_string();
             let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Fetching experimental features..."));
+            self.messages
+                .push(Message::system("Fetching experimental features..."));
         }
     }
 
@@ -1477,7 +1897,8 @@ impl App {
             })
             .to_string();
             let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Switching to Plan mode..."));
+            self.messages
+                .push(Message::system("Switching to Plan mode..."));
         }
     }
 
@@ -1502,12 +1923,45 @@ impl App {
         }
     }
 
+    /// Open status line preset picker.
+    async fn open_statusline_picker(&mut self) {
+        self.picker_mode = PickerMode::Statusline;
+        self.picker.title = "Status Line".to_string();
+        let items = vec![
+            PickerItem {
+                id: "default".to_string(),
+                title: "Default".to_string(),
+                subtitle: "model-with-reasoning, context-remaining, current-dir".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "minimal".to_string(),
+                title: "Minimal".to_string(),
+                subtitle: "model-name, current-dir".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "verbose".to_string(),
+                title: "Verbose".to_string(),
+                subtitle: "model-with-reasoning + context/tokens + current-dir".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "off".to_string(),
+                title: "Off".to_string(),
+                subtitle: "Disable custom status line items".to_string(),
+                metadata: None,
+            },
+        ];
+        self.picker.open(items);
+    }
+
     /// Execute /init command - creates AGENTS.md
     async fn execute_init(&mut self) {
         let init_target = std::path::Path::new(&self.cwd).join("AGENTS.md");
         if init_target.exists() {
             self.messages.push(Message::system(
-                "AGENTS.md already exists. Skipping /init to avoid overwriting it."
+                "AGENTS.md already exists. Skipping /init to avoid overwriting it.",
             ));
             return;
         }
@@ -1524,7 +1978,7 @@ impl App {
 
 Make it comprehensive but concise."#;
 
-            let msg = self.create_turn_message(INIT_PROMPT);
+        let msg = self.create_turn_message(INIT_PROMPT);
         if let Some(tx) = &self.input_tx {
             let _ = tx.send(msg).await;
             self.messages.push(Message::user("/init"));
@@ -1573,7 +2027,8 @@ Make it comprehensive but concise."#;
                     if let Some(tx) = &self.input_tx {
                         self.request_counter += 1;
                         self.pending_request_id = Some(self.request_counter);
-                        self.pending_request_type = PendingRequestType::ThreadResume(item_id.clone());
+                        self.pending_request_type =
+                            PendingRequestType::ThreadResume(item_id.clone());
                         // Build params with both threadId and path (if available).
                         // The path takes precedence in the app-server, bypassing
                         // the potentially unreliable UUID-based file search.
@@ -1664,20 +2119,21 @@ Make it comprehensive but concise."#;
                             .map(|e| e.effort.clone())
                             .or(default_effort);
 
-                        self.set_default_model(&item_id, selected_effort.as_deref()).await;
+                        self.set_default_model(&item_id, selected_effort.as_deref())
+                            .await;
                         let suffix = selected_effort
                             .as_deref()
                             .map(|e| format!(" (reasoning: {e})"))
                             .unwrap_or_default();
-                        self.messages
-                            .push(Message::system(&format!("Model set to: {}{}", item_title, suffix)));
+                        self.messages.push(Message::system(&format!(
+                            "Model set to: {}{}",
+                            item_title, suffix
+                        )));
                     } else {
                         // Fallback if model cache is missing for any reason.
                         self.set_default_model(&item_id, None).await;
-                        self.messages.push(Message::system(&format!(
-                            "Model set to: {}",
-                            item_title
-                        )));
+                        self.messages
+                            .push(Message::system(&format!("Model set to: {}", item_title)));
                     }
                 }
                 PickerMode::ModelReasoning => {
@@ -1791,7 +2247,8 @@ Make it comprehensive but concise."#;
                         } else {
                             Some(item_id.as_str())
                         };
-                        self.persist_gugugaga_model_selection(&model.id, effort).await;
+                        self.persist_gugugaga_model_selection(&model.id, effort)
+                            .await;
                         let suffix = effort
                             .map(|e| format!(" (reasoning: {e})"))
                             .unwrap_or_default();
@@ -1843,24 +2300,71 @@ Make it comprehensive but concise."#;
                     self.toggle_skill(skill_name, currently_enabled).await;
                 }
                 PickerMode::Approvals => {
-                    self.messages.push(Message::system(&format!("Approval mode: {}", item_title)));
-                    self.write_config("approvalPolicy", &serde_json::json!(item_id)).await;
+                    self.messages
+                        .push(Message::system(&format!("Approval mode: {}", item_title)));
+                    self.write_config("approvalPolicy", &serde_json::json!(item_id))
+                        .await;
                 }
                 PickerMode::Permissions => {
-                    self.messages.push(Message::system(&format!("Permissions: {}", item_title)));
-                    self.write_config("sandboxPolicy", &serde_json::json!(item_id)).await;
+                    self.messages
+                        .push(Message::system(&format!("Permissions: {}", item_title)));
+                    self.write_config("sandboxPolicy", &serde_json::json!(item_id))
+                        .await;
                 }
                 PickerMode::Personality => {
-                    self.messages.push(Message::system(&format!("Personality: {}", item_title)));
-                    self.write_config("personality", &serde_json::json!(item_id)).await;
+                    self.messages
+                        .push(Message::system(&format!("Personality: {}", item_title)));
+                    self.write_config("personality", &serde_json::json!(item_id))
+                        .await;
                 }
                 PickerMode::Collab => {
-                    self.messages.push(Message::system(&format!("Collaboration mode: {}", item_title)));
-                    self.write_config("collaborationMode", &serde_json::json!(item_id)).await;
+                    self.messages.push(Message::system(&format!(
+                        "Collaboration mode: {}",
+                        item_title
+                    )));
+                    self.write_config("collaborationMode", &serde_json::json!(item_id))
+                        .await;
                 }
                 PickerMode::Agent => {
-                    self.messages.push(Message::system(&format!("Switched to agent: {}", item_title)));
-                    self.thread_id = Some(item_id);
+                    self.messages.push(Message::system(&format!(
+                        "Switched to agent: {}",
+                        item_title
+                    )));
+                    self.set_active_thread_id(item_id);
+                }
+                PickerMode::Statusline => {
+                    let items: Vec<&str> = match item_id.as_str() {
+                        "default" => DEFAULT_STATUS_LINE_ITEMS.to_vec(),
+                        "minimal" => vec!["model-name", "current-dir"],
+                        "verbose" => vec![
+                            "model-with-reasoning",
+                            "context-remaining",
+                            "context-window-size",
+                            "used-tokens",
+                            "total-input-tokens",
+                            "total-output-tokens",
+                            "current-dir",
+                        ],
+                        "off" => Vec::new(),
+                        _ => DEFAULT_STATUS_LINE_ITEMS.to_vec(),
+                    };
+
+                    let value = serde_json::Value::Array(
+                        items
+                            .iter()
+                            .map(|item| serde_json::Value::String((*item).to_string()))
+                            .collect(),
+                    );
+                    self.write_config("tui.status_line", &value).await;
+                    let summary = if items.is_empty() {
+                        "disabled".to_string()
+                    } else {
+                        items.join(", ")
+                    };
+                    self.messages.push(Message::system(&format!(
+                        "Status line preset: {} ({})",
+                        item_title, summary
+                    )));
                 }
                 PickerMode::None => {}
             }
@@ -1870,7 +2374,7 @@ Make it comprehensive but concise."#;
         self.picker_mode = PickerMode::None;
         self.scroll_to_bottom();
     }
-    
+
     /// Helper: write a config value to Codex via config/value/write
     async fn write_config(&mut self, key_path: &str, value: &serde_json::Value) {
         if let Some(tx) = &self.input_tx {
@@ -1889,7 +2393,7 @@ Make it comprehensive but concise."#;
             let _ = tx.send(msg).await;
         }
     }
-    
+
     /// Set the default model via Codex's setDefaultModel RPC
     async fn set_default_model(&mut self, model_id: &str, reasoning_effort: Option<&str>) {
         if let Some(tx) = &self.input_tx {
@@ -1926,7 +2430,11 @@ Make it comprehensive but concise."#;
     }
 
     /// Send acceptWithExecpolicyAmendment decision (command exec only)
-    async fn respond_to_approval_with_amendment(&mut self, approval: &PendingApproval, amendment: &[String]) {
+    async fn respond_to_approval_with_amendment(
+        &mut self,
+        approval: &PendingApproval,
+        amendment: &[String],
+    ) {
         if let Some(tx) = &self.input_tx {
             let response = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1983,7 +2491,8 @@ Make it comprehensive but concise."#;
                 "jsonrpc": "2.0",
                 "method": "gugugaga/chat",
                 "params": { "message": message }
-            }).to_string();
+            })
+            .to_string();
             let _ = tx.send(msg).await;
         }
 
@@ -1994,7 +2503,8 @@ Make it comprehensive but concise."#;
     async fn execute_gugugaga_command(&mut self, cmd: GugugagaCommand, args: String) {
         match cmd {
             GugugagaCommand::Help => {
-                self.messages.push(Message::system("Gugugaga commands (//):"));
+                self.messages
+                    .push(Message::system("Gugugaga commands (//):"));
                 for c in GugugagaCommand::all() {
                     self.messages.push(Message::system(&format!(
                         "  //{:<12} - {}",
@@ -2003,8 +2513,11 @@ Make it comprehensive but concise."#;
                     )));
                 }
                 self.messages.push(Message::system("\nCodex commands (/):"));
-                self.messages.push(Message::system("  /model, /resume, /new, /status, /diff, etc."));
-                self.messages.push(Message::system("  Type / and press Tab for full list."));
+                self.messages.push(Message::system(
+                    "  /model, /resume, /new, /status, /diff, etc.",
+                ));
+                self.messages
+                    .push(Message::system("  Type / and press Tab for full list."));
             }
             GugugagaCommand::Clear => {
                 self.messages.clear();
@@ -2046,7 +2559,12 @@ Make it comprehensive but concise."#;
                         lines.push("  (none)".to_string());
                     } else {
                         for (i, item) in nb.completed.iter().rev().take(10).enumerate() {
-                            lines.push(format!("  {}. {} — {}", i + 1, item.what, item.significance));
+                            lines.push(format!(
+                                "  {}. {} — {}",
+                                i + 1,
+                                item.what,
+                                item.significance
+                            ));
                         }
                         if nb.completed.len() > 10 {
                             lines.push(format!("  ... and {} more", nb.completed.len() - 10));
@@ -2083,7 +2601,8 @@ Make it comprehensive but concise."#;
 
                     self.messages.push(Message::system(&lines.join("\n")));
                 } else {
-                    self.messages.push(Message::system("No notebook available (not initialized)."));
+                    self.messages
+                        .push(Message::system("No notebook available (not initialized)."));
                 }
             }
         }
@@ -2096,15 +2615,13 @@ Make it comprehensive but concise."#;
         reasoning_effort: Option<&str>,
     ) {
         let config_path = Self::codex_home_dir().join("config.toml");
-        if let Err(e) = Self::write_gugugaga_model_selection(
-            &config_path,
-            model,
-            reasoning_effort,
-        )
-        .await
+        if let Err(e) =
+            Self::write_gugugaga_model_selection(&config_path, model, reasoning_effort).await
         {
-            self.messages
-                .push(Message::system(&format!("Failed to set Gugugaga model: {}", e)));
+            self.messages.push(Message::system(&format!(
+                "Failed to set Gugugaga model: {}",
+                e
+            )));
         }
     }
 
@@ -2118,9 +2635,7 @@ Make it comprehensive but concise."#;
             })
     }
 
-    async fn read_gugugaga_model_reasoning_effort(
-        config_path: &std::path::Path,
-    ) -> Option<String> {
+    async fn read_gugugaga_model_reasoning_effort(config_path: &std::path::Path) -> Option<String> {
         let content = tokio::fs::read_to_string(config_path).await.ok()?;
         let doc = content.parse::<toml_edit::DocumentMut>().ok()?;
         doc.get("gugugaga_model_reasoning_effort")
@@ -2196,7 +2711,8 @@ Make it comprehensive but concise."#;
                 // Show important events
                 if method.contains("error") || method.contains("Error") {
                     let preview = truncate_utf8(msg, 200);
-                    self.messages.push(Message::system(&format!("[{}] {}", method, preview)));
+                    self.messages
+                        .push(Message::system(&format!("[{}] {}", method, preview)));
                 }
             }
         }
@@ -2204,7 +2720,10 @@ Make it comprehensive but concise."#;
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(msg) {
             // Check if this is a server-initiated REQUEST (has both "id" and "method")
             // These are approval requests that need our response
-            if let (Some(id), Some(method)) = (json.get("id").and_then(|i| i.as_u64()), json.get("method").and_then(|m| m.as_str())) {
+            if let (Some(id), Some(method)) = (
+                json.get("id").and_then(|i| i.as_u64()),
+                json.get("method").and_then(|m| m.as_str()),
+            ) {
                 match method {
                     "item/tool/requestUserInput" => {
                         let params = json.get("params").cloned().unwrap_or_default();
@@ -2212,7 +2731,9 @@ Make it comprehensive but concise."#;
                             .unwrap_or_default();
                         let question_ids: Vec<String> = questions
                             .iter()
-                            .filter_map(|q| q.get("id").and_then(|v| v.as_str()).map(ToOwned::to_owned))
+                            .filter_map(|q| {
+                                q.get("id").and_then(|v| v.as_str()).map(ToOwned::to_owned)
+                            })
                             .collect();
 
                         if question_ids.is_empty() {
@@ -2220,7 +2741,8 @@ Make it comprehensive but concise."#;
                                 request_id: id,
                                 question_ids: Vec::new(),
                             };
-                            self.respond_to_user_input_request(&empty_pending, None).await;
+                            self.respond_to_user_input_request(&empty_pending, None)
+                                .await;
                             self.messages.push(Message::system(
                                 "Received a tool user-input request without questions; sent empty response.",
                             ));
@@ -2240,10 +2762,7 @@ Make it comprehensive but concise."#;
                                 .get("header")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Question");
-                            let question = q
-                                .get("question")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let question = q.get("question").and_then(|v| v.as_str()).unwrap_or("");
                             lines.push(format!("{}. {}: {}", idx + 1, header, question));
 
                             if let Some(options) = q.get("options").and_then(|v| v.as_array()) {
@@ -2270,14 +2789,25 @@ Make it comprehensive but concise."#;
                     "item/commandExecution/requestApproval" => {
                         // Command execution approval request
                         let params = json.get("params").cloned().unwrap_or_default();
-                        let command = params.get("command").and_then(|c| c.as_str()).map(String::from);
+                        let command = params
+                            .get("command")
+                            .and_then(|c| c.as_str())
+                            .map(String::from);
                         let cwd = params.get("cwd").and_then(|c| c.as_str()).map(String::from);
-                        let reason = params.get("reason").and_then(|r| r.as_str()).map(String::from);
+                        let reason = params
+                            .get("reason")
+                            .and_then(|r| r.as_str())
+                            .map(String::from);
                         // Extract proposed execpolicy amendment (array of command prefix strings)
-                        let proposed_amendment = params.get("proposedExecpolicyAmendment")
+                        let proposed_amendment = params
+                            .get("proposedExecpolicyAmendment")
                             .and_then(|v| v.as_array())
-                            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect::<Vec<_>>());
-                        
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|s| s.as_str().map(String::from))
+                                    .collect::<Vec<_>>()
+                            });
+
                         self.pending_approval = Some(PendingApproval {
                             request_id: id,
                             approval_type: ApprovalType::CommandExecution,
@@ -2288,7 +2818,7 @@ Make it comprehensive but concise."#;
                             proposed_execpolicy_amendment: proposed_amendment,
                         });
                         self.approval_scroll = 0;
-                        
+
                         // No chat message needed — the overlay will show everything
                         self.scroll_to_bottom();
                         return;
@@ -2296,8 +2826,11 @@ Make it comprehensive but concise."#;
                     "item/fileChange/requestApproval" => {
                         // File change approval request
                         let params = json.get("params").cloned().unwrap_or_default();
-                        let reason = params.get("reason").and_then(|r| r.as_str()).map(String::from);
-                        
+                        let reason = params
+                            .get("reason")
+                            .and_then(|r| r.as_str())
+                            .map(String::from);
+
                         self.pending_approval = Some(PendingApproval {
                             request_id: id,
                             approval_type: ApprovalType::FileChange,
@@ -2308,7 +2841,7 @@ Make it comprehensive but concise."#;
                             proposed_execpolicy_amendment: None,
                         });
                         self.approval_scroll = 0;
-                        
+
                         // No chat message needed — the overlay will show everything
                         self.scroll_to_bottom();
                         return;
@@ -2316,7 +2849,7 @@ Make it comprehensive but concise."#;
                     _ => {} // Not an approval request, continue processing
                 }
             }
-            
+
             // Always capture thread_id from any response that contains result.thread.id
             // This handles initialization thread/start, thread/resume, thread/fork etc.
             if let Some(tid) = json
@@ -2325,9 +2858,9 @@ Make it comprehensive but concise."#;
                 .and_then(|t| t.get("id"))
                 .and_then(|i| i.as_str())
             {
-                self.thread_id = Some(tid.to_string());
+                self.set_active_thread_id(tid.to_string());
             }
-            
+
             // Check if this is a JSON-RPC response (has "id" and "result" or "error")
             if let Some(id) = json.get("id") {
                 // This is a response to a request we made
@@ -2346,8 +2879,9 @@ Make it comprehensive but concise."#;
                         .unwrap_or("Unknown error");
                     // Only show error if it seems relevant (not from init)
                     if self.pending_request_id.is_some() {
-                    self.messages.push(Message::system(&format!("Error: {}", error_msg)));
-                    self.stop_processing();
+                        self.messages
+                            .push(Message::system(&format!("Error: {}", error_msg)));
+                        self.stop_processing();
                         self.pending_request_id = None;
                         self.pending_request_type = PendingRequestType::None;
                         // Close picker if it was open
@@ -2453,34 +2987,55 @@ Make it comprehensive but concise."#;
                 }
                 "item/commandExecution/outputDelta" => {
                     // Command execution output streaming
+                    let item_id = json
+                        .get("params")
+                        .and_then(|p| p.get("itemId").or_else(|| p.get("item_id")))
+                        .and_then(|id| id.as_str())
+                        .map(|s| s.to_string());
                     if let Some(delta) = json
                         .get("params")
                         .and_then(|p| p.get("delta"))
                         .and_then(|t| t.as_str())
                     {
+                        if let Some(item_id) = &item_id {
+                            if let Some(active) = self.active_terminals.get_mut(item_id) {
+                                active.recent_output.push_str(delta);
+                                if active.recent_output.len() > 2000 {
+                                    active.recent_output =
+                                        tail_utf8(&active.recent_output, 2000).to_string();
+                                }
+                            }
+                        }
+
                         self.start_processing();
                         const MAX_OUTPUT_LINES: usize = 50;
                         const MAX_OUTPUT_CHARS: usize = 4000;
-                        
+
                         if let Some(last) = self.messages.last_mut() {
                             if last.role == MessageRole::CommandExec {
                                 // Check if already truncated
                                 if last.content.ends_with("... (output truncated)") {
                                     return;
                                 }
-                                
+
                                 last.content.push_str(delta);
-                                
+
                                 // Truncate if too long
                                 let lines: Vec<&str> = last.content.lines().collect();
-                                if lines.len() > MAX_OUTPUT_LINES || last.content.len() > MAX_OUTPUT_CHARS {
-                                    let truncated: String = lines.iter()
+                                if lines.len() > MAX_OUTPUT_LINES
+                                    || last.content.len() > MAX_OUTPUT_CHARS
+                                {
+                                    let truncated: String = lines
+                                        .iter()
                                         .take(MAX_OUTPUT_LINES)
                                         .map(|s| *s)
                                         .collect::<Vec<_>>()
                                         .join("\n");
                                     let truncated = if truncated.len() > MAX_OUTPUT_CHARS {
-                                        format!("{}...", truncate_utf8(&truncated, MAX_OUTPUT_CHARS))
+                                        format!(
+                                            "{}...",
+                                            truncate_utf8(&truncated, MAX_OUTPUT_CHARS)
+                                        )
                                     } else {
                                         truncated
                                     };
@@ -2524,7 +3079,9 @@ Make it comprehensive but concise."#;
                             let marker = "[turn diff]";
                             let new_content = format!("{}\n{}", marker, diff);
                             let replaced = self.messages.iter_mut().rev().any(|m| {
-                                if m.role == MessageRole::FileChange && m.content.starts_with(marker) {
+                                if m.role == MessageRole::FileChange
+                                    && m.content.starts_with(marker)
+                                {
                                     m.content = new_content.clone();
                                     true
                                 } else {
@@ -2541,18 +3098,41 @@ Make it comprehensive but concise."#;
                 "item/started" => {
                     // Item lifecycle start - show what's happening
                     if let Some(item) = json.get("params").and_then(|p| p.get("item")) {
-                        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+                        let item_type = item
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("unknown");
                         match item_type {
                             "commandExecution" => {
-                                let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("command");
-                                self.messages.push(Message::command_exec(format!("$ {}", cmd)));
+                                let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                                let cmd = item
+                                    .get("command")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("command");
+                                if !item_id.is_empty() {
+                                    self.active_terminals.insert(
+                                        item_id.to_string(),
+                                        ActiveTerminal {
+                                            command: cmd.to_string(),
+                                            recent_output: String::new(),
+                                        },
+                                    );
+                                }
+                                self.messages
+                                    .push(Message::command_exec(format!("$ {}", cmd)));
                             }
                             "fileChange" => {
-                                if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
-                                    let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                                if let Some(changes) =
+                                    item.get("changes").and_then(|c| c.as_array())
+                                {
+                                    let item_id =
+                                        item.get("id").and_then(|i| i.as_str()).unwrap_or("");
                                     let mut full_diff = String::new();
                                     for change in changes {
-                                        let raw_path = change.get("path").and_then(|p| p.as_str()).unwrap_or("file");
+                                        let raw_path = change
+                                            .get("path")
+                                            .and_then(|p| p.as_str())
+                                            .unwrap_or("file");
                                         let path = make_relative_path(raw_path, &self.cwd);
                                         let kind = change.get("kind");
                                         let verb = if let Some(k) = kind.and_then(|k| k.as_str()) {
@@ -2565,7 +3145,9 @@ Make it comprehensive but concise."#;
                                             "Edited"
                                         };
                                         full_diff.push_str(&format!("• {} {}\n", verb, path));
-                                        if let Some(diff) = change.get("diff").and_then(|d| d.as_str()) {
+                                        if let Some(diff) =
+                                            change.get("diff").and_then(|d| d.as_str())
+                                        {
                                             if !diff.trim().is_empty() {
                                                 full_diff.push_str(diff);
                                                 if !diff.ends_with('\n') {
@@ -2577,34 +3159,45 @@ Make it comprehensive but concise."#;
                                     if !full_diff.is_empty() {
                                         // Tag with item_id so item/completed can replace it.
                                         let marker = format!("[fc:{}]", item_id);
-                                        let content = format!("{}\n{}", marker, full_diff.trim_end());
+                                        let content =
+                                            format!("{}\n{}", marker, full_diff.trim_end());
                                         self.messages.push(Message::file_change(&content));
                                     }
                                 }
                             }
                             "contextCompaction" => {
-                                self.messages.push(Message::system("Context compaction in progress..."));
+                                self.messages
+                                    .push(Message::system("Context compaction in progress..."));
                             }
                             "webSearch" => {
-                                let query = item.get("query").and_then(|q| q.as_str()).unwrap_or("...");
-                                self.messages.push(Message::system(&format!("🔍 Searching: {}", query)));
+                                let query =
+                                    item.get("query").and_then(|q| q.as_str()).unwrap_or("...");
+                                self.messages
+                                    .push(Message::system(&format!("🔍 Searching: {}", query)));
                             }
                             "enteredReviewMode" => {
-                                let review = item.get("review").and_then(|r| r.as_str()).unwrap_or("changes");
-                                self.messages.push(Message::system(&format!("📋 Reviewing: {}", review)));
+                                let review = item
+                                    .get("review")
+                                    .and_then(|r| r.as_str())
+                                    .unwrap_or("changes");
+                                self.messages
+                                    .push(Message::system(&format!("📋 Reviewing: {}", review)));
                             }
                             "collabAgentToolCall" => {
-                                let tool = item.get("details")
+                                let tool = item
+                                    .get("details")
                                     .and_then(|d| d.get("tool"))
                                     .and_then(|t| t.as_str())
                                     .unwrap_or("unknown");
-                                let sender = item.get("details")
+                                let sender = item
+                                    .get("details")
                                     .and_then(|d| d.get("senderThreadId"))
                                     .and_then(|s| s.as_str())
                                     .unwrap_or("?");
                                 match tool {
                                     "spawnAgent" => {
-                                        let prompt = item.get("details")
+                                        let prompt = item
+                                            .get("details")
                                             .and_then(|d| d.get("prompt"))
                                             .and_then(|p| p.as_str())
                                             .unwrap_or("");
@@ -2614,23 +3207,27 @@ Make it comprehensive but concise."#;
                                             prompt.to_string()
                                         };
                                         self.messages.push(Message::system(&format!(
-                                            "🔀 Spawning sub-agent: {}", preview
+                                            "🔀 Spawning sub-agent: {}",
+                                            preview
                                         )));
                                     }
                                     "sendInput" => {
                                         self.messages.push(Message::system(&format!(
-                                            "📨 Sending input to agent (from {})", sender
+                                            "📨 Sending input to agent (from {})",
+                                            sender
                                         )));
                                     }
                                     "wait" => {
-                                        self.messages.push(Message::system("⏳ Waiting for sub-agent..."));
+                                        self.messages
+                                            .push(Message::system("⏳ Waiting for sub-agent..."));
                                     }
                                     "closeAgent" => {
                                         self.messages.push(Message::system("🔚 Closing sub-agent"));
                                     }
                                     _ => {
                                         self.messages.push(Message::system(&format!(
-                                            "🤖 Collab: {} (from {})", tool, sender
+                                            "🤖 Collab: {} (from {})",
+                                            tool, sender
                                         )));
                                     }
                                 }
@@ -2643,13 +3240,20 @@ Make it comprehensive but concise."#;
                 "item/completed" => {
                     // Item lifecycle complete
                     if let Some(item) = json.get("params").and_then(|p| p.get("item")) {
-                        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+                        let item_type = item
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("unknown");
                         match item_type {
                             "commandExecution" => {
+                                if let Some(item_id) = item.get("id").and_then(|i| i.as_str()) {
+                                    self.active_terminals.remove(item_id);
+                                }
                                 let exit_code = item.get("exitCode").and_then(|e| e.as_i64());
                                 let duration = item.get("durationMs").and_then(|d| d.as_i64());
 
-                                let dur_str = duration.map(|d| format!(" • {}ms", d)).unwrap_or_default();
+                                let dur_str =
+                                    duration.map(|d| format!(" • {}ms", d)).unwrap_or_default();
                                 let status_line = if exit_code.unwrap_or(0) == 0 {
                                     format!("\n\u{2713}{}", dur_str)
                                 } else {
@@ -2657,10 +3261,15 @@ Make it comprehensive but concise."#;
                                 };
 
                                 // Update the last in-progress CommandExec message
-                                let updated = self.messages.iter_mut().rev()
-                                    .find(|m| m.role == MessageRole::CommandExec
-                                        && !m.content.contains('\u{2713}')
-                                        && !m.content.contains('\u{2717}'))
+                                let updated = self
+                                    .messages
+                                    .iter_mut()
+                                    .rev()
+                                    .find(|m| {
+                                        m.role == MessageRole::CommandExec
+                                            && !m.content.contains('\u{2713}')
+                                            && !m.content.contains('\u{2717}')
+                                    })
                                     .map(|m| {
                                         m.content.push_str(&status_line);
                                         true
@@ -2669,21 +3278,34 @@ Make it comprehensive but concise."#;
 
                                 if !updated {
                                     // Fallback: separate system message
-                                    let code_str = exit_code.map(|c| format!(" (exit {})", c)).unwrap_or_default();
-                                    let dur = duration.map(|d| format!(" in {}ms", d)).unwrap_or_default();
-                                    self.messages.push(Message::system(
-                                        &format!("Command completed{}{}", code_str, dur)
-                                    ));
+                                    let code_str = exit_code
+                                        .map(|c| format!(" (exit {})", c))
+                                        .unwrap_or_default();
+                                    let dur = duration
+                                        .map(|d| format!(" in {}ms", d))
+                                        .unwrap_or_default();
+                                    self.messages.push(Message::system(&format!(
+                                        "Command completed{}{}",
+                                        code_str, dur
+                                    )));
                                 }
                             }
                             "fileChange" => {
                                 let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                                let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("completed");
+                                let status = item
+                                    .get("status")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("completed");
                                 // Build the final diff from completed changes.
-                                if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
+                                if let Some(changes) =
+                                    item.get("changes").and_then(|c| c.as_array())
+                                {
                                     let mut full_diff = String::new();
                                     for change in changes {
-                                        let raw_path = change.get("path").and_then(|p| p.as_str()).unwrap_or("file");
+                                        let raw_path = change
+                                            .get("path")
+                                            .and_then(|p| p.as_str())
+                                            .unwrap_or("file");
                                         let path = make_relative_path(raw_path, &self.cwd);
                                         let kind = change.get("kind");
                                         let verb = if let Some(k) = kind.and_then(|k| k.as_str()) {
@@ -2696,7 +3318,9 @@ Make it comprehensive but concise."#;
                                             "Edited"
                                         };
                                         full_diff.push_str(&format!("• {} {}\n", verb, path));
-                                        if let Some(diff) = change.get("diff").and_then(|d| d.as_str()) {
+                                        if let Some(diff) =
+                                            change.get("diff").and_then(|d| d.as_str())
+                                        {
                                             if !diff.trim().is_empty() {
                                                 full_diff.push_str(diff);
                                                 if !diff.ends_with('\n') {
@@ -2707,10 +3331,13 @@ Make it comprehensive but concise."#;
                                     }
                                     if !full_diff.is_empty() {
                                         let marker = format!("[fc:{}]", item_id);
-                                        let new_content = format!("{}\n{}", marker, full_diff.trim_end());
+                                        let new_content =
+                                            format!("{}\n{}", marker, full_diff.trim_end());
                                         // Replace the in-progress message if it exists.
                                         let replaced = self.messages.iter_mut().rev().any(|m| {
-                                            if m.role == MessageRole::FileChange && m.content.starts_with(&marker) {
+                                            if m.role == MessageRole::FileChange
+                                                && m.content.starts_with(&marker)
+                                            {
                                                 m.content = new_content.clone();
                                                 true
                                             } else {
@@ -2723,7 +3350,10 @@ Make it comprehensive but concise."#;
                                     }
                                 }
                                 let icon = if status == "completed" { "✓" } else { "✘" };
-                                self.messages.push(Message::system(&format!("{} File change {}", icon, status)));
+                                self.messages.push(Message::system(&format!(
+                                    "{} File change {}",
+                                    icon, status
+                                )));
                             }
                             "exitedReviewMode" => {
                                 if let Some(review) = item.get("review").and_then(|r| r.as_str()) {
@@ -2734,31 +3364,34 @@ Make it comprehensive but concise."#;
                                 self.messages.push(Message::system("Context compacted."));
                             }
                             "collabAgentToolCall" => {
-                                let tool = item.get("details")
+                                let tool = item
+                                    .get("details")
                                     .and_then(|d| d.get("tool"))
                                     .and_then(|t| t.as_str())
                                     .unwrap_or("unknown");
-                                let status = item.get("details")
+                                let status = item
+                                    .get("details")
                                     .and_then(|d| d.get("status"))
                                     .and_then(|s| s.as_str())
                                     .unwrap_or("completed");
                                 // Show agent states if available
-                                if let Some(agents) = item.get("details")
+                                if let Some(agents) = item
+                                    .get("details")
                                     .and_then(|d| d.get("agentsStates"))
                                     .and_then(|a| a.as_object())
                                 {
                                     for (agent_id, state) in agents {
-                                        let agent_status = state.get("status")
+                                        let agent_status = state
+                                            .get("status")
                                             .and_then(|s| s.as_str())
                                             .unwrap_or("unknown");
-                                        let msg = state.get("message")
-                                            .and_then(|m| m.as_str());
+                                        let msg = state.get("message").and_then(|m| m.as_str());
                                         let icon = match agent_status {
                                             "completed" => "✅",
                                             "running" => "🔄",
                                             "errored" => "❌",
                                             "shutdown" => "⏹️",
-                                            _ => "🤖"
+                                            _ => "🤖",
                                         };
                                         let short_id = if agent_id.len() > 8 {
                                             truncate_utf8(&agent_id, 8)
@@ -2772,17 +3405,20 @@ Make it comprehensive but concise."#;
                                                 msg.to_string()
                                             };
                                             self.messages.push(Message::system(&format!(
-                                                "{} Agent {}.. {}: {}", icon, short_id, agent_status, preview
+                                                "{} Agent {}.. {}: {}",
+                                                icon, short_id, agent_status, preview
                                             )));
                                         } else {
                                             self.messages.push(Message::system(&format!(
-                                                "{} Agent {}.. {}", icon, short_id, agent_status
+                                                "{} Agent {}.. {}",
+                                                icon, short_id, agent_status
                                             )));
                                         }
                                     }
                                 } else {
                                     self.messages.push(Message::system(&format!(
-                                        "🤖 Collab {} {}", tool, status
+                                        "🤖 Collab {} {}",
+                                        tool, status
                                     )));
                                 }
                             }
@@ -2792,19 +3428,37 @@ Make it comprehensive but concise."#;
                 }
                 "turn/plan/updated" => {
                     // Plan update notification
-                    if let Some(explanation) = json.get("params").and_then(|p| p.get("explanation")).and_then(|e| e.as_str()) {
-                        self.messages.push(Message::system(&format!("📋 Plan: {}", explanation)));
+                    if let Some(explanation) = json
+                        .get("params")
+                        .and_then(|p| p.get("explanation"))
+                        .and_then(|e| e.as_str())
+                    {
+                        self.messages
+                            .push(Message::system(&format!("📋 Plan: {}", explanation)));
                     }
-                    if let Some(plan) = json.get("params").and_then(|p| p.get("plan")).and_then(|p| p.as_array()) {
+                    if let Some(plan) = json
+                        .get("params")
+                        .and_then(|p| p.get("plan"))
+                        .and_then(|p| p.as_array())
+                    {
                         for (i, step) in plan.iter().enumerate() {
-                            let step_text = step.get("step").and_then(|s| s.as_str()).unwrap_or("step");
-                            let status = step.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
+                            let step_text =
+                                step.get("step").and_then(|s| s.as_str()).unwrap_or("step");
+                            let status = step
+                                .get("status")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("pending");
                             let icon = match status {
                                 "completed" => "✓",
                                 "inProgress" => "→",
-                                _ => "○"
+                                _ => "○",
                             };
-                            self.messages.push(Message::system(&format!("  {} {}. {}", icon, i + 1, step_text)));
+                            self.messages.push(Message::system(&format!(
+                                "  {} {}. {}",
+                                icon,
+                                i + 1,
+                                step_text
+                            )));
                         }
                     }
                 }
@@ -2833,7 +3487,7 @@ Make it comprehensive but concise."#;
                     match turn_status {
                         "interrupted" => {
                             self.messages.push(Message::system(
-                                "Turn interrupted — tell the model what to do differently."
+                                "Turn interrupted — tell the model what to do differently.",
                             ));
                         }
                         "failed" => {
@@ -2844,9 +3498,8 @@ Make it comprehensive but concise."#;
                                 .and_then(|e| e.get("message"))
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown error");
-                            self.messages.push(Message::system(
-                                &format!("Turn failed: {}", error_msg)
-                            ));
+                            self.messages
+                                .push(Message::system(&format!("Turn failed: {}", error_msg)));
                         }
                         _ => {} // "completed" — normal
                     }
@@ -2855,14 +3508,64 @@ Make it comprehensive but concise."#;
                     self.current_turn_id = None;
                     self.scroll_to_bottom();
                 }
+                "thread/tokenUsage/updated" => {
+                    if let Some(params) = json.get("params") {
+                        let token_usage = params
+                            .get("tokenUsage")
+                            .or_else(|| params.get("token_usage"));
+                        let total = token_usage
+                            .and_then(|usage| usage.get("total"))
+                            .cloned()
+                            .unwrap_or_default();
+                        let turn_id = params
+                            .get("turnId")
+                            .or_else(|| params.get("turn_id"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let model_context_window = token_usage
+                            .and_then(|usage| {
+                                usage
+                                    .get("modelContextWindow")
+                                    .or_else(|| usage.get("model_context_window"))
+                            })
+                            .and_then(|v| v.as_i64());
+
+                        self.token_usage_snapshot = Some(TokenUsageSnapshot {
+                            total_tokens: total
+                                .get("totalTokens")
+                                .or_else(|| total.get("total_tokens"))
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0),
+                            input_tokens: total
+                                .get("inputTokens")
+                                .or_else(|| total.get("input_tokens"))
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0),
+                            cached_input_tokens: total
+                                .get("cachedInputTokens")
+                                .or_else(|| total.get("cached_input_tokens"))
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0),
+                            output_tokens: total
+                                .get("outputTokens")
+                                .or_else(|| total.get("output_tokens"))
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0),
+                            reasoning_output_tokens: total
+                                .get("reasoningOutputTokens")
+                                .or_else(|| total.get("reasoning_output_tokens"))
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0),
+                            model_context_window,
+                            turn_id,
+                        });
+                    }
+                }
                 "thread/started" => {
                     // Extract thread ID from notification
-                    if let Some(thread) = json
-                        .get("params")
-                        .and_then(|p| p.get("thread"))
-                    {
+                    if let Some(thread) = json.get("params").and_then(|p| p.get("thread")) {
                         if let Some(id) = thread.get("id").and_then(|i| i.as_str()) {
-                            self.thread_id = Some(id.to_string());
+                            self.set_active_thread_id(id.to_string());
                             // Session ready — no startup message needed
                         }
                     }
@@ -2887,14 +3590,21 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("message"))
                         .and_then(|t| t.as_str())
                     {
-                        self.messages.push(Message::system(&format!("⚠️ violations: {}", text)));
+                        self.messages
+                            .push(Message::system(&format!("⚠️ violations: {}", text)));
                         self.scroll_to_bottom();
                     }
                 }
                 "gugugaga/thinking" => {
                     let params = json.get("params");
-                    let status = params.and_then(|p| p.get("status")).and_then(|s| s.as_str()).unwrap_or("");
-                    let message = params.and_then(|p| p.get("message")).and_then(|m| m.as_str()).unwrap_or("");
+                    let status = params
+                        .and_then(|p| p.get("status"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let message = params
+                        .and_then(|p| p.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("");
 
                     match status {
                         "thinking" => {
@@ -2903,7 +3613,10 @@ Make it comprehensive but concise."#;
                         }
                         "thought" => {
                             // Show thinking content in chat (dimmed, like reasoning output)
-                            let duration_ms = params.and_then(|p| p.get("duration_ms")).and_then(|d| d.as_u64()).unwrap_or(0);
+                            let duration_ms = params
+                                .and_then(|p| p.get("duration_ms"))
+                                .and_then(|d| d.as_u64())
+                                .unwrap_or(0);
                             let duration_str = if duration_ms >= 1000 {
                                 format!("{:.1}s", duration_ms as f64 / 1000.0)
                             } else {
@@ -2916,7 +3629,8 @@ Make it comprehensive but concise."#;
                             } else {
                                 first_line.to_string()
                             };
-                            self.gugugaga_status = Some(format!("Thought ({}): {}", duration_str, display));
+                            self.gugugaga_status =
+                                Some(format!("Thought ({}): {}", duration_str, display));
                         }
                         _ => {
                             if !message.is_empty() {
@@ -2927,9 +3641,18 @@ Make it comprehensive but concise."#;
                 }
                 "gugugaga/toolCall" => {
                     let params = json.get("params");
-                    let status = params.and_then(|p| p.get("status")).and_then(|s| s.as_str()).unwrap_or("");
-                    let tool = params.and_then(|p| p.get("tool")).and_then(|t| t.as_str()).unwrap_or("?");
-                    let args = params.and_then(|p| p.get("args")).and_then(|a| a.as_str()).unwrap_or("");
+                    let status = params
+                        .and_then(|p| p.get("status"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let tool = params
+                        .and_then(|p| p.get("tool"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("?");
+                    let args = params
+                        .and_then(|p| p.get("args"))
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("");
 
                     match status {
                         "started" => {
@@ -2937,9 +3660,18 @@ Make it comprehensive but concise."#;
                             self.gugugaga_status = Some(format!("$ {}({})", tool, args));
                         }
                         "completed" => {
-                            let output = params.and_then(|p| p.get("output")).and_then(|o| o.as_str()).unwrap_or("");
-                            let duration_ms = params.and_then(|p| p.get("duration_ms")).and_then(|d| d.as_u64()).unwrap_or(0);
-                            let success = params.and_then(|p| p.get("success")).and_then(|s| s.as_bool()).unwrap_or(true);
+                            let output = params
+                                .and_then(|p| p.get("output"))
+                                .and_then(|o| o.as_str())
+                                .unwrap_or("");
+                            let duration_ms = params
+                                .and_then(|p| p.get("duration_ms"))
+                                .and_then(|d| d.as_u64())
+                                .unwrap_or(0);
+                            let success = params
+                                .and_then(|p| p.get("success"))
+                                .and_then(|s| s.as_bool())
+                                .unwrap_or(true);
 
                             let duration_str = if duration_ms >= 1000 {
                                 format!("{:.1}s", duration_ms as f64 / 1000.0)
@@ -2958,17 +3690,21 @@ Make it comprehensive but concise."#;
                                 content.push_str(&output_lines.join("\n"));
                                 let total_lines = output.lines().count();
                                 if total_lines > 8 {
-                                    content.push_str(&format!("\n... ({} more lines)", total_lines - 8));
+                                    content.push_str(&format!(
+                                        "\n... ({} more lines)",
+                                        total_lines - 8
+                                    ));
                                 }
                                 content.push('\n');
                             }
                             content.push_str(&format!("{} {}", icon, duration_str));
 
                             self.messages.push(Message::gugugaga(&content));
-                        self.scroll_to_bottom();
+                            self.scroll_to_bottom();
 
                             // Update status bar
-                            self.gugugaga_status = Some(format!("{} {}({}) {}", icon, tool, args, duration_str));
+                            self.gugugaga_status =
+                                Some(format!("{} {}({}) {}", icon, tool, args, duration_str));
                         }
                         _ => {}
                     }
@@ -2977,14 +3713,22 @@ Make it comprehensive but concise."#;
                     // Full ordered conversation history for session restore.
                     // Store it; the thread/resume handler will use it instead of
                     // display_turns() to show messages in correct interleaved order.
-                    if let Some(turns) = json.get("params").and_then(|p| p.get("turns")).and_then(|t| t.as_array()) {
+                    if let Some(turns) = json
+                        .get("params")
+                        .and_then(|p| p.get("turns"))
+                        .and_then(|t| t.as_array())
+                    {
                         self.pending_session_restore = Some(turns.clone());
                     }
                 }
                 "gugugaga/chatReply" => {
                     // Direct chat response from Gugugaga
                     self.gugugaga_status = None;
-                    if let Some(msg) = json.get("params").and_then(|p| p.get("message")).and_then(|m| m.as_str()) {
+                    if let Some(msg) = json
+                        .get("params")
+                        .and_then(|p| p.get("message"))
+                        .and_then(|m| m.as_str())
+                    {
                         if !msg.is_empty() {
                             self.messages.push(Message::gugugaga(msg));
                             self.scroll_to_bottom();
@@ -3001,12 +3745,12 @@ Make it comprehensive but concise."#;
                         .and_then(|s| s.as_str())
                         .unwrap_or("ok");
 
-                        let msg = json
-                            .get("params")
-                            .and_then(|p| p.get("message"))
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("");
-                        
+                    let msg = json
+                        .get("params")
+                        .and_then(|p| p.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("");
+
                     if !msg.is_empty() {
                         match status {
                             "ok" => {
@@ -3014,7 +3758,8 @@ Make it comprehensive but concise."#;
                                 if msg.starts_with("🛡️") {
                                     self.messages.push(Message::gugugaga(msg));
                                 } else {
-                                    self.messages.push(Message::gugugaga(&format!("🛡️ {}", msg)));
+                                    self.messages
+                                        .push(Message::gugugaga(&format!("🛡️ {}", msg)));
                                 }
                             }
                             "violation" => {
@@ -3041,7 +3786,8 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("message"))
                         .and_then(|m| m.as_str())
                     {
-                        self.messages.push(Message::system(&format!("Error: {}", msg)));
+                        self.messages
+                            .push(Message::system(&format!("Error: {}", msg)));
                         self.stop_processing();
                     }
                 }
@@ -3054,8 +3800,9 @@ Make it comprehensive but concise."#;
     }
 
     fn handle_rpc_response(&mut self, json: &serde_json::Value) {
-        let request_type = std::mem::replace(&mut self.pending_request_type, PendingRequestType::None);
-        
+        let request_type =
+            std::mem::replace(&mut self.pending_request_type, PendingRequestType::None);
+
         match request_type {
             PendingRequestType::ThreadList => {
                 // Parse thread list response for picker
@@ -3066,34 +3813,37 @@ Make it comprehensive but concise."#;
                             .iter()
                             .filter_map(|thread| {
                                 let id = thread.get("id")?.as_str()?.to_string();
-                                
+
                                 // Extract rollout file path for direct resume
-                                let rollout_path = thread.get("path").and_then(|p| p.as_str()).map(|s| s.to_string());
-                                
+                                let rollout_path = thread
+                                    .get("path")
+                                    .and_then(|p| p.as_str())
+                                    .map(|s| s.to_string());
+
                                 // Filter by cwd - only show sessions from current directory
-                                let thread_cwd = thread.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
+                                let thread_cwd =
+                                    thread.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
                                 if !thread_cwd.is_empty() && thread_cwd != current_cwd {
                                     return None;
                                 }
-                                
+
                                 // Use preview as title (first user message), fallback to id
-                                let preview = thread
-                                    .get("preview")
-                                    .and_then(|p| p.as_str())
-                                    .unwrap_or("");
+                                let preview =
+                                    thread.get("preview").and_then(|p| p.as_str()).unwrap_or("");
                                 let title = if preview.is_empty() {
                                     format!("Session {}", &id[..8.min(id.len())])
                                 } else {
                                     // Truncate long previews (char-safe for UTF-8)
                                     let max_chars = 40;
-                                    let truncated: String = preview.chars().take(max_chars).collect();
+                                    let truncated: String =
+                                        preview.chars().take(max_chars).collect();
                                     if truncated.len() < preview.len() {
                                         format!("{}...", truncated)
                                     } else {
                                         preview.to_string()
                                     }
                                 };
-                                
+
                                 // createdAt is Unix timestamp (i64), convert to date
                                 let created_at = thread
                                     .get("createdAt")
@@ -3101,7 +3851,8 @@ Make it comprehensive but concise."#;
                                     .unwrap_or(0);
                                 let date = if created_at > 0 {
                                     use std::time::{Duration, UNIX_EPOCH};
-                                    let datetime = UNIX_EPOCH + Duration::from_secs(created_at as u64);
+                                    let datetime =
+                                        UNIX_EPOCH + Duration::from_secs(created_at as u64);
                                     let secs_ago = std::time::SystemTime::now()
                                         .duration_since(datetime)
                                         .map(|d| d.as_secs())
@@ -3131,8 +3882,9 @@ Make it comprehensive but concise."#;
                         if items.is_empty() {
                             self.picker.close();
                             self.picker_mode = PickerMode::None;
-                            self.messages
-                                .push(Message::system("No saved sessions found for this directory."));
+                            self.messages.push(Message::system(
+                                "No saved sessions found for this directory.",
+                            ));
                         } else {
                             self.picker.set_items(items);
                         }
@@ -3150,13 +3902,40 @@ Make it comprehensive but concise."#;
                     )));
                 }
             }
+            PendingRequestType::RolloutPathLookup(thread_id) => {
+                if let Some(result) = json.get("result") {
+                    let path = result
+                        .get("data")
+                        .and_then(|d| d.as_array())
+                        .and_then(|threads| {
+                            threads.iter().find_map(|thread| {
+                                let id = thread.get("id").and_then(|v| v.as_str())?;
+                                if id != thread_id {
+                                    return None;
+                                }
+                                thread.get("path").and_then(|p| p.as_str())
+                            })
+                        });
+
+                    match path {
+                        Some(p) if !p.is_empty() => self
+                            .messages
+                            .push(Message::system(&format!("Current rollout path: {}", p))),
+                        _ => self.messages.push(Message::system(
+                            "Rollout path is not available for the current thread.",
+                        )),
+                    }
+                } else {
+                    self.handle_rpc_error(json, "Failed to fetch rollout path");
+                }
+            }
             PendingRequestType::ThreadResume(_thread_id) => {
                 // Handle thread/resume response
                 if let Some(result) = json.get("result") {
                     // Extract thread ID from response and update our state
                     if let Some(thread) = result.get("thread") {
                         if let Some(id) = thread.get("id").and_then(|i| i.as_str()) {
-                            self.thread_id = Some(id.to_string());
+                            self.set_active_thread_id(id.to_string());
 
                             // If we have a pending session restore (from gugugaga/sessionRestore),
                             // use it to display ALL turns (User, Codex, Gugugaga) in correct
@@ -3164,7 +3943,9 @@ Make it comprehensive but concise."#;
                             if let Some(restore_turns) = self.pending_session_restore.take() {
                                 self.display_session_restore(&restore_turns);
                                 self.scroll_to_bottom();
-                            } else if let Some(turns) = thread.get("turns").and_then(|t| t.as_array()) {
+                            } else if let Some(turns) =
+                                thread.get("turns").and_then(|t| t.as_array())
+                            {
                                 if !turns.is_empty() {
                                     self.display_turns(turns);
                                     self.scroll_to_bottom();
@@ -3192,6 +3973,23 @@ Make it comprehensive but concise."#;
                             self.scroll_to_bottom();
                         }
                     }
+                }
+            }
+            PendingRequestType::ThreadCompactStart => {
+                if json.get("result").is_some() {
+                    self.messages
+                        .push(Message::system("Context compaction started."));
+                } else {
+                    self.handle_rpc_error(json, "Failed to start context compaction");
+                }
+            }
+            PendingRequestType::ThreadBackgroundTerminalsClean => {
+                if json.get("result").is_some() {
+                    self.active_terminals.clear();
+                    self.messages
+                        .push(Message::system("Background terminals cleaned."));
+                } else {
+                    self.handle_rpc_error(json, "Failed to clean background terminals");
                 }
             }
             PendingRequestType::ModelList => {
@@ -3269,18 +4067,36 @@ Make it comprehensive but concise."#;
                         for entry in data {
                             if let Some(skills) = entry.get("skills").and_then(|s| s.as_array()) {
                                 for skill in skills {
-                                    let name = skill.get("name").and_then(|n| n.as_str()).unwrap_or("unnamed").to_string();
-                                    let desc = skill.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
-                                    let enabled = skill.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
-                                    let path = skill.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                                    let name = skill
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("unnamed")
+                                        .to_string();
+                                    let desc = skill
+                                        .get("description")
+                                        .and_then(|d| d.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let enabled = skill
+                                        .get("enabled")
+                                        .and_then(|e| e.as_bool())
+                                        .unwrap_or(false);
+                                    let path = skill
+                                        .get("path")
+                                        .and_then(|p| p.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
                                     all_skills.push((name, desc, enabled, path));
                                 }
                             }
                             if let Some(errs) = entry.get("errors").and_then(|e| e.as_array()) {
                                 for err in errs {
                                     // SkillErrorInfo has path and message fields
-                                    let path = err.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                                    let msg = err.get("message").and_then(|m| m.as_str())
+                                    let path =
+                                        err.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                                    let msg = err
+                                        .get("message")
+                                        .and_then(|m| m.as_str())
                                         .unwrap_or_else(|| err.as_str().unwrap_or("unknown error"));
                                     if path.is_empty() {
                                         errors.push(msg.to_string());
@@ -3295,23 +4111,26 @@ Make it comprehensive but concise."#;
                     match self.picker_mode {
                         PickerMode::SkillsSelect => {
                             // Show enabled skills in picker for selection/mention
-                            let enabled_skills: Vec<&(String, String, bool, String)> = all_skills.iter()
+                            let enabled_skills: Vec<&(String, String, bool, String)> = all_skills
+                                .iter()
                                 .filter(|(_, _, enabled, _)| *enabled)
                                 .collect();
 
                             if enabled_skills.is_empty() {
                                 self.picker.close();
                                 self.picker_mode = PickerMode::None;
-                                self.messages.push(Message::system("No enabled skills found."));
+                                self.messages
+                                    .push(Message::system("No enabled skills found."));
                             } else {
-                                let items: Vec<PickerItem> = enabled_skills.iter().map(|(name, desc, _, _)| {
-                                    PickerItem {
+                                let items: Vec<PickerItem> = enabled_skills
+                                    .iter()
+                                    .map(|(name, desc, _, _)| PickerItem {
                                         id: name.clone(),
                                         title: name.clone(),
                                         subtitle: desc.clone(),
                                         metadata: None,
-                                    }
-                                }).collect();
+                                    })
+                                    .collect();
                                 self.picker.set_items(items);
                             }
                         }
@@ -3320,19 +4139,23 @@ Make it comprehensive but concise."#;
                             if all_skills.is_empty() {
                                 self.picker.close();
                                 self.picker_mode = PickerMode::None;
-                                self.messages.push(Message::system("No skills found to manage."));
+                                self.messages
+                                    .push(Message::system("No skills found to manage."));
                             } else {
-                                let items: Vec<PickerItem> = all_skills.iter().map(|(name, desc, enabled, path)| {
-                                    let status = if *enabled { "✓" } else { "✗" };
-                                    let prefix = if *enabled { "enabled" } else { "disabled" };
-                                    PickerItem {
-                                        // Use path as ID since skills/config/write requires path
-                                        id: format!("{}:{}", prefix, path),
-                                        title: format!("{} {}", status, name),
-                                        subtitle: desc.clone(),
-                                        metadata: None,
-                                    }
-                                }).collect();
+                                let items: Vec<PickerItem> = all_skills
+                                    .iter()
+                                    .map(|(name, desc, enabled, path)| {
+                                        let status = if *enabled { "✓" } else { "✗" };
+                                        let prefix = if *enabled { "enabled" } else { "disabled" };
+                                        PickerItem {
+                                            // Use path as ID since skills/config/write requires path
+                                            id: format!("{}:{}", prefix, path),
+                                            title: format!("{} {}", status, name),
+                                            subtitle: desc.clone(),
+                                            metadata: None,
+                                        }
+                                    })
+                                    .collect();
                                 self.picker.set_items(items);
                             }
                         }
@@ -3342,7 +4165,9 @@ Make it comprehensive but concise."#;
                             self.picker_mode = PickerMode::None;
 
                             if all_skills.is_empty() && errors.is_empty() {
-                                self.messages.push(Message::system("No skills found. Add skills via AGENTS.md or ~/.codex/skills/"));
+                                self.messages.push(Message::system(
+                                    "No skills found. Add skills via AGENTS.md or ~/.codex/skills/",
+                                ));
                             } else {
                                 let mut lines = Vec::new();
                                 for (name, desc, enabled, _path) in &all_skills {
@@ -3352,7 +4177,10 @@ Make it comprehensive but concise."#;
                                 for err in &errors {
                                     lines.push(format!("  ⚠ {}", err));
                                 }
-                                self.messages.push(Message::system(&format!("Skills:\n{}", lines.join("\n"))));
+                                self.messages.push(Message::system(&format!(
+                                    "Skills:\n{}",
+                                    lines.join("\n")
+                                )));
                             }
                         }
                     }
@@ -3388,7 +4216,8 @@ Make it comprehensive but concise."#;
                         if items.is_empty() {
                             self.picker.close();
                             self.picker_mode = PickerMode::None;
-                            self.messages.push(Message::system("No collaboration modes available."));
+                            self.messages
+                                .push(Message::system("No collaboration modes available."));
                         } else {
                             self.picker.set_items(items);
                         }
@@ -3396,7 +4225,8 @@ Make it comprehensive but concise."#;
                         self.picker.close();
                         self.picker_mode = PickerMode::None;
                         let text = serde_json::to_string_pretty(result).unwrap_or_default();
-                        self.messages.push(Message::system(&format!("Collaboration modes:\n{}", text)));
+                        self.messages
+                            .push(Message::system(&format!("Collaboration modes:\n{}", text)));
                     }
                 } else {
                     self.picker.close();
@@ -3412,7 +4242,11 @@ Make it comprehensive but concise."#;
                             .iter()
                             .filter_map(|t| {
                                 let id = t.as_str()?.to_string();
-                                let short_id = if id.len() > 12 { truncate_utf8(&id, 12) } else { &id };
+                                let short_id = if id.len() > 12 {
+                                    truncate_utf8(&id, 12)
+                                } else {
+                                    &id
+                                };
                                 Some(PickerItem {
                                     id: id.clone(),
                                     title: format!("Thread {}", short_id),
@@ -3425,7 +4259,8 @@ Make it comprehensive but concise."#;
                         if items.is_empty() {
                             self.picker.close();
                             self.picker_mode = PickerMode::None;
-                            self.messages.push(Message::system("No active agent threads."));
+                            self.messages
+                                .push(Message::system("No active agent threads."));
                         } else {
                             self.picker.set_items(items);
                         }
@@ -3433,7 +4268,8 @@ Make it comprehensive but concise."#;
                         self.picker.close();
                         self.picker_mode = PickerMode::None;
                         let text = serde_json::to_string_pretty(result).unwrap_or_default();
-                        self.messages.push(Message::system(&format!("Agent threads:\n{}", text)));
+                        self.messages
+                            .push(Message::system(&format!("Agent threads:\n{}", text)));
                     }
                 } else {
                     self.picker.close();
@@ -3447,11 +4283,24 @@ Make it comprehensive but concise."#;
 
                     if let Some(servers) = result.get("data").and_then(|s| s.as_array()) {
                         for server in servers {
-                            let name = server.get("name").and_then(|n| n.as_str()).unwrap_or("unnamed");
-                            let auth_status = server.get("authStatus").and_then(|s| s.as_str()).unwrap_or("unknown");
+                            let name = server
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unnamed");
+                            let auth_status = server
+                                .get("authStatus")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("unknown");
                             // tools is a HashMap<String, McpTool>, not an array
-                            let tool_count = server.get("tools").and_then(|t| t.as_object()).map(|o| o.len()).unwrap_or(0);
-                            lines.push(format!("  {} [{}] - {} tools", name, auth_status, tool_count));
+                            let tool_count = server
+                                .get("tools")
+                                .and_then(|t| t.as_object())
+                                .map(|o| o.len())
+                                .unwrap_or(0);
+                            lines.push(format!(
+                                "  {} [{}] - {} tools",
+                                name, auth_status, tool_count
+                            ));
 
                             if let Some(tools) = server.get("tools").and_then(|t| t.as_object()) {
                                 for (tool_name, _tool_info) in tools {
@@ -3462,9 +4311,13 @@ Make it comprehensive but concise."#;
                     }
 
                     if lines.is_empty() {
-                        self.messages.push(Message::system("MCP: No servers configured."));
+                        self.messages
+                            .push(Message::system("MCP: No servers configured."));
                     } else {
-                        self.messages.push(Message::system(&format!("MCP Servers:\n{}", lines.join("\n"))));
+                        self.messages.push(Message::system(&format!(
+                            "MCP Servers:\n{}",
+                            lines.join("\n")
+                        )));
                     }
                 } else {
                     self.handle_rpc_error(json, "Failed to load MCP servers");
@@ -3476,9 +4329,18 @@ Make it comprehensive but concise."#;
 
                     if let Some(apps) = result.get("data").and_then(|a| a.as_array()) {
                         for app in apps {
-                            let name = app.get("name").and_then(|n| n.as_str()).unwrap_or("unnamed");
-                            let desc = app.get("description").and_then(|d| d.as_str()).unwrap_or("");
-                            let accessible = app.get("isAccessible").and_then(|a| a.as_bool()).unwrap_or(false);
+                            let name = app
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unnamed");
+                            let desc = app
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("");
+                            let accessible = app
+                                .get("isAccessible")
+                                .and_then(|a| a.as_bool())
+                                .unwrap_or(false);
                             let status = if accessible { "✓" } else { "✗" };
                             lines.push(format!("  {} {} — {}", status, name, desc));
                         }
@@ -3487,7 +4349,8 @@ Make it comprehensive but concise."#;
                     if lines.is_empty() {
                         self.messages.push(Message::system("No apps configured."));
                     } else {
-                        self.messages.push(Message::system(&format!("Apps:\n{}", lines.join("\n"))));
+                        self.messages
+                            .push(Message::system(&format!("Apps:\n{}", lines.join("\n"))));
                     }
                 } else {
                     self.handle_rpc_error(json, "Failed to load apps");
@@ -3496,22 +4359,46 @@ Make it comprehensive but concise."#;
             PendingRequestType::ConfigRead => {
                 if let Some(result) = json.get("result") {
                     let text = serde_json::to_string_pretty(result).unwrap_or_default();
-                    self.messages.push(Message::system(&format!("Current config:\n{}", text)));
+                    self.messages
+                        .push(Message::system(&format!("Current config:\n{}", text)));
                 } else {
                     self.handle_rpc_error(json, "Failed to read config");
                 }
             }
+            PendingRequestType::DebugConfigRead => {
+                if let Some(result) = json.get("result") {
+                    let text = serde_json::to_string_pretty(result).unwrap_or_default();
+                    self.messages
+                        .push(Message::system(&format!("Debug config:\n{}", text)));
+                } else {
+                    self.handle_rpc_error(json, "Failed to read debug config");
+                }
+            }
+            PendingRequestType::StatusRead => {
+                if let Some(result) = json.get("result") {
+                    let summary = self.render_status_summary(result);
+                    self.messages.push(Message::system(&summary));
+                } else {
+                    self.handle_rpc_error(json, "Failed to load status");
+                }
+            }
             PendingRequestType::FeedbackUpload => {
                 if json.get("result").is_some() {
-                    self.messages.push(Message::system("Feedback uploaded successfully. Thank you!"));
+                    self.messages.push(Message::system(
+                        "Feedback uploaded successfully. Thank you!",
+                    ));
                 } else {
                     self.handle_rpc_error(json, "Failed to upload feedback");
                 }
             }
             PendingRequestType::NewThread => {
                 if let Some(result) = json.get("result") {
-                    if let Some(thread_id) = result.get("thread").and_then(|t| t.get("id")).and_then(|i| i.as_str()) {
-                        self.thread_id = Some(thread_id.to_string());
+                    if let Some(thread_id) = result
+                        .get("thread")
+                        .and_then(|t| t.get("id"))
+                        .and_then(|i| i.as_str())
+                    {
+                        self.set_active_thread_id(thread_id.to_string());
                         self.messages.push(Message::system("New session ready."));
                     }
                 } else {
@@ -3520,9 +4407,14 @@ Make it comprehensive but concise."#;
             }
             PendingRequestType::ForkThread => {
                 if let Some(result) = json.get("result") {
-                    if let Some(thread_id) = result.get("thread").and_then(|t| t.get("id")).and_then(|i| i.as_str()) {
-                        self.thread_id = Some(thread_id.to_string());
-                        self.messages.push(Message::system("Session forked successfully."));
+                    if let Some(thread_id) = result
+                        .get("thread")
+                        .and_then(|t| t.get("id"))
+                        .and_then(|i| i.as_str())
+                    {
+                        self.set_active_thread_id(thread_id.to_string());
+                        self.messages
+                            .push(Message::system("Session forked successfully."));
                     } else {
                         self.messages.push(Message::system("Session forked."));
                     }
@@ -3539,7 +4431,8 @@ Make it comprehensive but concise."#;
             }
             PendingRequestType::Logout => {
                 if json.get("result").is_some() {
-                    self.messages.push(Message::system("Logged out. Exiting..."));
+                    self.messages
+                        .push(Message::system("Logged out. Exiting..."));
                     self.should_quit = true;
                 } else {
                     self.handle_rpc_error(json, "Failed to logout");
@@ -3653,18 +4546,19 @@ Make it comprehensive but concise."#;
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or(fallback);
-            self.messages.push(Message::system(&format!("Error: {}", error_msg)));
+            self.messages
+                .push(Message::system(&format!("Error: {}", error_msg)));
         } else {
             self.messages.push(Message::system(fallback));
         }
     }
-    
+
     fn request_thread_read(&mut self, thread_id: String) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
             self.pending_request_id = Some(self.request_counter);
             self.pending_request_type = PendingRequestType::ThreadRead(thread_id.clone());
-            
+
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "thread/read",
@@ -3675,7 +4569,7 @@ Make it comprehensive but concise."#;
                 }
             })
             .to_string();
-            
+
             // Use try_send since we're not in async context
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -3719,7 +4613,9 @@ Make it comprehensive but concise."#;
                                 }
                             }
                             if reasoning_text.is_empty() {
-                                if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                                if let Some(content) =
+                                    item.get("content").and_then(|c| c.as_array())
+                                {
                                     for c in content {
                                         if let Some(t) = c.as_str() {
                                             if !reasoning_text.is_empty() {
@@ -3738,21 +4634,29 @@ Make it comprehensive but concise."#;
                             let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("?");
                             let exit_code = item.get("exitCode").and_then(|e| e.as_i64());
                             let duration = item.get("durationMs").and_then(|d| d.as_i64());
-                            let output = item.get("aggregatedOutput").and_then(|o| o.as_str()).unwrap_or("");
+                            let output = item
+                                .get("aggregatedOutput")
+                                .and_then(|o| o.as_str())
+                                .unwrap_or("");
 
                             let mut msg = format!("$ {}", cmd);
 
                             if !output.is_empty() {
                                 let max_output = 2000;
                                 if output.len() > max_output {
-                                    msg.push_str(&format!("\n{}...\n... (output truncated)", &output[..max_output]));
+                                    msg.push_str(&format!(
+                                        "\n{}...\n... (output truncated)",
+                                        &output[..max_output]
+                                    ));
                                 } else {
                                     msg.push_str(&format!("\n{}", output));
                                 }
                             }
 
                             // Status line matching new renderer format
-                            let dur_str = duration.map(|d| format!(" \u{2022} {}ms", d)).unwrap_or_default();
+                            let dur_str = duration
+                                .map(|d| format!(" \u{2022} {}ms", d))
+                                .unwrap_or_default();
                             if exit_code.unwrap_or(0) == 0 {
                                 msg.push_str(&format!("\n\u{2713}{}", dur_str));
                             } else if let Some(code) = exit_code {
@@ -3765,11 +4669,13 @@ Make it comprehensive but concise."#;
                             if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
                                 let mut full_diff = String::new();
                                 for change in changes {
-                                    let raw_path = change.get("path")
+                                    let raw_path = change
+                                        .get("path")
                                         .and_then(|p| p.as_str())
                                         .unwrap_or("unknown");
                                     let path = make_relative_path(raw_path, &self.cwd);
-                                    let kind = change.get("kind")
+                                    let kind = change
+                                        .get("kind")
                                         .and_then(|k| k.get("type"))
                                         .and_then(|t| t.as_str())
                                         .unwrap_or("update");
@@ -3779,7 +4685,8 @@ Make it comprehensive but concise."#;
                                         _ => "Edited",
                                     };
                                     full_diff.push_str(&format!("\u{2022} {} {}\n", verb, path));
-                                    if let Some(diff) = change.get("diff").and_then(|d| d.as_str()) {
+                                    if let Some(diff) = change.get("diff").and_then(|d| d.as_str())
+                                    {
                                         if !diff.trim().is_empty() {
                                             full_diff.push_str(diff);
                                             if !diff.ends_with('\n') {
@@ -3789,14 +4696,16 @@ Make it comprehensive but concise."#;
                                     }
                                 }
                                 if !full_diff.is_empty() {
-                                    self.messages.push(Message::file_change(full_diff.trim_end()));
+                                    self.messages
+                                        .push(Message::file_change(full_diff.trim_end()));
                                 }
                             }
                         }
                         "plan" => {
                             if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
-                                    self.messages.push(Message::system(&format!("Plan: {}", text)));
+                                    self.messages
+                                        .push(Message::system(&format!("Plan: {}", text)));
                                 }
                             }
                         }
@@ -3811,7 +4720,10 @@ Make it comprehensive but concise."#;
     /// in their original chronological order.
     fn display_session_restore(&mut self, restore_turns: &[serde_json::Value]) {
         for turn in restore_turns {
-            let role = turn.get("role").and_then(|r| r.as_str()).unwrap_or("unknown");
+            let role = turn
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unknown");
             let raw_content = turn.get("content").and_then(|c| c.as_str()).unwrap_or("");
             if raw_content.is_empty() {
                 continue;
@@ -4064,7 +4976,14 @@ Make it comprehensive but concise."#;
             f.render_widget(status, main_chunks[2]);
 
             // Messages (full width, no side panel)
-            let (lines_text, inner_rect) = Self::render_messages(f, main_chunks[1], messages, scroll_offset, sel_anchor, sel_end);
+            let (lines_text, inner_rect) = Self::render_messages(
+                f,
+                main_chunks[1],
+                messages,
+                scroll_offset,
+                sel_anchor,
+                sel_end,
+            );
             captured_lines = lines_text;
             captured_rect = inner_rect;
 
@@ -4092,9 +5011,13 @@ Make it comprehensive but concise."#;
             // Help bar
             if pending_approval.is_some() {
                 // When approval overlay is shown, show minimal hint in help bar
-                let hint = ratatui::widgets::Paragraph::new(
-                    " Approval pending — see overlay above "
-                ).style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow).bg(ratatui::style::Color::DarkGray));
+                let hint =
+                    ratatui::widgets::Paragraph::new(" Approval pending — see overlay above ")
+                        .style(
+                            ratatui::style::Style::default()
+                                .fg(ratatui::style::Color::Yellow)
+                                .bg(ratatui::style::Color::DarkGray),
+                        );
                 f.render_widget(hint, main_chunks[4]);
             } else {
                 f.render_widget(HelpBar, main_chunks[4]);
@@ -4173,11 +5096,18 @@ Make it comprehensive but concise."#;
         f.render_widget(paragraph, popup_area);
     }
 
-    fn render_approval_overlay(f: &mut Frame, area: Rect, approval: &PendingApproval, scroll: usize) {
+    fn render_approval_overlay(
+        f: &mut Frame,
+        area: Rect,
+        approval: &PendingApproval,
+        scroll: usize,
+    ) {
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
 
-        let opt_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let opt_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
         let desc_style = Style::default().fg(Color::White);
 
         // --- Build footer lines (options) — these are ALWAYS visible ---
@@ -4193,10 +5123,7 @@ Make it comprehensive but concise."#;
                     let prefix = amendment.join(" ");
                     footer_lines.push(Line::from(vec![
                         Span::styled("  [p] ", opt_style),
-                        Span::styled(
-                            format!("Yes, don't ask again for `{}`", prefix),
-                            desc_style,
-                        ),
+                        Span::styled(format!("Yes, don't ask again for `{}`", prefix), desc_style),
                     ]));
                 }
             }
@@ -4226,14 +5153,21 @@ Make it comprehensive but concise."#;
         };
         content_lines.push(Line::from(Span::styled(
             title_text,
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )));
         content_lines.push(Line::from(""));
 
         if let Some(ref reason) = approval.reason {
             content_lines.push(Line::from(vec![
                 Span::styled("Reason: ", Style::default().fg(Color::Gray)),
-                Span::styled(reason.as_str(), Style::default().fg(Color::White).add_modifier(Modifier::ITALIC)),
+                Span::styled(
+                    reason.as_str(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::ITALIC),
+                ),
             ]));
             content_lines.push(Line::from(""));
         }
@@ -4242,7 +5176,12 @@ Make it comprehensive but concise."#;
             ApprovalType::CommandExecution => {
                 let cmd = approval.command.as_deref().unwrap_or("(unknown)");
                 content_lines.push(Line::from(vec![
-                    Span::styled("  $ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "  $ ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(cmd.to_string(), Style::default().fg(Color::White)),
                 ]));
                 if let Some(ref cwd) = approval.cwd {
@@ -4268,7 +5207,12 @@ Make it comprehensive but concise."#;
 
         let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
         let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
-        let overlay_area = Rect { x, y, width: overlay_width, height: overlay_height };
+        let overlay_area = Rect {
+            x,
+            y,
+            width: overlay_width,
+            height: overlay_height,
+        };
 
         f.render_widget(Clear, overlay_area);
 
@@ -4278,7 +5222,9 @@ Make it comprehensive but concise."#;
             .border_style(Style::default().fg(Color::Yellow))
             .title_top(Line::styled(
                 " ⚡ APPROVAL REQUIRED ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(overlay_area);
         f.render_widget(block, overlay_area);
@@ -4307,7 +5253,11 @@ Make it comprehensive but concise."#;
             x: inner.x,
             y: inner.y + content_height + sep_area.height,
             width: inner.width,
-            height: footer_height.min(inner.height.saturating_sub(content_height + sep_area.height)),
+            height: footer_height.min(
+                inner
+                    .height
+                    .saturating_sub(content_height + sep_area.height),
+            ),
         };
 
         // Render content with scroll support
@@ -4322,8 +5272,7 @@ Make it comprehensive but concise."#;
             .take(content_h)
             .collect();
 
-        let content_para = Paragraph::new(visible_content)
-            .wrap(Wrap { trim: false });
+        let content_para = Paragraph::new(visible_content).wrap(Wrap { trim: false });
         f.render_widget(content_para, content_area);
 
         // Scroll indicator (if content is scrollable)
@@ -4418,11 +5367,12 @@ Make it comprehensive but concise."#;
 
         // Apply selection highlight if there's an active selection
         let visible = if let (Some(anchor), Some(end)) = (sel_anchor, sel_end) {
-            let (sel_start, sel_finish) = if anchor.0 < end.0 || (anchor.0 == end.0 && anchor.1 <= end.1) {
-                (anchor, end)
-            } else {
-                (end, anchor)
-            };
+            let (sel_start, sel_finish) =
+                if anchor.0 < end.0 || (anchor.0 == end.0 && anchor.1 <= end.1) {
+                    (anchor, end)
+                } else {
+                    (end, anchor)
+                };
 
             visible
                 .into_iter()
@@ -4431,8 +5381,16 @@ Make it comprehensive but concise."#;
                     let row = i as u16;
                     if row >= sel_start.0 && row <= sel_finish.0 {
                         // This line is (at least partially) selected
-                        let col_start = if row == sel_start.0 { sel_start.1 as usize } else { 0 };
-                        let col_end = if row == sel_finish.0 { sel_finish.1 as usize + 1 } else { usize::MAX };
+                        let col_start = if row == sel_start.0 {
+                            sel_start.1 as usize
+                        } else {
+                            0
+                        };
+                        let col_end = if row == sel_finish.0 {
+                            sel_finish.1 as usize + 1
+                        } else {
+                            usize::MAX
+                        };
 
                         // Rebuild spans with selection highlight
                         let mut new_spans = Vec::new();
@@ -4448,7 +5406,10 @@ Make it comprehensive but concise."#;
                                 // Entirely inside selection
                                 new_spans.push(Span::styled(
                                     span.content.clone(),
-                                    span.style.bg(Color::White).fg(Color::Black).remove_modifier(Modifier::all()),
+                                    span.style
+                                        .bg(Color::White)
+                                        .fg(Color::Black)
+                                        .remove_modifier(Modifier::all()),
                                 ));
                             } else {
                                 // Partially selected — split the span
@@ -4460,10 +5421,14 @@ Make it comprehensive but concise."#;
                                     let before: String = chars[..local_start].iter().collect();
                                     new_spans.push(Span::styled(before, span.style));
                                 }
-                                let selected: String = chars[local_start..local_end].iter().collect();
+                                let selected: String =
+                                    chars[local_start..local_end].iter().collect();
                                 new_spans.push(Span::styled(
                                     selected,
-                                    span.style.bg(Color::White).fg(Color::Black).remove_modifier(Modifier::all()),
+                                    span.style
+                                        .bg(Color::White)
+                                        .fg(Color::Black)
+                                        .remove_modifier(Modifier::all()),
                                 ));
                                 if local_end < span_len {
                                     let after: String = chars[local_end..].iter().collect();
