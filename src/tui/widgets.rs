@@ -569,9 +569,11 @@ impl Widget for InputBox<'_> {
 }
 
 /// Help bar showing key bindings
-pub struct HelpBar;
+pub struct HelpBar<'a> {
+    pub collaboration_mode_hint: Option<&'a str>,
+}
 
-impl Widget for HelpBar {
+impl Widget for HelpBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let bindings = [
             ("/", "Codex"),
@@ -589,6 +591,14 @@ impl Widget for HelpBar {
             }
             spans.push(Span::styled(*key, Theme::key()));
             spans.push(Span::styled(format!(" {}", desc), Theme::key_desc()));
+        }
+
+        if let Some(mode_hint) = self.collaboration_mode_hint {
+            spans.push(Span::styled(" │ ", Theme::muted()));
+            spans.push(Span::styled(
+                mode_hint.to_string(),
+                Theme::muted().add_modifier(Modifier::ITALIC),
+            ));
         }
 
         let line = Line::from(spans);

@@ -547,6 +547,10 @@ pub struct App {
     rate_limit_snapshot: Option<RateLimitSnapshotCache>,
     /// Latest account auth mode from account/updated (e.g. apikey/chatgpt).
     account_auth_mode: Option<String>,
+    /// Current collaboration mode key (e.g. "default", "plan") for UI indicator.
+    collaboration_mode: Option<String>,
+    /// Last known collaboration mode options for Shift+Tab cycling.
+    collaboration_mode_options: Vec<String>,
     /// Active command execution terminals keyed by item_id.
     active_terminals: HashMap<String, ActiveTerminal>,
     /// Images attached via clipboard paste (Ctrl/Alt+V or pasted file paths).
@@ -643,6 +647,8 @@ impl App {
             token_usage_snapshot: None,
             rate_limit_snapshot: None,
             account_auth_mode: None,
+            collaboration_mode: Some("default".to_string()),
+            collaboration_mode_options: vec!["default".to_string(), "plan".to_string()],
             active_terminals: HashMap::new(),
             attached_images: Vec::new(),
             pending_large_pastes: Vec::new(),
@@ -1191,6 +1197,19 @@ impl App {
             return;
         }
         if is_escape && self.interrupt_active_work().await {
+            return;
+        }
+
+        let is_shift_tab = matches!(key.code, crossterm::event::KeyCode::BackTab);
+        if is_shift_tab && !self.picker.visible && !self.slash_popup.visible {
+            if self.is_processing || self.gugugaga_status.is_some() {
+                self.messages.push(Message::system(
+                    "Cannot switch collaboration mode while a task is running.",
+                ));
+                self.scroll_to_bottom();
+            } else {
+                self.cycle_collaboration_mode_shortcut().await;
+            }
             return;
         }
 
@@ -1816,6 +1835,7 @@ impl App {
         let collab = config
             .get("collaboration_mode")
             .and_then(|v| v.as_str())
+            .or(self.collaboration_mode.as_deref())
             .unwrap_or("-");
 
         let permissions = if approval == "on-request" && sandbox == "workspace-write" {
@@ -2876,26 +2896,131 @@ impl App {
         }
     }
 
+    fn normalize_collaboration_mode_key(mode: &str) -> String {
+        let trimmed = mode.trim();
+        if trimmed.is_empty() {
+            "default".to_string()
+        } else {
+            trimmed.to_ascii_lowercase()
+        }
+    }
+
+    fn collaboration_mode_title(mode: &str) -> String {
+        match mode {
+            "plan" => "Plan mode".to_string(),
+            "default" => "Default mode".to_string(),
+            other => {
+                let mut chars = other.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let mut label = first.to_uppercase().to_string();
+                        label.push_str(chars.as_str());
+                        format!("{label} mode")
+                    }
+                    None => "Default mode".to_string(),
+                }
+            }
+        }
+    }
+
+    fn collaboration_mode_hint_text(&self) -> Option<String> {
+        self.collaboration_mode.as_deref().map(|mode| {
+            format!(
+                "{} (shift+tab to cycle)",
+                Self::collaboration_mode_title(mode)
+            )
+        })
+    }
+
+    fn set_collaboration_mode_options(&mut self, options: Vec<String>) {
+        let mut dedup = Vec::<String>::new();
+        for item in options {
+            let normalized = Self::normalize_collaboration_mode_key(&item);
+            if !dedup.iter().any(|existing| existing == &normalized) {
+                dedup.push(normalized);
+            }
+        }
+        if dedup.is_empty() {
+            dedup.push("default".to_string());
+            dedup.push("plan".to_string());
+        }
+        self.collaboration_mode_options = dedup;
+    }
+
+    fn maybe_update_collaboration_mode_from_config_result(&mut self, result: &serde_json::Value) {
+        let config = result.get("config").unwrap_or(result);
+        let mode = config
+            .get("collaboration_mode")
+            .or_else(|| config.get("collaborationMode"))
+            .and_then(|value| value.as_str())
+            .map(Self::normalize_collaboration_mode_key);
+        if let Some(mode) = mode {
+            self.collaboration_mode = Some(mode.clone());
+            if !self
+                .collaboration_mode_options
+                .iter()
+                .any(|item| item == &mode)
+            {
+                self.collaboration_mode_options.push(mode);
+            }
+        }
+    }
+
+    fn next_collaboration_mode_key(&self) -> String {
+        let options = if self.collaboration_mode_options.is_empty() {
+            vec!["default".to_string(), "plan".to_string()]
+        } else {
+            self.collaboration_mode_options.clone()
+        };
+
+        let current = self
+            .collaboration_mode
+            .as_deref()
+            .map(Self::normalize_collaboration_mode_key);
+        if let Some(current_mode) = current {
+            if let Some(idx) = options.iter().position(|item| item == &current_mode) {
+                return options[(idx + 1) % options.len()].clone();
+            }
+        }
+        options
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    async fn set_collaboration_mode(&mut self, mode: &str, announce: bool) {
+        let normalized = Self::normalize_collaboration_mode_key(mode);
+        self.collaboration_mode = Some(normalized.clone());
+        if !self
+            .collaboration_mode_options
+            .iter()
+            .any(|item| item == &normalized)
+        {
+            self.collaboration_mode_options.push(normalized.clone());
+        }
+
+        self.write_config("collaborationMode", &serde_json::json!(normalized))
+            .await;
+
+        if announce {
+            self.messages.push(Message::system(format!(
+                "Collaboration mode: {}",
+                Self::collaboration_mode_title(
+                    self.collaboration_mode.as_deref().unwrap_or("default")
+                )
+            )));
+            self.scroll_to_bottom();
+        }
+    }
+
+    async fn cycle_collaboration_mode_shortcut(&mut self) {
+        let next = self.next_collaboration_mode_key();
+        self.set_collaboration_mode(&next, true).await;
+    }
+
     /// Set plan mode directly
     async fn set_plan_mode(&mut self) {
-        // Plan mode is a specific collaboration mode
-        if let Some(tx) = &self.input_tx {
-            self.request_counter += 1;
-            let msg = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "config/value/write",
-                "id": self.request_counter,
-                "params": {
-                    "keyPath": "collaborationMode",
-                    "value": "plan",
-                    "mergeStrategy": "replace"
-                }
-            })
-            .to_string();
-            let _ = tx.send(msg).await;
-            self.messages
-                .push(Message::system("Switching to Plan mode..."));
-        }
+        self.set_collaboration_mode("plan", true).await;
     }
 
     /// Open agent thread picker
@@ -3404,12 +3529,15 @@ Make it comprehensive but concise."#;
                         .await;
                 }
                 PickerMode::Collab => {
+                    self.set_collaboration_mode(&item_id, false).await;
                     self.messages.push(Message::system(format!(
                         "Collaboration mode: {}",
-                        item_title
+                        if item_title.is_empty() {
+                            Self::collaboration_mode_title(&item_id)
+                        } else {
+                            item_title
+                        }
                     )));
-                    self.write_config("collaborationMode", &serde_json::json!(item_id))
-                        .await;
                 }
                 PickerMode::Agent => {
                     self.messages.push(Message::system(format!(
@@ -5480,6 +5608,13 @@ Make it comprehensive but concise."#;
             PendingRequestType::CollabModeList => {
                 if let Some(result) = json.get("result") {
                     if let Some(modes) = result.get("data").and_then(|m| m.as_array()) {
+                        let options: Vec<String> = modes
+                            .iter()
+                            .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                            .map(Self::normalize_collaboration_mode_key)
+                            .collect();
+                        self.set_collaboration_mode_options(options);
+
                         let items: Vec<PickerItem> = modes
                             .iter()
                             .filter_map(|m| {
@@ -5645,6 +5780,7 @@ Make it comprehensive but concise."#;
             }
             PendingRequestType::ConfigRead => {
                 if let Some(result) = json.get("result") {
+                    self.maybe_update_collaboration_mode_from_config_result(result);
                     let text = serde_json::to_string_pretty(result).unwrap_or_default();
                     self.messages
                         .push(Message::system(format!("Current config:\n{}", text)));
@@ -5663,6 +5799,7 @@ Make it comprehensive but concise."#;
             }
             PendingRequestType::StatusRead => {
                 if let Some(result) = json.get("result") {
+                    self.maybe_update_collaboration_mode_from_config_result(result);
                     let summary = self.render_status_summary(result);
                     self.messages.push(Message::system(&summary));
                 } else {
@@ -6273,6 +6410,7 @@ Make it comprehensive but concise."#;
         let pending_approval = &self.pending_approval;
         let approval_scroll = self.approval_scroll;
         let gugugaga_status = &self.gugugaga_status;
+        let collaboration_mode_hint = self.collaboration_mode_hint_text();
         let elapsed_secs = self.turn_start_time.map(|t| t.elapsed().as_secs_f64());
         let sel_anchor = self.sel_anchor;
         let sel_end = self.sel_end;
@@ -6374,7 +6512,12 @@ Make it comprehensive but concise."#;
                         );
                 f.render_widget(hint, main_chunks[4]);
             } else {
-                f.render_widget(HelpBar, main_chunks[4]);
+                f.render_widget(
+                    HelpBar {
+                        collaboration_mode_hint: collaboration_mode_hint.as_deref(),
+                    },
+                    main_chunks[4],
+                );
             }
 
             // Render picker overlay (on top of everything)

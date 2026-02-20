@@ -321,7 +321,6 @@ impl InputState {
             self.cursor = self.char_count();
         }
     }
-
 }
 
 #[cfg(test)]
