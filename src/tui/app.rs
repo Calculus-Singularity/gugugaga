@@ -14,7 +14,6 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::Stylize,
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -213,8 +212,8 @@ use super::slash_commands::{
 };
 use super::theme::Theme;
 use super::widgets::{
-    render_message_lines, wrapped_input_cursor_position, HeaderBar, HelpBar, InputBox, Message,
-    MessageRole, StatusBar,
+    render_message_lines, truncate_to_width_str, wrapped_input_cursor_position, HeaderBar, HelpBar,
+    InputBox, Message, MessageRole, StatusBar,
 };
 
 /// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
@@ -1270,6 +1269,14 @@ impl App {
                 }
                 crossterm::event::KeyCode::Down => {
                     self.slash_popup.select_next();
+                    return;
+                }
+                crossterm::event::KeyCode::PageUp => {
+                    self.slash_popup.page_up();
+                    return;
+                }
+                crossterm::event::KeyCode::PageDown => {
+                    self.slash_popup.page_down();
                     return;
                 }
                 crossterm::event::KeyCode::Tab => {
@@ -7038,8 +7045,12 @@ Make it comprehensive but concise."#;
 
     fn render_slash_popup(f: &mut Frame, input_area: Rect, popup: &SlashPopup) {
         let items = popup.display_items();
-        let popup_height = (items.len() as u16 + 2).min(12);
-        let popup_width = 50.min(input_area.width.saturating_sub(2));
+        let popup_width = input_area.width.saturating_sub(2);
+        if popup_width < 4 {
+            return;
+        }
+        let body_rows = items.len().max(1) as u16;
+        let popup_height = (body_rows + 2).min(10);
 
         // Position popup above the input box
         let popup_area = Rect {
@@ -7053,41 +7064,46 @@ Make it comprehensive but concise."#;
         f.render_widget(Clear, popup_area);
 
         // Build popup content
-        let lines: Vec<Line> = items
-            .iter()
-            .map(|(cmd, desc, selected)| {
-                let prefix = if *selected { "▸ " } else { "  " };
-                let style = if *selected {
-                    Theme::accent()
-                } else {
-                    Theme::text()
-                };
-                Line::from(vec![
-                    Span::styled(prefix, style),
-                    Span::styled(cmd.clone(), style.bold()),
-                    Span::styled(format!(" - {}", desc), Theme::muted()),
-                ])
-            })
-            .collect();
-
-        let title = if popup.is_gugugaga {
-            " Gugugaga Commands (Tab) "
+        let inner_width = popup_width.saturating_sub(2) as usize;
+        let lines: Vec<Line> = if items.is_empty() {
+            vec![Line::from(Span::styled(
+                "  no matching commands",
+                Theme::muted(),
+            ))]
         } else {
-            " Codex Commands (Tab) "
+            items
+                .iter()
+                .map(|(cmd, desc, selected)| {
+                    let prefix = if *selected { "▸ " } else { "  " };
+                    let raw = format!("{prefix}{cmd} - {desc}");
+                    let line = truncate_to_width_str(&raw, inner_width);
+                    let style = if *selected {
+                        Theme::accent()
+                    } else {
+                        Theme::text()
+                    };
+                    Line::from(Span::styled(line, style))
+                })
+                .collect()
+        };
+
+        let kind = if popup.is_gugugaga {
+            "Gugugaga Commands"
+        } else {
+            "Codex Commands"
+        };
+        let title = if let Some((page, total_pages)) = popup.page_progress() {
+            format!(" {kind} (Tab, PgUp/PgDn) {page}/{total_pages} ")
+        } else {
+            format!(" {kind} (Tab) ")
         };
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(if popup.is_gugugaga {
-                Theme::correction_badge()
-            } else {
-                Theme::accent()
-            })
+            .border_style(Theme::accent())
             .title_top(Line::styled(title, Theme::title()));
 
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines).block(block);
         f.render_widget(paragraph, popup_area);
     }
 

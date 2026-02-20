@@ -353,6 +353,8 @@ pub struct SlashPopup {
     pub gugugaga_matches: Vec<GugugagaCommand>,
     /// Selected index
     pub selected: usize,
+    /// Top row of the visible command window
+    pub scroll_top: usize,
 }
 
 impl Default for SlashPopup {
@@ -362,6 +364,8 @@ impl Default for SlashPopup {
 }
 
 impl SlashPopup {
+    const MAX_VISIBLE_ROWS: usize = 8;
+
     pub fn new() -> Self {
         Self {
             visible: false,
@@ -370,6 +374,7 @@ impl SlashPopup {
             codex_matches: Vec::new(),
             gugugaga_matches: Vec::new(),
             selected: 0,
+            scroll_top: 0,
         }
     }
 
@@ -380,6 +385,8 @@ impl SlashPopup {
         self.filter.clear();
         self.update_matches();
         self.selected = 0;
+        self.scroll_top = 0;
+        self.ensure_selected_visible();
     }
 
     /// Open the popup for Gugugaga commands
@@ -389,6 +396,8 @@ impl SlashPopup {
         self.filter.clear();
         self.update_matches();
         self.selected = 0;
+        self.scroll_top = 0;
+        self.ensure_selected_visible();
     }
 
     /// Close the popup
@@ -398,15 +407,14 @@ impl SlashPopup {
         self.codex_matches.clear();
         self.gugugaga_matches.clear();
         self.selected = 0;
+        self.scroll_top = 0;
     }
 
     /// Update filter and refresh matches
     pub fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
         self.update_matches();
-        if self.selected >= self.total_matches() {
-            self.selected = 0;
-        }
+        self.ensure_selected_visible();
     }
 
     fn update_matches(&mut self) {
@@ -436,6 +444,7 @@ impl SlashPopup {
             } else {
                 self.selected -= 1;
             }
+            self.ensure_selected_visible();
         }
     }
 
@@ -444,7 +453,43 @@ impl SlashPopup {
         let total = self.total_matches();
         if total > 0 {
             self.selected = (self.selected + 1) % total;
+            self.ensure_selected_visible();
         }
+    }
+
+    /// Move selection up by one visible page.
+    pub fn page_up(&mut self) {
+        let total = self.total_matches();
+        if total == 0 {
+            return;
+        }
+
+        let step = Self::MAX_VISIBLE_ROWS.min(total);
+        self.selected = self.selected.saturating_sub(step);
+        self.ensure_selected_visible();
+    }
+
+    /// Move selection down by one visible page.
+    pub fn page_down(&mut self) {
+        let total = self.total_matches();
+        if total == 0 {
+            return;
+        }
+
+        let step = Self::MAX_VISIBLE_ROWS.min(total);
+        self.selected = (self.selected + step).min(total - 1);
+        self.ensure_selected_visible();
+    }
+
+    pub fn page_progress(&self) -> Option<(usize, usize)> {
+        let total = self.total_matches();
+        if total <= Self::MAX_VISIBLE_ROWS {
+            return None;
+        }
+
+        let total_pages = (total + Self::MAX_VISIBLE_ROWS - 1) / Self::MAX_VISIBLE_ROWS;
+        let current_page = (self.scroll_top / Self::MAX_VISIBLE_ROWS) + 1;
+        Some((current_page, total_pages))
     }
 
     /// Complete the current selection
@@ -466,10 +511,20 @@ impl SlashPopup {
 
     /// Get display items for rendering
     pub fn display_items(&self) -> Vec<(String, String, bool)> {
+        let total = self.total_matches();
+        if total == 0 {
+            return Vec::new();
+        }
+
+        let visible = Self::MAX_VISIBLE_ROWS.min(total);
+        let start = self.scroll_top.min(total.saturating_sub(visible));
+
         if self.is_gugugaga {
             self.gugugaga_matches
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(visible)
                 .map(|(i, cmd)| {
                     (
                         format!("//{}", cmd.name()),
@@ -482,6 +537,8 @@ impl SlashPopup {
             self.codex_matches
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(visible)
                 .map(|(i, cmd)| {
                     (
                         format!("/{}", cmd.name()),
@@ -490,6 +547,34 @@ impl SlashPopup {
                     )
                 })
                 .collect()
+        }
+    }
+
+    fn ensure_selected_visible(&mut self) {
+        let total = self.total_matches();
+        if total == 0 {
+            self.selected = 0;
+            self.scroll_top = 0;
+            return;
+        }
+
+        if self.selected >= total {
+            self.selected = total - 1;
+        }
+
+        let visible = Self::MAX_VISIBLE_ROWS.min(total);
+        if self.selected < self.scroll_top {
+            self.scroll_top = self.selected;
+        } else {
+            let bottom = self.scroll_top + visible - 1;
+            if self.selected > bottom {
+                self.scroll_top = self.selected + 1 - visible;
+            }
+        }
+
+        let max_top = total.saturating_sub(visible);
+        if self.scroll_top > max_top {
+            self.scroll_top = max_top;
         }
     }
 }
@@ -593,6 +678,44 @@ mod tests {
         popup.set_filter("debug");
         let names: Vec<&str> = popup.codex_matches.iter().map(CodexCommand::name).collect();
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn test_popup_scrolls_visible_window_with_selection() {
+        let mut popup = SlashPopup::new();
+        popup.open_codex();
+        assert!(
+            popup.total_matches() > 8,
+            "expected enough commands to test popup scrolling"
+        );
+
+        for _ in 0..8 {
+            popup.select_next();
+        }
+
+        assert_eq!(popup.selected, 8);
+        assert_eq!(popup.scroll_top, 1);
+        let items = popup.display_items();
+        assert_eq!(items.len(), 8);
+        assert!(items.iter().any(|(_, _, selected)| *selected));
+    }
+
+    #[test]
+    fn test_popup_page_navigation() {
+        let mut popup = SlashPopup::new();
+        popup.open_codex();
+        assert!(
+            popup.total_matches() > 8,
+            "expected enough commands to test popup paging"
+        );
+
+        popup.page_down();
+        assert!(popup.selected >= 8);
+        assert!(popup.scroll_top > 0);
+
+        popup.page_up();
+        assert_eq!(popup.selected, 0);
+        assert_eq!(popup.scroll_top, 0);
     }
 
     #[cfg(not(target_os = "windows"))]
