@@ -1162,6 +1162,7 @@ impl App {
                 | CodexCommand::Rollout
                 | CodexCommand::Collab
                 | CodexCommand::Agent
+                | CodexCommand::TestApproval
         )
     }
 
@@ -1304,6 +1305,21 @@ impl App {
             }
             CodexCommand::Statusline => {
                 self.open_statusline_picker().await;
+            }
+            CodexCommand::TestApproval => {
+                self.messages.push(Message::system(
+                    "/test-approval is a debug command and is not implemented in this TUI.",
+                ));
+            }
+            CodexCommand::MemoryDrop => {
+                self.messages.push(Message::system(
+                    "/debug-m-drop is a debug command and is not available in this TUI.",
+                ));
+            }
+            CodexCommand::MemoryUpdate => {
+                self.messages.push(Message::system(
+                    "/debug-m-update is a debug command and is not available in this TUI.",
+                ));
             }
 
             // === Special commands ===

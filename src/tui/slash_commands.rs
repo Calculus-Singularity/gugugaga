@@ -40,6 +40,9 @@ pub enum CodexCommand {
     Ps,
     Clean,
     Personality,
+    TestApproval,
+    MemoryDrop,
+    MemoryUpdate,
 }
 
 impl CodexCommand {
@@ -78,6 +81,9 @@ impl CodexCommand {
             CodexCommand::Ps,
             CodexCommand::Clean,
             CodexCommand::Personality,
+            CodexCommand::TestApproval,
+            CodexCommand::MemoryDrop,
+            CodexCommand::MemoryUpdate,
         ]
     }
 
@@ -115,6 +121,9 @@ impl CodexCommand {
             CodexCommand::Ps => "ps",
             CodexCommand::Clean => "clean",
             CodexCommand::Personality => "personality",
+            CodexCommand::TestApproval => "test-approval",
+            CodexCommand::MemoryDrop => "debug-m-drop",
+            CodexCommand::MemoryUpdate => "debug-m-update",
         }
     }
 
@@ -154,6 +163,9 @@ impl CodexCommand {
             CodexCommand::Ps => "list background terminals",
             CodexCommand::Clean => "stop all background terminals",
             CodexCommand::Personality => "choose communication style",
+            CodexCommand::TestApproval => "test approval request",
+            CodexCommand::MemoryDrop => "DO NOT USE",
+            CodexCommand::MemoryUpdate => "DO NOT USE",
         }
     }
 
@@ -161,7 +173,14 @@ impl CodexCommand {
         let prefix = prefix.to_lowercase();
         Self::all()
             .iter()
-            .filter(|cmd| cmd.is_visible() && cmd.name().starts_with(&prefix))
+            .filter(|cmd| cmd.is_visible())
+            // Match codex popup behavior: debug commands are dispatchable but
+            // not shown in the slash command menu.
+            .filter(|cmd| !cmd.is_hidden_in_popup())
+            // Match codex popup behavior: hide alias commands in the default
+            // (empty-filter) list to avoid duplicate actions.
+            .filter(|cmd| !prefix.is_empty() || !cmd.is_alias_in_popup())
+            .filter(|cmd| cmd.name().starts_with(&prefix))
             .copied()
             .collect()
     }
@@ -173,10 +192,22 @@ impl CodexCommand {
 
     fn is_visible(&self) -> bool {
         match self {
+            CodexCommand::ElevateSandbox => cfg!(target_os = "windows"),
             CodexCommand::SandboxReadRoot => cfg!(target_os = "windows"),
-            CodexCommand::Rollout => cfg!(debug_assertions),
+            CodexCommand::Rollout | CodexCommand::TestApproval => cfg!(debug_assertions),
             _ => true,
         }
+    }
+
+    fn is_hidden_in_popup(&self) -> bool {
+        matches!(
+            self,
+            CodexCommand::DebugConfig | CodexCommand::MemoryDrop | CodexCommand::MemoryUpdate
+        )
+    }
+
+    fn is_alias_in_popup(&self) -> bool {
+        matches!(self, CodexCommand::Quit | CodexCommand::Approvals)
     }
 }
 
@@ -496,6 +527,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_codex_debug_memory_commands() {
+        match parse_command("/debug-m-drop") {
+            Some(ParsedCommand::Codex(CodexCommand::MemoryDrop, _)) => {}
+            _ => panic!("Should parse as Codex debug-m-drop"),
+        }
+        match parse_command("/debug-m-update") {
+            Some(ParsedCommand::Codex(CodexCommand::MemoryUpdate, _)) => {}
+            _ => panic!("Should parse as Codex debug-m-update"),
+        }
+    }
+
+    #[test]
     fn test_parse_gugugaga_command() {
         match parse_command("//help") {
             Some(ParsedCommand::Gugugaga(GugugagaCommand::Help, _)) => {}
@@ -522,5 +565,45 @@ mod tests {
         popup.open_gugugaga();
         assert!(popup.is_gugugaga);
         assert!(!popup.gugugaga_matches.is_empty());
+    }
+
+    #[test]
+    fn test_popup_hides_aliases_by_default() {
+        let mut popup = SlashPopup::new();
+        popup.open_codex();
+        let names: Vec<&str> = popup.codex_matches.iter().map(CodexCommand::name).collect();
+
+        assert!(!names.contains(&"quit"));
+        assert!(!names.contains(&"approvals"));
+        assert!(names.contains(&"exit"));
+        assert!(names.contains(&"permissions"));
+    }
+
+    #[test]
+    fn test_popup_shows_alias_when_filtered() {
+        let mut popup = SlashPopup::new();
+        popup.open_codex();
+        popup.set_filter("appro");
+        let names: Vec<&str> = popup.codex_matches.iter().map(CodexCommand::name).collect();
+        assert_eq!(names, vec!["approvals"]);
+    }
+
+    #[test]
+    fn test_popup_hides_debug_commands() {
+        let mut popup = SlashPopup::new();
+        popup.open_codex();
+        popup.set_filter("debug");
+        let names: Vec<&str> = popup.codex_matches.iter().map(CodexCommand::name).collect();
+        assert!(names.is_empty());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_popup_hides_windows_only_commands_on_non_windows() {
+        let mut popup = SlashPopup::new();
+        popup.open_codex();
+        let names: Vec<&str> = popup.codex_matches.iter().map(CodexCommand::name).collect();
+        assert!(!names.contains(&"sandbox-add-read-dir"));
+        assert!(!names.contains(&"setup-default-sandbox"));
     }
 }
