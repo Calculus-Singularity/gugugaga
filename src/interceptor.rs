@@ -725,6 +725,7 @@ impl Interceptor {
     }
 
     /// Process a message from the server
+    #[allow(clippy::too_many_arguments)]
     async fn process_server_message(
         msg: &Value,
         memory: &Arc<RwLock<PersistentMemory>>,
@@ -833,7 +834,7 @@ impl Interceptor {
                             }
                             // Found a violation - send correction directly to Codex
                             // Use LLM's correction as-is, no template wrapper
-                            return InterceptAction::CorrectAgent(violation.correction);
+                            InterceptAction::CorrectAgent(violation.correction)
                         } else {
                             // No violation - show what was analyzed
                             let summary = &result.summary;
@@ -857,7 +858,7 @@ impl Interceptor {
                                 "params": params
                             })
                             .to_string();
-                            return InterceptAction::InjectAfter(vec![msg]);
+                            InterceptAction::InjectAfter(vec![msg])
                         }
                     }
                     Err(e) => {
@@ -868,7 +869,7 @@ impl Interceptor {
                             "method": "gugugaga/check",
                             "params": { "status": "error", "message": format!("Evaluation failed: {}", e) }
                         }).to_string();
-                        return InterceptAction::InjectAfter(vec![msg]);
+                        InterceptAction::InjectAfter(vec![msg])
                     }
                 }
             }

@@ -129,7 +129,7 @@ impl Picker {
         }
 
         // Calculate picker size and position (centered)
-        let width = (area.width * 3 / 4).min(96).max(48);
+        let width = (area.width * 3 / 4).clamp(48, 96);
         let height = 16.min(area.height.saturating_sub(4));
         let x = area.x + (area.width - width) / 2;
         let y = area.y + (area.height - height) / 2;

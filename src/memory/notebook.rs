@@ -99,7 +99,7 @@ pub struct MistakeEntry {
 ///
 /// This is independent of conversation history and never compacted.
 /// The agent updates it via tool calls.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GugugagaNotebook {
     /// What Codex is currently doing
     #[serde(default)]
@@ -124,19 +124,6 @@ pub struct GugugagaNotebook {
     /// File path for persistence
     #[serde(skip)]
     file_path: Option<PathBuf>,
-}
-
-impl Default for GugugagaNotebook {
-    fn default() -> Self {
-        Self {
-            current_activity: None,
-            completed: Vec::new(),
-            attention: Vec::new(),
-            mistakes: Vec::new(),
-            last_updated: None,
-            file_path: None,
-        }
-    }
 }
 
 impl GugugagaNotebook {

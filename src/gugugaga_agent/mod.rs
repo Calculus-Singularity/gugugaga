@@ -600,10 +600,9 @@ impl GugugagaAgent {
             }
             "shell" | "rg" | "grep" => {
                 // Execute shell command (with safety restrictions)
-                let cmd = if tool_name == "rg" {
+                let cmd = if tool_name == "rg" || tool_name == "grep" {
+                    // Use rg instead of grep.
                     format!("rg {}", args)
-                } else if tool_name == "grep" {
-                    format!("rg {}", args) // Use rg instead of grep
                 } else {
                     args.to_string()
                 };
@@ -764,14 +763,13 @@ impl GugugagaAgent {
                 .get("significance")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !what.is_empty() {
-                if notebook
+            if !what.is_empty()
+                && notebook
                     .add_completed(what.to_string(), significance.to_string())
                     .await
                     .is_ok()
-                {
-                    results.push(format!("completed: '{}'", what));
-                }
+            {
+                results.push(format!("completed: '{}'", what));
             }
         }
 
@@ -790,14 +788,13 @@ impl GugugagaAgent {
                 "low" => Priority::Low,
                 _ => Priority::Medium,
             };
-            if !content.is_empty() {
-                if notebook
+            if !content.is_empty()
+                && notebook
                     .add_attention(content.to_string(), AttentionSource::Inference, priority)
                     .await
                     .is_ok()
-                {
-                    results.push(format!("attention: '{}'", content));
-                }
+            {
+                results.push(format!("attention: '{}'", content));
             }
         }
 
@@ -809,14 +806,14 @@ impl GugugagaAgent {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let lesson = mistake.get("lesson").and_then(|v| v.as_str()).unwrap_or("");
-            if !what.is_empty() && !lesson.is_empty() {
-                if notebook
+            if !what.is_empty()
+                && !lesson.is_empty()
+                && notebook
                     .record_mistake(what.to_string(), how.to_string(), lesson.to_string())
                     .await
                     .is_ok()
-                {
-                    results.push(format!("mistake: '{}'", what));
-                }
+            {
+                results.push(format!("mistake: '{}'", what));
             }
         }
 
@@ -888,7 +885,7 @@ impl GugugagaAgent {
             "sed" => {
                 args.len() <= 4
                     && args.get(1) == Some(&"-n")
-                    && args.get(2).map_or(false, |arg| {
+                    && args.get(2).is_some_and(|arg| {
                         // Check if it matches pattern like "1p" or "1,5p"
                         arg.ends_with('p')
                             && arg

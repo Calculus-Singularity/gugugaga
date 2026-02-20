@@ -306,8 +306,7 @@ pub fn parse_command(input: &str) -> Option<ParsedCommand> {
     let input = input.trim();
 
     // Check for gugugaga command (//)
-    if input.starts_with("//") {
-        let rest = &input[2..];
+    if let Some(rest) = input.strip_prefix("//") {
         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
         let cmd_name = parts[0];
         let args = parts.get(1).unwrap_or(&"").to_string();
@@ -325,8 +324,7 @@ pub fn parse_command(input: &str) -> Option<ParsedCommand> {
     }
 
     // Check for Codex command (/)
-    if input.starts_with('/') {
-        let rest = &input[1..];
+    if let Some(rest) = input.strip_prefix('/') {
         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
         let cmd_name = parts[0];
         let args = parts.get(1).unwrap_or(&"").to_string();

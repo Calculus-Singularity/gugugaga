@@ -300,12 +300,12 @@ impl PersistentMemory {
         let mut section_content = Vec::new();
 
         for line in content.lines() {
-            if line.starts_with("## ") {
+            if let Some(section) = line.strip_prefix("## ") {
                 // Process previous section
                 if !current_section.is_empty() {
                     self.process_section(&current_section, &section_content)?;
                 }
-                current_section = line[3..].trim().to_string();
+                current_section = section.trim().to_string();
                 section_content.clear();
             } else if !current_section.is_empty() {
                 section_content.push(line.to_string());

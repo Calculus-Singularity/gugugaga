@@ -197,9 +197,7 @@ impl Responder {
     fn parse_violation_text(text: &str) -> ParsedCheck {
         // Try to split: TYPE separator rest
         // Accept `-`, `–`, `:` as separators
-        let parts: Vec<&str> = text
-            .splitn(2, |c: char| c == '-' || c == '–' || c == ':')
-            .collect();
+        let parts: Vec<&str> = text.splitn(2, ['-', '–', ':']).collect();
 
         let (type_str, rest) = if parts.len() >= 2 {
             (parts[0].trim(), parts[1].trim())

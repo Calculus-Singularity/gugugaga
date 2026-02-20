@@ -49,6 +49,7 @@ fn truncate_to_width(text: &str, max_display_width: usize) -> String {
 pub struct Message {
     pub role: MessageRole,
     pub content: String,
+    #[allow(dead_code)]
     pub timestamp: String,
 }
 
@@ -268,7 +269,7 @@ impl Widget for StatsPanel {
         };
         buf.set_line(inner.x, inner.y, &status_line, inner.width);
 
-        let stats = vec![
+        let stats = [
             (
                 "Violations",
                 self.violations,
@@ -298,6 +299,8 @@ impl Widget for StatsPanel {
 }
 
 /// Context panel showing Gugugaga notebook state
+#[derive(Default)]
+#[allow(dead_code)]
 pub struct ContextPanel {
     /// Current activity Codex is doing
     pub current_activity: Option<String>,
@@ -313,20 +316,6 @@ pub struct ContextPanel {
     pub corrections: usize,
     /// Monitoring status
     pub is_monitoring: bool,
-}
-
-impl Default for ContextPanel {
-    fn default() -> Self {
-        Self {
-            current_activity: None,
-            completed_count: 0,
-            attention_items: Vec::new(),
-            mistakes_count: 0,
-            violations: 0,
-            corrections: 0,
-            is_monitoring: false,
-        }
-    }
 }
 
 impl Widget for ContextPanel {
@@ -934,8 +923,8 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
         let mut status_line: Option<&str> = None;
 
         for line in content.lines() {
-            if line.starts_with("$ ") {
-                cmd_text = line[2..].to_string();
+            if let Some(stripped) = line.strip_prefix("$ ") {
+                cmd_text = stripped.to_string();
             } else if line.starts_with('\u{2713}') || line.starts_with('\u{2717}') {
                 // ✓ or ✗
                 status_line = Some(line);
@@ -1163,9 +1152,6 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                 let bar_style = Style::default().fg(Color::Magenta);
                 let bar = "▎";
                 let bar_w = bar.width(); // 1
-                let prefix_style = Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD);
                 let dim_style = Style::default().fg(Color::Rgb(140, 135, 150));
 
                 // Detect if this is a tool-call message (starts with "$ ")
@@ -1216,7 +1202,7 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                         text_avail.saturating_sub(bar_w + 1),
                         "",
                     );
-                    for (_i, md_line) in md_lines.into_iter().enumerate() {
+                    for md_line in md_lines.into_iter() {
                         let mut spans = Vec::new();
                         spans.push(Span::styled(indent.to_string(), Style::default()));
                         spans.push(Span::styled(bar, bar_style));
@@ -1585,8 +1571,8 @@ fn parse_unified_diff(text: &str, hint: DiffChangeType) -> (Vec<DiffHunk>, usize
             old_ln += 1;
             total_removed += 1;
         } else if line.starts_with(' ') || (!line.is_empty() && !line.starts_with('\\')) {
-            let text = if line.starts_with(' ') {
-                &line[1..]
+            let text = if let Some(stripped) = line.strip_prefix(' ') {
+                stripped
             } else {
                 line
             };

@@ -201,6 +201,7 @@ enum PendingRequestType {
     None,
     ThreadList,
     ThreadResume(String),
+    #[allow(dead_code)]
     ThreadRead(String),
     RolloutPathLookup(String),
     ThreadCompactStart,
@@ -542,50 +543,44 @@ impl App {
 
                     // Poll with animation frame rate
                     if event::poll(animation_poll)? {
-                        match event::read()? {
-                            Event::Key(key) => {
-                                use crossterm::event::{KeyCode, KeyModifiers};
+                        if let Event::Key(key) = event::read()? {
+                            use crossterm::event::{KeyCode, KeyModifiers};
 
-                                // Ignore input during minimum display period
-                                // (except Ctrl+C which always works)
-                                let accept_input = welcome_start.elapsed() >= welcome_min_display;
+                            // Ignore input during minimum display period
+                            // (except Ctrl+C which always works)
+                            let accept_input = welcome_start.elapsed() >= welcome_min_display;
 
-                                // Ctrl+C → quit immediately (always)
-                                if key.code == KeyCode::Char('c')
-                                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                                {
-                                    self.should_quit = true;
-                                } else if !accept_input {
-                                    // Swallow key — too early
-                                } else if self.trust_ctx.is_some() {
-                                    // Trust selection mode: only 1 or 2 advance
-                                    match key.code {
-                                        KeyCode::Char('1') => {
-                                            if let Some(ctx) = self.trust_ctx.take() {
-                                                let _ =
-                                                    crate::trust::write_trust_decision(&ctx, true);
-                                            }
-                                            self.phase = AppPhase::Chat;
-                                            self.terminal.clear()?;
+                            // Ctrl+C → quit immediately (always)
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                self.should_quit = true;
+                            } else if !accept_input {
+                                // Swallow key — too early
+                            } else if self.trust_ctx.is_some() {
+                                // Trust selection mode: only 1 or 2 advance
+                                match key.code {
+                                    KeyCode::Char('1') => {
+                                        if let Some(ctx) = self.trust_ctx.take() {
+                                            let _ = crate::trust::write_trust_decision(&ctx, true);
                                         }
-                                        KeyCode::Char('2') => {
-                                            if let Some(ctx) = self.trust_ctx.take() {
-                                                let _ =
-                                                    crate::trust::write_trust_decision(&ctx, false);
-                                            }
-                                            self.phase = AppPhase::Chat;
-                                            self.terminal.clear()?;
-                                        }
-                                        _ => {} // ignore other keys
+                                        self.phase = AppPhase::Chat;
+                                        self.terminal.clear()?;
                                     }
-                                } else {
-                                    // No trust needed — any key advances
-                                    self.phase = AppPhase::Chat;
-                                    self.terminal.clear()?;
+                                    KeyCode::Char('2') => {
+                                        if let Some(ctx) = self.trust_ctx.take() {
+                                            let _ = crate::trust::write_trust_decision(&ctx, false);
+                                        }
+                                        self.phase = AppPhase::Chat;
+                                        self.terminal.clear()?;
+                                    }
+                                    _ => {} // ignore other keys
                                 }
+                            } else {
+                                // No trust needed — any key advances
+                                self.phase = AppPhase::Chat;
+                                self.terminal.clear()?;
                             }
-                            // Silently consume non-key events
-                            _ => {}
                         }
                     }
                 }
@@ -774,7 +769,7 @@ impl App {
                 | crossterm::event::KeyCode::Enter => {
                     let cmd_display = approval.command.as_deref().unwrap_or("command");
                     self.messages
-                        .push(Message::system(&format!("✓ Approved: {}", cmd_display)));
+                        .push(Message::system(format!("✓ Approved: {}", cmd_display)));
                     self.respond_to_approval_decision(&approval, "accept").await;
                     return;
                 }
@@ -785,7 +780,7 @@ impl App {
                 {
                     let amendment = approval.proposed_execpolicy_amendment.clone().unwrap();
                     let prefix = amendment.join(" ");
-                    self.messages.push(Message::system(&format!(
+                    self.messages.push(Message::system(format!(
                         "✓ Approved (won't ask again for `{}`)",
                         prefix
                     )));
@@ -984,7 +979,7 @@ impl App {
                         ParsedCommand::Codex(cmd, args) => {
                             if self.is_processing && !Self::codex_command_available_during_task(cmd)
                             {
-                                self.messages.push(Message::system(&format!(
+                                self.messages.push(Message::system(format!(
                                     "`/{}` is unavailable while a task is running.",
                                     cmd.name()
                                 )));
@@ -1000,7 +995,7 @@ impl App {
                             self.send_gugugaga_chat(&message).await;
                         }
                         ParsedCommand::Unknown(name) => {
-                            self.messages.push(Message::system(&format!(
+                            self.messages.push(Message::system(format!(
                                 "Unknown command: {}. Use //help for Gugugaga commands.",
                                 name
                             )));
@@ -1926,7 +1921,7 @@ impl App {
             .as_deref()
             .map(|e| format!(" (reasoning: {e})"))
             .unwrap_or_default();
-        self.messages.push(Message::system(&format!(
+        self.messages.push(Message::system(format!(
             "Gugugaga model set to: {}{}\n(Restart gugugaga to apply)",
             model, suffix
         )));
@@ -1998,7 +1993,7 @@ impl App {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(skill_path);
-            self.messages.push(Message::system(&format!(
+            self.messages.push(Message::system(format!(
                 "{} skill: {}",
                 action, display_name
             )));
@@ -2054,7 +2049,7 @@ impl App {
                 .to_string();
                 let _ = tx.send(msg).await;
                 self.messages
-                    .push(Message::system(&format!("Renaming to: {}", name)));
+                    .push(Message::system(format!("Renaming to: {}", name)));
             }
         } else {
             self.messages
@@ -2512,10 +2507,8 @@ Make it comprehensive but concise."#;
 
             match self.picker_mode {
                 PickerMode::Resume => {
-                    self.messages.push(Message::system(&format!(
-                        "Resuming session: {}",
-                        item_title
-                    )));
+                    self.messages
+                        .push(Message::system(format!("Resuming session: {}", item_title)));
                     if let Some(tx) = &self.input_tx {
                         self.request_counter += 1;
                         self.pending_request_id = Some(self.request_counter);
@@ -2597,7 +2590,7 @@ Make it comprehensive but concise."#;
                             }
 
                             self.picker.open(items);
-                            self.messages.push(Message::system(&format!(
+                            self.messages.push(Message::system(format!(
                                 "Model selected: {}. Choose reasoning effort.",
                                 model.display_name
                             )));
@@ -2617,7 +2610,7 @@ Make it comprehensive but concise."#;
                             .as_deref()
                             .map(|e| format!(" (reasoning: {e})"))
                             .unwrap_or_default();
-                        self.messages.push(Message::system(&format!(
+                        self.messages.push(Message::system(format!(
                             "Model set to: {}{}",
                             item_title, suffix
                         )));
@@ -2625,7 +2618,7 @@ Make it comprehensive but concise."#;
                         // Fallback if model cache is missing for any reason.
                         self.set_default_model(&item_id, None).await;
                         self.messages
-                            .push(Message::system(&format!("Model set to: {}", item_title)));
+                            .push(Message::system(format!("Model set to: {}", item_title)));
                     }
                 }
                 PickerMode::ModelReasoning => {
@@ -2639,7 +2632,7 @@ Make it comprehensive but concise."#;
                         let suffix = effort
                             .map(|e| format!(" (reasoning: {e})"))
                             .unwrap_or_default();
-                        self.messages.push(Message::system(&format!(
+                        self.messages.push(Message::system(format!(
                             "Model set to: {}{}",
                             model.display_name, suffix
                         )));
@@ -2701,7 +2694,7 @@ Make it comprehensive but concise."#;
                             }
 
                             self.picker.open(items);
-                            self.messages.push(Message::system(&format!(
+                            self.messages.push(Message::system(format!(
                                 "Gugugaga model selected: {}. Choose reasoning effort.",
                                 model.display_name
                             )));
@@ -2720,13 +2713,13 @@ Make it comprehensive but concise."#;
                             .as_deref()
                             .map(|e| format!(" (reasoning: {e})"))
                             .unwrap_or_default();
-                        self.messages.push(Message::system(&format!(
+                        self.messages.push(Message::system(format!(
                             "Gugugaga model set to: {}{}\n(Restart gugugaga to apply)",
                             item_title, suffix
                         )));
                     } else {
                         self.persist_gugugaga_model_selection(&item_id, None).await;
-                        self.messages.push(Message::system(&format!(
+                        self.messages.push(Message::system(format!(
                             "Gugugaga model set to: {}\n(Restart gugugaga to apply)",
                             item_title
                         )));
@@ -2744,7 +2737,7 @@ Make it comprehensive but concise."#;
                         let suffix = effort
                             .map(|e| format!(" (reasoning: {e})"))
                             .unwrap_or_default();
-                        self.messages.push(Message::system(&format!(
+                        self.messages.push(Message::system(format!(
                             "Gugugaga model set to: {}{}\n(Restart gugugaga to apply)",
                             model.display_name, suffix
                         )));
@@ -2793,24 +2786,24 @@ Make it comprehensive but concise."#;
                 }
                 PickerMode::Approvals => {
                     self.messages
-                        .push(Message::system(&format!("Approval mode: {}", item_title)));
+                        .push(Message::system(format!("Approval mode: {}", item_title)));
                     self.write_config("approvalPolicy", &serde_json::json!(item_id))
                         .await;
                 }
                 PickerMode::Permissions => {
                     self.messages
-                        .push(Message::system(&format!("Permissions: {}", item_title)));
+                        .push(Message::system(format!("Permissions: {}", item_title)));
                     self.write_config("sandboxPolicy", &serde_json::json!(item_id))
                         .await;
                 }
                 PickerMode::Personality => {
                     self.messages
-                        .push(Message::system(&format!("Personality: {}", item_title)));
+                        .push(Message::system(format!("Personality: {}", item_title)));
                     self.write_config("personality", &serde_json::json!(item_id))
                         .await;
                 }
                 PickerMode::Collab => {
-                    self.messages.push(Message::system(&format!(
+                    self.messages.push(Message::system(format!(
                         "Collaboration mode: {}",
                         item_title
                     )));
@@ -2818,7 +2811,7 @@ Make it comprehensive but concise."#;
                         .await;
                 }
                 PickerMode::Agent => {
-                    self.messages.push(Message::system(&format!(
+                    self.messages.push(Message::system(format!(
                         "Switched to agent: {}",
                         item_title
                     )));
@@ -2845,7 +2838,7 @@ Make it comprehensive but concise."#;
                                 saved_items.join(", ")
                             };
                             self.messages
-                                .push(Message::system(&format!("Status line saved: {}", summary)));
+                                .push(Message::system(format!("Status line saved: {}", summary)));
                         }
                         self.statusline_editor = None;
                     } else if let Some(editor) = self.statusline_editor.as_mut() {
@@ -3064,7 +3057,7 @@ Make it comprehensive but concise."#;
                 self.messages
                     .push(Message::system("Gugugaga commands (//):"));
                 for c in GugugagaCommand::all() {
-                    self.messages.push(Message::system(&format!(
+                    self.messages.push(Message::system(format!(
                         "  //{:<12} - {}",
                         c.name(),
                         c.description()
@@ -3082,7 +3075,7 @@ Make it comprehensive but concise."#;
                 self.messages.push(Message::system("Chat history cleared."));
             }
             GugugagaCommand::Stats => {
-                self.messages.push(Message::system(&format!(
+                self.messages.push(Message::system(format!(
                     "Session stats:\n  Violations: {}\n  Corrections: {}\n  Auto-replies: {}",
                     self.violations_detected, self.corrections_made, self.auto_replies
                 )));
@@ -3157,7 +3150,7 @@ Make it comprehensive but concise."#;
                         }
                     }
 
-                    self.messages.push(Message::system(&lines.join("\n")));
+                    self.messages.push(Message::system(lines.join("\n")));
                 } else {
                     self.messages
                         .push(Message::system("No notebook available (not initialized)."));
@@ -3176,7 +3169,7 @@ Make it comprehensive but concise."#;
         if let Err(e) =
             Self::write_gugugaga_model_selection(&config_path, model, reasoning_effort).await
         {
-            self.messages.push(Message::system(&format!(
+            self.messages.push(Message::system(format!(
                 "Failed to set Gugugaga model: {}",
                 e
             )));
@@ -3270,7 +3263,7 @@ Make it comprehensive but concise."#;
                 if method.contains("error") || method.contains("Error") {
                     let preview = truncate_utf8(msg, 200);
                     self.messages
-                        .push(Message::system(&format!("[{}] {}", method, preview)));
+                        .push(Message::system(format!("[{}] {}", method, preview)));
                 }
             }
         }
@@ -3340,7 +3333,7 @@ Make it comprehensive but concise."#;
                         lines.push(
                             "Type your answer and press Enter. It will be used for all questions in this request. Type /cancel to send an empty response.".to_string(),
                         );
-                        self.messages.push(Message::system(&lines.join("\n")));
+                        self.messages.push(Message::system(lines.join("\n")));
                         self.scroll_to_bottom();
                         return;
                     }
@@ -3438,7 +3431,7 @@ Make it comprehensive but concise."#;
                     // Only show error if it seems relevant (not from init)
                     if self.pending_request_id.is_some() {
                         self.messages
-                            .push(Message::system(&format!("Error: {}", error_msg)));
+                            .push(Message::system(format!("Error: {}", error_msg)));
                         self.stop_processing();
                         self.pending_request_id = None;
                         self.pending_request_type = PendingRequestType::None;
@@ -3586,7 +3579,7 @@ Make it comprehensive but concise."#;
                                     let truncated: String = lines
                                         .iter()
                                         .take(MAX_OUTPUT_LINES)
-                                        .map(|s| *s)
+                                        .copied()
                                         .collect::<Vec<_>>()
                                         .join("\n");
                                     let truncated = if truncated.len() > MAX_OUTPUT_CHARS {
@@ -3731,7 +3724,7 @@ Make it comprehensive but concise."#;
                                 let query =
                                     item.get("query").and_then(|q| q.as_str()).unwrap_or("...");
                                 self.messages
-                                    .push(Message::system(&format!("🔍 Searching: {}", query)));
+                                    .push(Message::system(format!("🔍 Searching: {}", query)));
                             }
                             "enteredReviewMode" => {
                                 let review = item
@@ -3739,7 +3732,7 @@ Make it comprehensive but concise."#;
                                     .and_then(|r| r.as_str())
                                     .unwrap_or("changes");
                                 self.messages
-                                    .push(Message::system(&format!("📋 Reviewing: {}", review)));
+                                    .push(Message::system(format!("📋 Reviewing: {}", review)));
                             }
                             "collabAgentToolCall" => {
                                 let tool = item
@@ -3760,17 +3753,17 @@ Make it comprehensive but concise."#;
                                             .and_then(|p| p.as_str())
                                             .unwrap_or("");
                                         let preview = if prompt.len() > 80 {
-                                            format!("{}...", truncate_utf8(&prompt, 80))
+                                            format!("{}...", truncate_utf8(prompt, 80))
                                         } else {
                                             prompt.to_string()
                                         };
-                                        self.messages.push(Message::system(&format!(
+                                        self.messages.push(Message::system(format!(
                                             "🔀 Spawning sub-agent: {}",
                                             preview
                                         )));
                                     }
                                     "sendInput" => {
-                                        self.messages.push(Message::system(&format!(
+                                        self.messages.push(Message::system(format!(
                                             "📨 Sending input to agent (from {})",
                                             sender
                                         )));
@@ -3783,7 +3776,7 @@ Make it comprehensive but concise."#;
                                         self.messages.push(Message::system("🔚 Closing sub-agent"));
                                     }
                                     _ => {
-                                        self.messages.push(Message::system(&format!(
+                                        self.messages.push(Message::system(format!(
                                             "🤖 Collab: {} (from {})",
                                             tool, sender
                                         )));
@@ -3842,7 +3835,7 @@ Make it comprehensive but concise."#;
                                     let dur = duration
                                         .map(|d| format!(" in {}ms", d))
                                         .unwrap_or_default();
-                                    self.messages.push(Message::system(&format!(
+                                    self.messages.push(Message::system(format!(
                                         "Command completed{}{}",
                                         code_str, dur
                                     )));
@@ -3908,7 +3901,7 @@ Make it comprehensive but concise."#;
                                     }
                                 }
                                 let icon = if status == "completed" { "✓" } else { "✘" };
-                                self.messages.push(Message::system(&format!(
+                                self.messages.push(Message::system(format!(
                                     "{} File change {}",
                                     icon, status
                                 )));
@@ -3952,29 +3945,29 @@ Make it comprehensive but concise."#;
                                             _ => "🤖",
                                         };
                                         let short_id = if agent_id.len() > 8 {
-                                            truncate_utf8(&agent_id, 8)
+                                            truncate_utf8(agent_id, 8)
                                         } else {
                                             agent_id
                                         };
                                         if let Some(msg) = msg {
                                             let preview = if msg.len() > 100 {
-                                                format!("{}...", truncate_utf8(&msg, 100))
+                                                format!("{}...", truncate_utf8(msg, 100))
                                             } else {
                                                 msg.to_string()
                                             };
-                                            self.messages.push(Message::system(&format!(
+                                            self.messages.push(Message::system(format!(
                                                 "{} Agent {}.. {}: {}",
                                                 icon, short_id, agent_status, preview
                                             )));
                                         } else {
-                                            self.messages.push(Message::system(&format!(
+                                            self.messages.push(Message::system(format!(
                                                 "{} Agent {}.. {}",
                                                 icon, short_id, agent_status
                                             )));
                                         }
                                     }
                                 } else {
-                                    self.messages.push(Message::system(&format!(
+                                    self.messages.push(Message::system(format!(
                                         "🤖 Collab {} {}",
                                         tool, status
                                     )));
@@ -3992,7 +3985,7 @@ Make it comprehensive but concise."#;
                         .and_then(|e| e.as_str())
                     {
                         self.messages
-                            .push(Message::system(&format!("📋 Plan: {}", explanation)));
+                            .push(Message::system(format!("📋 Plan: {}", explanation)));
                     }
                     if let Some(plan) = json
                         .get("params")
@@ -4011,7 +4004,7 @@ Make it comprehensive but concise."#;
                                 "inProgress" => "→",
                                 _ => "○",
                             };
-                            self.messages.push(Message::system(&format!(
+                            self.messages.push(Message::system(format!(
                                 "  {} {}. {}",
                                 icon,
                                 i + 1,
@@ -4057,7 +4050,7 @@ Make it comprehensive but concise."#;
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown error");
                             self.messages
-                                .push(Message::system(&format!("Turn failed: {}", error_msg)));
+                                .push(Message::system(format!("Turn failed: {}", error_msg)));
                         }
                         _ => {} // "completed" — normal
                     }
@@ -4160,7 +4153,7 @@ Make it comprehensive but concise."#;
                         .and_then(|t| t.as_str())
                     {
                         self.messages
-                            .push(Message::system(&format!("⚠️ violations: {}", text)));
+                            .push(Message::system(format!("⚠️ violations: {}", text)));
                         self.scroll_to_bottom();
                     }
                 }
@@ -4327,8 +4320,7 @@ Make it comprehensive but concise."#;
                                 if msg.starts_with("🛡️") {
                                     self.messages.push(Message::gugugaga(msg));
                                 } else {
-                                    self.messages
-                                        .push(Message::gugugaga(&format!("🛡️ {}", msg)));
+                                    self.messages.push(Message::gugugaga(format!("🛡️ {}", msg)));
                                 }
                             }
                             "violation" => {
@@ -4356,7 +4348,7 @@ Make it comprehensive but concise."#;
                         .and_then(|m| m.as_str())
                     {
                         self.messages
-                            .push(Message::system(&format!("Error: {}", msg)));
+                            .push(Message::system(format!("Error: {}", msg)));
                         self.stop_processing();
                     }
                 }
@@ -4465,7 +4457,7 @@ Make it comprehensive but concise."#;
                         .get("message")
                         .and_then(|m| m.as_str())
                         .unwrap_or("Unknown error");
-                    self.messages.push(Message::system(&format!(
+                    self.messages.push(Message::system(format!(
                         "Failed to load sessions: {}",
                         error_msg
                     )));
@@ -4489,7 +4481,7 @@ Make it comprehensive but concise."#;
                     match path {
                         Some(p) if !p.is_empty() => self
                             .messages
-                            .push(Message::system(&format!("Current rollout path: {}", p))),
+                            .push(Message::system(format!("Current rollout path: {}", p))),
                         _ => self.messages.push(Message::system(
                             "Rollout path is not available for the current thread.",
                         )),
@@ -4527,7 +4519,7 @@ Make it comprehensive but concise."#;
                         .get("message")
                         .and_then(|m| m.as_str())
                         .unwrap_or("Unknown error");
-                    self.messages.push(Message::system(&format!(
+                    self.messages.push(Message::system(format!(
                         "Failed to resume session: {}",
                         error_msg
                     )));
@@ -4746,7 +4738,7 @@ Make it comprehensive but concise."#;
                                 for err in &errors {
                                     lines.push(format!("  ⚠ {}", err));
                                 }
-                                self.messages.push(Message::system(&format!(
+                                self.messages.push(Message::system(format!(
                                     "Skills:\n{}",
                                     lines.join("\n")
                                 )));
@@ -4795,7 +4787,7 @@ Make it comprehensive but concise."#;
                         self.picker_mode = PickerMode::None;
                         let text = serde_json::to_string_pretty(result).unwrap_or_default();
                         self.messages
-                            .push(Message::system(&format!("Collaboration modes:\n{}", text)));
+                            .push(Message::system(format!("Collaboration modes:\n{}", text)));
                     }
                 } else {
                     self.picker.close();
@@ -4838,7 +4830,7 @@ Make it comprehensive but concise."#;
                         self.picker_mode = PickerMode::None;
                         let text = serde_json::to_string_pretty(result).unwrap_or_default();
                         self.messages
-                            .push(Message::system(&format!("Agent threads:\n{}", text)));
+                            .push(Message::system(format!("Agent threads:\n{}", text)));
                     }
                 } else {
                     self.picker.close();
@@ -4883,7 +4875,7 @@ Make it comprehensive but concise."#;
                         self.messages
                             .push(Message::system("MCP: No servers configured."));
                     } else {
-                        self.messages.push(Message::system(&format!(
+                        self.messages.push(Message::system(format!(
                             "MCP Servers:\n{}",
                             lines.join("\n")
                         )));
@@ -4919,7 +4911,7 @@ Make it comprehensive but concise."#;
                         self.messages.push(Message::system("No apps configured."));
                     } else {
                         self.messages
-                            .push(Message::system(&format!("Apps:\n{}", lines.join("\n"))));
+                            .push(Message::system(format!("Apps:\n{}", lines.join("\n"))));
                     }
                 } else {
                     self.handle_rpc_error(json, "Failed to load apps");
@@ -4929,7 +4921,7 @@ Make it comprehensive but concise."#;
                 if let Some(result) = json.get("result") {
                     let text = serde_json::to_string_pretty(result).unwrap_or_default();
                     self.messages
-                        .push(Message::system(&format!("Current config:\n{}", text)));
+                        .push(Message::system(format!("Current config:\n{}", text)));
                 } else {
                     self.handle_rpc_error(json, "Failed to read config");
                 }
@@ -4938,7 +4930,7 @@ Make it comprehensive but concise."#;
                 if let Some(result) = json.get("result") {
                     let text = serde_json::to_string_pretty(result).unwrap_or_default();
                     self.messages
-                        .push(Message::system(&format!("Debug config:\n{}", text)));
+                        .push(Message::system(format!("Debug config:\n{}", text)));
                 } else {
                     self.handle_rpc_error(json, "Failed to read debug config");
                 }
@@ -5124,12 +5116,13 @@ Make it comprehensive but concise."#;
                 .and_then(|m| m.as_str())
                 .unwrap_or(fallback);
             self.messages
-                .push(Message::system(&format!("Error: {}", error_msg)));
+                .push(Message::system(format!("Error: {}", error_msg)));
         } else {
             self.messages.push(Message::system(fallback));
         }
     }
 
+    #[allow(dead_code)]
     fn request_thread_read(&mut self, thread_id: String) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
@@ -5282,7 +5275,7 @@ Make it comprehensive but concise."#;
                             if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
                                     self.messages
-                                        .push(Message::system(&format!("Plan: {}", text)));
+                                        .push(Message::system(format!("Plan: {}", text)));
                                 }
                             }
                         }

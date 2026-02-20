@@ -15,6 +15,12 @@ pub struct AsciiAnimation {
     start: Instant,
 }
 
+impl Default for AsciiAnimation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AsciiAnimation {
     /// Create a new animation.
     pub fn new() -> Self {
