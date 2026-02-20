@@ -1723,32 +1723,40 @@ impl App {
             format!("Custom ({}, {})", sandbox, approval)
         };
 
-        let mut lines = vec![
-            "Status:".to_string(),
-            format!(
-                "  Model: {} (reasoning {}, provider {})",
-                model, reasoning, provider
+        let overview_rows: Vec<(String, String)> = vec![
+            (
+                "Model".to_string(),
+                format!("{} (reasoning {}, provider {})", model, reasoning, provider),
             ),
-            format!("  Directory: {}", self.cwd),
-            format!("  Permissions: {}", permissions),
-            format!("  Collaboration: {}", collab),
-            format!(
-                "  Session ID: {}",
-                self.thread_id.as_deref().unwrap_or("none")
+            ("Directory".to_string(), self.cwd.clone()),
+            ("Permissions".to_string(), permissions),
+            ("Agents.md".to_string(), self.status_agents_summary()),
+            ("Collaboration".to_string(), collab.to_string()),
+            (
+                "Session ID".to_string(),
+                self.thread_id.as_deref().unwrap_or("none").to_string(),
             ),
         ];
 
+        let mut usage_rows: Vec<(String, String)> = Vec::new();
         if let Some(usage) = &self.token_usage_snapshot {
             let non_cached_input = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
-            lines.push("  token usage (total):".to_string());
-            lines.push(format!(
-                "    {} total ({} input + {} output)",
-                usage.total_tokens, non_cached_input, usage.output_tokens
+            usage_rows.push((
+                "Token usage".to_string(),
+                format!(
+                    "{} total  ({} input + {} output)",
+                    Self::format_tokens_compact(usage.total_tokens),
+                    Self::format_tokens_compact(non_cached_input),
+                    Self::format_tokens_compact(usage.output_tokens)
+                ),
             ));
-            lines.push(format!("    cached input: {}", usage.cached_input_tokens));
-            lines.push(format!(
-                "    reasoning output: {}",
-                usage.reasoning_output_tokens
+            usage_rows.push((
+                "Cached input".to_string(),
+                Self::format_tokens_compact(usage.cached_input_tokens),
+            ));
+            usage_rows.push((
+                "Reasoning output".to_string(),
+                Self::format_tokens_compact(usage.reasoning_output_tokens),
             ));
             if let Some(window) = usage.model_context_window {
                 let remaining_pct = if window > 0 {
@@ -1757,23 +1765,32 @@ impl App {
                 } else {
                     100.0
                 };
-                lines.push(format!(
-                    "    context window: {:.1}% left ({} / {})",
-                    remaining_pct, usage.total_tokens, window
+                usage_rows.push((
+                    "Context window".to_string(),
+                    format!(
+                        "{:.1}% left ({} used / {})",
+                        remaining_pct,
+                        Self::format_tokens_compact(usage.total_tokens),
+                        Self::format_tokens_compact(window)
+                    ),
                 ));
             }
             if let Some(turn_id) = &usage.turn_id {
-                lines.push(format!("    last_turn: {}", turn_id));
+                usage_rows.push(("Last turn".to_string(), turn_id.clone()));
             }
         } else {
-            lines.push("  token usage: unavailable (no turn usage update yet)".to_string());
+            usage_rows.push((
+                "Token usage".to_string(),
+                "unavailable (no turn usage update yet)".to_string(),
+            ));
         }
 
+        let mut limit_rows: Vec<(String, String)> = Vec::new();
         if let Some(snapshot) = &self.rate_limit_snapshot {
             if let Some(limit_name) = &snapshot.limit_name {
-                lines.push(format!("  limits profile: {}", limit_name));
+                limit_rows.push(("Limits profile".to_string(), limit_name.clone()));
             } else if let Some(limit_id) = &snapshot.limit_id {
-                lines.push(format!("  limits profile: {}", limit_id));
+                limit_rows.push(("Limits profile".to_string(), limit_id.clone()));
             }
             let primary_label = snapshot
                 .primary
@@ -1782,37 +1799,206 @@ impl App {
                 .map(Self::format_limit_duration_label)
                 .unwrap_or_else(|| "5h".to_string());
             if let Some(window) = &snapshot.primary {
-                lines.push(format!(
-                    "  {} limit: {}",
-                    primary_label,
-                    Self::format_limit_window_summary(window)
+                let remaining = (100.0 - window.used_percent).clamp(0.0, 100.0);
+                limit_rows.push((
+                    format!("{} limit", primary_label),
+                    format!(
+                        "{} {}",
+                        Self::render_status_limit_progress_bar(remaining),
+                        Self::format_limit_window_summary(window)
+                    ),
                 ));
             }
             if let Some(window) = &snapshot.secondary {
-                lines.push(format!(
-                    "  weekly limit: {}",
-                    Self::format_limit_window_summary(window)
+                let remaining = (100.0 - window.used_percent).clamp(0.0, 100.0);
+                limit_rows.push((
+                    "weekly limit".to_string(),
+                    format!(
+                        "{} {}",
+                        Self::render_status_limit_progress_bar(remaining),
+                        Self::format_limit_window_summary(window)
+                    ),
                 ));
             }
 
             if snapshot.credits_has_credits == Some(true) {
                 if snapshot.credits_unlimited == Some(true) {
-                    lines.push("  credits: unlimited".to_string());
+                    limit_rows.push(("Credits".to_string(), "unlimited".to_string()));
                 } else if let Some(balance) = &snapshot.credits_balance {
-                    lines.push(format!("  credits: {}", balance));
+                    limit_rows.push(("Credits".to_string(), balance.clone()));
                 }
             }
 
             if let Some(plan_type) = &snapshot.plan_type {
-                lines.push(format!("  plan: {}", plan_type));
+                limit_rows.push(("Plan".to_string(), plan_type.clone()));
             }
         }
 
-        lines.push(format!("  violations: {}", self.violations_detected));
-        lines.push(format!("  corrections: {}", self.corrections_made));
-        lines.push(format!("  auto_replies: {}", self.auto_replies));
+        let supervisor_rows = vec![
+            (
+                "Violations".to_string(),
+                self.violations_detected.to_string(),
+            ),
+            ("Corrections".to_string(), self.corrections_made.to_string()),
+            ("Auto replies".to_string(), self.auto_replies.to_string()),
+        ];
 
-        lines.join("\n")
+        let label_width = overview_rows
+            .iter()
+            .chain(usage_rows.iter())
+            .chain(limit_rows.iter())
+            .chain(supervisor_rows.iter())
+            .map(|(label, _)| label.chars().count())
+            .max()
+            .unwrap_or(12);
+
+        let mut content_lines = vec![
+            format!(" >_ OpenAI Codex (v{})", env!("CARGO_PKG_VERSION")),
+            String::new(),
+            "Visit https://chatgpt.com/codex/settings/usage for up-to-date".to_string(),
+            "information on rate limits and credits".to_string(),
+            String::new(),
+        ];
+
+        Self::append_status_rows(&mut content_lines, &overview_rows, label_width);
+        content_lines.push(String::new());
+        Self::append_status_rows(&mut content_lines, &usage_rows, label_width);
+        if !limit_rows.is_empty() {
+            content_lines.push(String::new());
+            Self::append_status_rows(&mut content_lines, &limit_rows, label_width);
+        }
+        content_lines.push(String::new());
+        Self::append_status_rows(&mut content_lines, &supervisor_rows, label_width);
+
+        format!("/status\n\n{}", self.render_status_card(&content_lines))
+    }
+
+    fn append_status_rows(lines: &mut Vec<String>, rows: &[(String, String)], label_width: usize) {
+        for (label, value) in rows {
+            lines.push(format!("  {label:<label_width$}: {value}"));
+        }
+    }
+
+    fn status_agents_summary(&self) -> String {
+        let cwd = Path::new(&self.cwd);
+        let mut found = Vec::new();
+        for name in ["AGENTS.md", "Agents.md", "agents.md"] {
+            if cwd.join(name).exists() {
+                found.push(name.to_string());
+            }
+        }
+        if found.is_empty() {
+            "<none>".to_string()
+        } else {
+            found.join(", ")
+        }
+    }
+
+    fn status_card_width(&self) -> usize {
+        let available = usize::from(self.msg_inner_rect.width);
+        if available > 8 {
+            available.saturating_sub(2).clamp(58, 96)
+        } else {
+            80
+        }
+    }
+
+    fn render_status_card(&self, content_lines: &[String]) -> String {
+        let width = self.status_card_width();
+        let inner_width = width.saturating_sub(2);
+        let text_width = inner_width.saturating_sub(2);
+        if text_width == 0 {
+            return content_lines.join("\n");
+        }
+
+        let mut output = Vec::new();
+        output.push(format!("╭{}╮", "─".repeat(inner_width)));
+        for line in content_lines {
+            let wrapped = Self::wrap_status_line(line, text_width);
+            for part in wrapped {
+                output.push(format!("│ {:<text_width$} │", part));
+            }
+        }
+        output.push(format!("╰{}╯", "─".repeat(inner_width)));
+        output.join("\n")
+    }
+
+    fn wrap_status_line(line: &str, width: usize) -> Vec<String> {
+        if width == 0 {
+            return vec![String::new()];
+        }
+        if line.is_empty() {
+            return vec![String::new()];
+        }
+
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut current_width = 0usize;
+
+        for ch in line.chars() {
+            if current_width >= width {
+                out.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += 1;
+        }
+
+        if !current.is_empty() {
+            out.push(current);
+        }
+
+        if out.is_empty() {
+            out.push(String::new());
+        }
+
+        out
+    }
+
+    fn render_status_limit_progress_bar(percent_remaining: f64) -> String {
+        const SEGMENTS: usize = 20;
+        let ratio = (percent_remaining / 100.0).clamp(0.0, 1.0);
+        let filled = ((ratio * SEGMENTS as f64).round() as usize).min(SEGMENTS);
+        let empty = SEGMENTS.saturating_sub(filled);
+        format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+    }
+
+    fn format_tokens_compact(value: i64) -> String {
+        let value = value.max(0);
+        if value < 1_000 {
+            return value.to_string();
+        }
+
+        let value_f64 = value as f64;
+        let (scaled, suffix) = if value >= 1_000_000_000_000 {
+            (value_f64 / 1_000_000_000_000.0, "T")
+        } else if value >= 1_000_000_000 {
+            (value_f64 / 1_000_000_000.0, "B")
+        } else if value >= 1_000_000 {
+            (value_f64 / 1_000_000.0, "M")
+        } else {
+            (value_f64 / 1_000.0, "K")
+        };
+
+        let decimals = if scaled < 10.0 {
+            2
+        } else if scaled < 100.0 {
+            1
+        } else {
+            0
+        };
+
+        let mut formatted = format!("{scaled:.decimals$}");
+        if formatted.contains('.') {
+            while formatted.ends_with('0') {
+                formatted.pop();
+            }
+            if formatted.ends_with('.') {
+                formatted.pop();
+            }
+        }
+        format!("{formatted}{suffix}")
     }
 
     fn format_limit_duration_label(window_mins: i64) -> String {
