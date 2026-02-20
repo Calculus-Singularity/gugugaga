@@ -34,7 +34,6 @@ pub struct PersistentMemory {
     conversation_archive_path: PathBuf,
 }
 
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConversationTurn {
     pub timestamp: DateTime<Utc>,
@@ -363,12 +362,10 @@ impl PersistentMemory {
         let timestamp_str = &line[3..end_bracket];
         let content = line[end_bracket + 1..].trim().to_string();
 
-        let timestamp = DateTime::parse_from_str(
-            &format!("{} +0000", timestamp_str),
-            "%Y-%m-%d %H:%M %z",
-        )
-        .ok()?
-        .with_timezone(&Utc);
+        let timestamp =
+            DateTime::parse_from_str(&format!("{} +0000", timestamp_str), "%Y-%m-%d %H:%M %z")
+                .ok()?
+                .with_timezone(&Utc);
 
         Some(UserInstruction { timestamp, content })
     }
@@ -496,7 +493,11 @@ impl PersistentMemory {
         md.push_str("<!-- Recent N entries for pattern detection -->\n");
         let start = self.behavior_log.len().saturating_sub(20);
         for entry in &self.behavior_log[start..] {
-            let corrected_marker = if entry.was_corrected { " (corrected)" } else { "" };
+            let corrected_marker = if entry.was_corrected {
+                " (corrected)"
+            } else {
+                ""
+            };
             md.push_str(&format!(
                 "- [{}] {}{}\n",
                 entry.timestamp.format("%H:%M"),
@@ -530,7 +531,11 @@ impl PersistentMemory {
     }
 
     /// Set the current task objective
-    pub async fn set_task_objective(&mut self, main_goal: &str, constraints: Vec<String>) -> Result<()> {
+    pub async fn set_task_objective(
+        &mut self,
+        main_goal: &str,
+        constraints: Vec<String>,
+    ) -> Result<()> {
         self.current_task = Some(TaskObjective {
             main_goal: main_goal.to_string(),
             constraints,

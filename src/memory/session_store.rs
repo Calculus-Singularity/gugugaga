@@ -207,6 +207,9 @@ pub async fn restore_snapshot(
     memory.save().await?;
     notebook.save().await?;
 
-    info!("Restored full session state for thread {}", snapshot.thread_id);
+    info!(
+        "Restored full session state for thread {}",
+        snapshot.thread_id
+    );
     Ok(())
 }

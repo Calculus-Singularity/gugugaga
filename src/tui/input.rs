@@ -48,7 +48,7 @@ pub enum InputAction {
 }
 
 /// Input state manager
-/// 
+///
 /// Note: `cursor` is a CHARACTER index, not a byte index.
 /// This is important for proper handling of multi-byte characters (e.g., Chinese).
 #[derive(Debug, Clone)]
@@ -111,7 +111,8 @@ impl InputState {
             let byte_idx = self.char_to_byte_index(self.cursor);
             // Find the character at this position and remove it
             if let Some((_, ch)) = self.buffer.char_indices().nth(self.cursor) {
-                self.buffer.replace_range(byte_idx..byte_idx + ch.len_utf8(), "");
+                self.buffer
+                    .replace_range(byte_idx..byte_idx + ch.len_utf8(), "");
             }
         }
     }
@@ -122,7 +123,8 @@ impl InputState {
         if self.cursor < char_count {
             let byte_idx = self.char_to_byte_index(self.cursor);
             if let Some((_, ch)) = self.buffer.char_indices().nth(self.cursor) {
-                self.buffer.replace_range(byte_idx..byte_idx + ch.len_utf8(), "");
+                self.buffer
+                    .replace_range(byte_idx..byte_idx + ch.len_utf8(), "");
             }
         }
     }
@@ -198,7 +200,7 @@ impl InputState {
             }
 
             // Up/Down for scrolling (alternate scroll mode converts mouse wheel to arrows)
-            KeyCode::Up => InputAction::HistoryPrev,  // Used as scroll in app.rs
+            KeyCode::Up => InputAction::HistoryPrev, // Used as scroll in app.rs
             KeyCode::Down => InputAction::HistoryNext, // Used as scroll in app.rs
 
             // PageUp/PageDown for faster scrolling
@@ -252,7 +254,7 @@ impl InputState {
         }
 
         let chars: Vec<char> = self.buffer.chars().collect();
-        
+
         // Skip trailing whitespace
         while self.cursor > 0 && chars.get(self.cursor - 1) == Some(&' ') {
             self.remove_char_before_cursor();

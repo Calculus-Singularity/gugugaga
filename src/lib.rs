@@ -5,19 +5,19 @@
 //! - Maintain persistent memory across context compaction
 //! - Intelligently filter user interaction requests
 
+pub mod gugugaga_agent;
 pub mod interceptor;
+pub mod issues;
 pub mod memory;
 pub mod protocol;
 pub mod rules;
-pub mod gugugaga_agent;
-pub mod issues;
 pub mod trust;
 pub mod tui;
 
+pub use gugugaga_agent::{EvaluationResult, GugugagaAgent, UserInputAnalysis};
 pub use interceptor::Interceptor;
 pub use memory::PersistentMemory;
 pub use rules::{Violation, ViolationDetector, ViolationType};
-pub use gugugaga_agent::{EvaluationResult, GugugagaAgent, UserInputAnalysis};
 
 use std::path::PathBuf;
 
@@ -49,7 +49,10 @@ impl GugugagaConfig {
         let mut hasher = DefaultHasher::new();
         cwd.hash(&mut hasher);
         let dir_name = format!("{:016x}", hasher.finish());
-        let memory_file = codex_home.join("gugugaga").join(&dir_name).join("memory.md");
+        let memory_file = codex_home
+            .join("gugugaga")
+            .join(&dir_name)
+            .join("memory.md");
         Self {
             memory_file,
             cwd,

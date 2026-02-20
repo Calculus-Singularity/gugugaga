@@ -197,7 +197,9 @@ impl Responder {
     fn parse_violation_text(text: &str) -> ParsedCheck {
         // Try to split: TYPE separator rest
         // Accept `-`, `–`, `:` as separators
-        let parts: Vec<&str> = text.splitn(2, |c: char| c == '-' || c == '–' || c == ':').collect();
+        let parts: Vec<&str> = text
+            .splitn(2, |c: char| c == '-' || c == '–' || c == ':')
+            .collect();
 
         let (type_str, rest) = if parts.len() >= 2 {
             (parts[0].trim(), parts[1].trim())
@@ -400,7 +402,9 @@ mod tests {
     #[test]
     fn test_legacy_violation_text() {
         let r = Responder::new();
-        let parsed = r.parse_check_response("VIOLATION: FALLBACK - Codex said skip for now - Implement fully");
+        let parsed = r.parse_check_response(
+            "VIOLATION: FALLBACK - Codex said skip for now - Implement fully",
+        );
         assert!(parsed.violation.is_some());
         let v = parsed.violation.unwrap();
         assert_eq!(v.violation_type, ViolationType::Fallback);
@@ -409,7 +413,8 @@ mod tests {
     #[test]
     fn test_unparseable_is_ok() {
         let r = Responder::new();
-        let parsed = r.parse_check_response("I think everything is fine, Codex did what was asked.");
+        let parsed =
+            r.parse_check_response("I think everything is fine, Codex did what was asked.");
         assert!(parsed.violation.is_none());
         assert!(!parsed.summary.is_empty());
     }

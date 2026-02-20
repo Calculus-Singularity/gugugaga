@@ -107,11 +107,7 @@ fn has_trust_level(config_text: &str, project_key: &str) -> bool {
         .is_some()
 }
 
-fn write_trust_level(
-    codex_home: &Path,
-    project_key: &str,
-    trusted: bool,
-) -> anyhow::Result<()> {
+fn write_trust_level(codex_home: &Path, project_key: &str, trusted: bool) -> anyhow::Result<()> {
     let config_path = codex_home.join("config.toml");
     std::fs::create_dir_all(codex_home)?;
 
@@ -148,7 +144,10 @@ fn write_trust_level(
         .ok_or_else(|| anyhow::anyhow!("projects table missing"))?;
 
     if !projects_tbl.contains_key(project_key)
-        || projects_tbl.get(project_key).and_then(|i| i.as_table()).is_none()
+        || projects_tbl
+            .get(project_key)
+            .and_then(|i| i.as_table())
+            .is_none()
     {
         projects_tbl.insert(project_key, toml_edit::table());
     }

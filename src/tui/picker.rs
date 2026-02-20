@@ -141,8 +141,8 @@ impl Picker {
 
         // Build content
         let inner_height = height.saturating_sub(2) as usize;
-        
-        // inner_width accounts for border (2 cols) 
+
+        // inner_width accounts for border (2 cols)
         let inner_width = width.saturating_sub(2) as usize;
 
         let lines: Vec<Line> = if self.loading {
@@ -154,7 +154,8 @@ impl Picker {
             let detail_reserved = if show_detail { 4 } else { 0 };
             let list_height = inner_height.saturating_sub(detail_reserved).max(1);
 
-            let mut lines: Vec<Line> = self.items
+            let mut lines: Vec<Line> = self
+                .items
                 .iter()
                 .enumerate()
                 .skip(self.scroll_offset)
@@ -179,15 +180,15 @@ impl Picker {
                         Span::styled(truncated_title, style.bold()),
                     ])
                 })
-                .collect()
-            ;
+                .collect();
 
             if show_detail {
                 if let Some(selected) = self.items.get(self.selected) {
                     lines.push(Line::styled("─".repeat(inner_width), Theme::muted()));
-                    lines.push(Line::from(vec![
-                        Span::styled(selected.title.clone(), Theme::accent().bold()),
-                    ]));
+                    lines.push(Line::from(vec![Span::styled(
+                        selected.title.clone(),
+                        Theme::accent().bold(),
+                    )]));
 
                     let subtitle = selected.subtitle.trim();
                     if !subtitle.is_empty() {
@@ -203,7 +204,7 @@ impl Picker {
 
         let title = format!(" {} ", self.title);
         let help = " Up/Down Enter Esc ";
-        
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Theme::accent())

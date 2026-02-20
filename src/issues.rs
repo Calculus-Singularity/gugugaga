@@ -964,13 +964,13 @@ mod tests {
         let created = store
             .with_lock(false, |s| {
                 s.create_issue(
-                "add issue tracker",
-                CreateIssueInput {
+                    "add issue tracker",
+                    CreateIssueInput {
                         description: "rewrite issues in Rust".to_string(),
-                    priority: 1,
-                    deps: vec![],
-                    notes: "ship mvp first".to_string(),
-                },
+                        priority: 1,
+                        deps: vec![],
+                        notes: "ship mvp first".to_string(),
+                    },
                 )
             })
             .expect("create");

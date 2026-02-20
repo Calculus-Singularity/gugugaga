@@ -8,9 +8,9 @@
 //!
 //! Reference: codex-rs/core/src/compact.rs
 
+use super::persistent::{ConversationTurn, TurnRole};
 use crate::gugugaga_agent::Evaluator;
 use crate::Result;
-use super::persistent::{ConversationTurn, TurnRole};
 use tracing::{info, warn};
 
 /// Approximate bytes per token for context estimation
@@ -87,7 +87,9 @@ impl Compactor {
         let user_messages: Vec<String> = history
             .iter()
             .filter_map(|turn| {
-                if (turn.role == TurnRole::User || turn.role == TurnRole::UserToGugugaga) && !is_summary_message(&turn.content) {
+                if (turn.role == TurnRole::User || turn.role == TurnRole::UserToGugugaga)
+                    && !is_summary_message(&turn.content)
+                {
                     Some(turn.content.clone())
                 } else {
                     None
@@ -186,10 +188,7 @@ impl Compactor {
 /// Build compacted history: recent user messages + summary turn.
 ///
 /// Aligned with Codex's `build_compacted_history_with_limit`.
-fn build_compacted_history(
-    user_messages: &[String],
-    summary_text: &str,
-) -> Vec<ConversationTurn> {
+fn build_compacted_history(user_messages: &[String], summary_text: &str) -> Vec<ConversationTurn> {
     let mut result = Vec::new();
 
     // Select recent user messages (newest first, up to token limit)
@@ -274,11 +273,7 @@ fn generate_fallback_summary(user_messages: &[String]) -> String {
             .rev()
             .take(recent_count)
             .map(|m| {
-                let end = m
-                    .char_indices()
-                    .nth(80)
-                    .map(|(i, _)| i)
-                    .unwrap_or(m.len());
+                let end = m.char_indices().nth(80).map(|(i, _)| i).unwrap_or(m.len());
                 &m[..end]
             })
             .collect();
@@ -296,7 +291,10 @@ mod tests {
     #[test]
     fn test_is_summary_message() {
         assert!(is_summary_message(SUMMARY_PREFIX));
-        assert!(is_summary_message(&format!("{}\nSome summary", SUMMARY_PREFIX)));
+        assert!(is_summary_message(&format!(
+            "{}\nSome summary",
+            SUMMARY_PREFIX
+        )));
         assert!(is_summary_message("[Compacted tool results summary]\nfoo"));
         assert!(!is_summary_message("Regular message"));
     }

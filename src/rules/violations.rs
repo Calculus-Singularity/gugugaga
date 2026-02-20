@@ -130,7 +130,9 @@ mod tests {
         for msg in fallback_messages {
             let violations = detector.check(msg);
             assert!(
-                violations.iter().any(|v| v.violation_type == ViolationType::Fallback),
+                violations
+                    .iter()
+                    .any(|v| v.violation_type == ViolationType::Fallback),
                 "Should detect fallback in: {}",
                 msg
             );

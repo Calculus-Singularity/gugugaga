@@ -18,9 +18,7 @@ impl Theme {
 
     // Semantic styles
     pub fn title() -> Style {
-        Style::default()
-            .fg(Self::CYAN)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::CYAN).add_modifier(Modifier::BOLD)
     }
 
     pub fn subtitle() -> Style {
@@ -127,9 +125,7 @@ impl Theme {
 
     // Key hints
     pub fn key() -> Style {
-        Style::default()
-            .fg(Self::CYAN)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::CYAN).add_modifier(Modifier::BOLD)
     }
 
     pub fn key_desc() -> Style {

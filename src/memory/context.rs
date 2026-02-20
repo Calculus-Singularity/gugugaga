@@ -1,7 +1,7 @@
 //! Context builder for Gugugaga LLM interactions
 
-use super::PersistentMemory;
 use super::GugugagaNotebook;
+use super::PersistentMemory;
 
 /// Builds context strings for different Gugugaga operations
 pub struct ContextBuilder<'a> {
@@ -11,7 +11,10 @@ pub struct ContextBuilder<'a> {
 
 impl<'a> ContextBuilder<'a> {
     pub fn new(memory: &'a PersistentMemory) -> Self {
-        Self { memory, notebook: None }
+        Self {
+            memory,
+            notebook: None,
+        }
     }
 
     /// Add notebook context
@@ -23,7 +26,7 @@ impl<'a> ContextBuilder<'a> {
     /// Build combined context from memory and notebook
     fn build_full_context(&self) -> String {
         let mut context = String::new();
-        
+
         // Notebook first (most important - persistent state)
         if let Some(notebook) = self.notebook {
             let notebook_str = notebook.to_prompt_string();
@@ -33,10 +36,10 @@ impl<'a> ContextBuilder<'a> {
                 context.push_str("\n\n");
             }
         }
-        
+
         // Then memory context
         context.push_str(&self.memory.build_context());
-        
+
         context
     }
 

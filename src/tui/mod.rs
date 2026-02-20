@@ -14,7 +14,5 @@ mod widgets;
 
 pub use app::App;
 pub use picker::{Picker, PickerItem};
-pub use slash_commands::{
-    parse_command, CodexCommand, ParsedCommand, SlashPopup, GugugagaCommand,
-};
+pub use slash_commands::{parse_command, CodexCommand, GugugagaCommand, ParsedCommand, SlashPopup};
 pub use theme::Theme;

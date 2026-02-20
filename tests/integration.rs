@@ -1,8 +1,8 @@
 //! Integration tests for the Codex Supervisor
 
+use gugugaga::gugugaga_agent::Responder;
 use gugugaga::memory::PersistentMemory;
 use gugugaga::rules::{ViolationDetector, ViolationType};
-use gugugaga::gugugaga_agent::Responder;
 use gugugaga::GugugagaConfig;
 use std::path::PathBuf;
 use tempfile::TempDir;

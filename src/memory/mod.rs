@@ -12,9 +12,8 @@ pub mod session_store;
 pub use compact::Compactor;
 pub use context::ContextBuilder;
 pub use notebook::{
-    GugugagaNotebook, NotebookSummary,
-    CompletedItem, AttentionItem, MistakeEntry as NotebookMistakeEntry,
-    Priority, AttentionSource,
+    AttentionItem, AttentionSource, CompletedItem, GugugagaNotebook,
+    MistakeEntry as NotebookMistakeEntry, NotebookSummary, Priority,
 };
-pub use persistent::{PersistentMemory, TurnRole, ConversationTurn};
+pub use persistent::{ConversationTurn, PersistentMemory, TurnRole};
 pub use session_store::SessionStore;

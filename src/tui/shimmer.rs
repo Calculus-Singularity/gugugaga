@@ -4,8 +4,8 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
-use std::time::{Duration, Instant};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
@@ -24,12 +24,13 @@ pub fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
     let padding = 10usize;
     let period = chars.len() + padding * 2;
     let sweep_seconds = 2.0f32;
-    let pos_f = (elapsed_since_start().as_secs_f32() % sweep_seconds) / sweep_seconds * (period as f32);
+    let pos_f =
+        (elapsed_since_start().as_secs_f32() % sweep_seconds) / sweep_seconds * (period as f32);
     let pos = pos_f as usize;
     let band_half_width = 5.0;
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    
+
     for (i, ch) in chars.iter().enumerate() {
         let i_pos = i as isize + padding as isize;
         let pos = pos as isize;
@@ -65,9 +66,7 @@ pub struct AnimatedDots {
 }
 
 impl AnimatedDots {
-    const FRAMES: &'static [&'static str] = &[
-        "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
-    ];
+    const FRAMES: &'static [&'static str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
     pub fn new(frame: usize) -> Self {
         Self { frame }
@@ -98,7 +97,7 @@ impl ProgressBar {
         let progress = progress.clamp(0.0, 1.0);
         let filled = (progress * width as f32) as usize;
         let partial_idx = ((progress * width as f32 - filled as f32) * 8.0) as usize;
-        
+
         let mut bar = String::with_capacity(width);
         for i in 0..width {
             if i < filled {

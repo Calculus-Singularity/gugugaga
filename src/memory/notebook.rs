@@ -96,7 +96,7 @@ pub struct MistakeEntry {
 }
 
 /// Gugugaga's personal notebook
-/// 
+///
 /// This is independent of conversation history and never compacted.
 /// The agent updates it via tool calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,23 +104,23 @@ pub struct GugugagaNotebook {
     /// What Codex is currently doing
     #[serde(default)]
     pub current_activity: Option<String>,
-    
+
     /// Completed items with significance
     #[serde(default)]
     pub completed: Vec<CompletedItem>,
-    
+
     /// Items that need attention
     #[serde(default)]
     pub attention: Vec<AttentionItem>,
-    
+
     /// Mistakes and lessons learned
     #[serde(default)]
     pub mistakes: Vec<MistakeEntry>,
-    
+
     /// Last update timestamp
     #[serde(default)]
     pub last_updated: Option<DateTime<Utc>>,
-    
+
     /// File path for persistence
     #[serde(skip)]
     file_path: Option<PathBuf>,
@@ -146,7 +146,7 @@ impl GugugagaNotebook {
             file_path: Some(file_path.clone()),
             ..Default::default()
         };
-        
+
         // Load if exists
         if file_path.exists() {
             notebook = notebook.load().await?;
@@ -157,7 +157,7 @@ impl GugugagaNotebook {
             }
             notebook.save().await?;
         }
-        
+
         Ok(notebook)
     }
 
@@ -181,12 +181,12 @@ impl GugugagaNotebook {
             significance,
         });
         self.last_updated = Some(Utc::now());
-        
+
         // Keep only last 20 items
         if self.completed.len() > 20 {
             self.completed.remove(0);
         }
-        
+
         self.save().await
     }
 
@@ -201,7 +201,7 @@ impl GugugagaNotebook {
         if self.attention.iter().any(|a| a.content == content) {
             return Ok(());
         }
-        
+
         self.attention.push(AttentionItem {
             content,
             source,
@@ -209,12 +209,12 @@ impl GugugagaNotebook {
             added_at: Utc::now(),
         });
         self.last_updated = Some(Utc::now());
-        
+
         // Keep only last 30 items
         if self.attention.len() > 30 {
             self.attention.remove(0);
         }
-        
+
         self.save().await
     }
 
@@ -222,7 +222,7 @@ impl GugugagaNotebook {
     pub async fn remove_attention(&mut self, content: &str) -> Result<bool> {
         let initial_len = self.attention.len();
         self.attention.retain(|a| a.content != content);
-        
+
         if self.attention.len() != initial_len {
             self.last_updated = Some(Utc::now());
             self.save().await?;
@@ -246,34 +246,36 @@ impl GugugagaNotebook {
             lesson: lesson.clone(),
         });
         self.last_updated = Some(Utc::now());
-        
+
         // Keep only last 15 mistakes
         if self.mistakes.len() > 15 {
             self.mistakes.remove(0);
         }
-        
+
         // Also add to attention items
         self.add_attention(
             format!("Avoid: {}", lesson),
             AttentionSource::Mistake,
             Priority::High,
-        ).await?;
-        
+        )
+        .await?;
+
         self.save().await
     }
 
     /// Build string for injection into LLM prompt
     pub fn to_prompt_string(&self) -> String {
         let mut parts = Vec::new();
-        
+
         // Current activity
         if let Some(activity) = &self.current_activity {
             parts.push(format!("**Current Activity**: {}", activity));
         }
-        
+
         // Recent completions (last 5)
         if !self.completed.is_empty() {
-            let recent: Vec<String> = self.completed
+            let recent: Vec<String> = self
+                .completed
                 .iter()
                 .rev()
                 .take(5)
@@ -281,29 +283,38 @@ impl GugugagaNotebook {
                 .collect();
             parts.push(format!("**Recent Progress**:\n{}", recent.join("\n")));
         }
-        
+
         // Attention items by priority
         if !self.attention.is_empty() {
             let mut attention_lines = Vec::new();
-            
+
             // High priority first
-            for item in self.attention.iter().filter(|a| a.priority == Priority::High) {
+            for item in self
+                .attention
+                .iter()
+                .filter(|a| a.priority == Priority::High)
+            {
                 attention_lines.push(format!("- [!] {} ({})", item.content, item.source));
             }
             // Then medium
-            for item in self.attention.iter().filter(|a| a.priority == Priority::Medium) {
+            for item in self
+                .attention
+                .iter()
+                .filter(|a| a.priority == Priority::Medium)
+            {
                 attention_lines.push(format!("- {} ({})", item.content, item.source));
             }
             // Skip low priority in prompt to save tokens
-            
+
             if !attention_lines.is_empty() {
                 parts.push(format!("**Watch Points**:\n{}", attention_lines.join("\n")));
             }
         }
-        
+
         // Recent mistakes (last 3)
         if !self.mistakes.is_empty() {
-            let recent: Vec<String> = self.mistakes
+            let recent: Vec<String> = self
+                .mistakes
                 .iter()
                 .rev()
                 .take(3)
@@ -311,7 +322,7 @@ impl GugugagaNotebook {
                 .collect();
             parts.push(format!("**Past Mistakes**:\n{}", recent.join("\n")));
         }
-        
+
         if parts.is_empty() {
             String::new()
         } else {
@@ -325,7 +336,9 @@ impl GugugagaNotebook {
             current_activity: self.current_activity.clone(),
             completed_count: self.completed.len(),
             attention_count: self.attention.len(),
-            high_priority_count: self.attention.iter()
+            high_priority_count: self
+                .attention
+                .iter()
                 .filter(|a| a.priority == Priority::High)
                 .count(),
             mistakes_count: self.mistakes.len(),
@@ -350,14 +363,14 @@ impl GugugagaNotebook {
     pub async fn save(&self) -> Result<()> {
         if let Some(file_path) = &self.file_path {
             let content = serde_json::to_string_pretty(self)?;
-            
+
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(file_path)
                 .await?;
-            
+
             file.write_all(content.as_bytes()).await?;
             file.flush().await?;
         }
@@ -410,20 +423,26 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_operations() {
         let mut nb = GugugagaNotebook::in_memory();
-        
-        nb.set_current_activity(Some("Testing".to_string())).await.unwrap();
+
+        nb.set_current_activity(Some("Testing".to_string()))
+            .await
+            .unwrap();
         assert_eq!(nb.current_activity.as_deref(), Some("Testing"));
-        
-        nb.add_completed("Test 1".to_string(), "Important".to_string()).await.unwrap();
+
+        nb.add_completed("Test 1".to_string(), "Important".to_string())
+            .await
+            .unwrap();
         assert_eq!(nb.completed.len(), 1);
-        
+
         nb.add_attention(
             "Watch this".to_string(),
             AttentionSource::UserInstruction,
             Priority::High,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(nb.attention.len(), 1);
-        
+
         let prompt = nb.to_prompt_string();
         assert!(prompt.contains("Testing"));
         assert!(prompt.contains("Test 1"));

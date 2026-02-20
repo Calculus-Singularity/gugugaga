@@ -23,14 +23,14 @@ fn truncate_to_width(text: &str, max_display_width: usize) -> String {
     if text.width() <= max_display_width {
         return text.to_string();
     }
-    
+
     let suffix = "...";
     let suffix_width = suffix.width();
     let target_width = max_display_width.saturating_sub(suffix_width);
-    
+
     let mut result = String::new();
     let mut current_width = 0;
-    
+
     for c in text.chars() {
         let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
         if current_width + char_width > target_width {
@@ -39,7 +39,7 @@ fn truncate_to_width(text: &str, max_display_width: usize) -> String {
         result.push(c);
         current_width += char_width;
     }
-    
+
     result.push_str(suffix);
     result
 }
@@ -56,9 +56,9 @@ pub struct Message {
 pub enum MessageRole {
     User,
     Codex,
-    Thinking,      // Codex reasoning/thinking
-    CommandExec,   // Command execution output
-    FileChange,    // File change notification
+    Thinking,    // Codex reasoning/thinking
+    CommandExec, // Command execution output
+    FileChange,  // File change notification
     Gugugaga,
     UserToGugugaga, // User message directed at Gugugaga (via //)
     Correction,
@@ -167,7 +167,12 @@ impl Widget for HeaderBar<'_> {
         };
 
         let title_line = Line::from(title_spans);
-        buf.set_line(area.x + 1, area.y, &title_line, area.width.saturating_sub(2));
+        buf.set_line(
+            area.x + 1,
+            area.y,
+            &title_line,
+            area.width.saturating_sub(2),
+        );
 
         // Project name on the right — use display width, not char count
         let project_str = format!("[{}]", self.project);
@@ -264,7 +269,15 @@ impl Widget for StatsPanel {
         buf.set_line(inner.x, inner.y, &status_line, inner.width);
 
         let stats = vec![
-            ("Violations", self.violations, if self.violations > 0 { Theme::warning() } else { Theme::success() }),
+            (
+                "Violations",
+                self.violations,
+                if self.violations > 0 {
+                    Theme::warning()
+                } else {
+                    Theme::success()
+                },
+            ),
             ("Corrections", self.corrections, Theme::info()),
             ("Auto-replies", self.auto_replies, Theme::accent()),
         ];
@@ -378,10 +391,12 @@ impl Widget for ContextPanel {
         }
 
         // Attention items (high priority first)
-        let high_priority: Vec<_> = self.attention_items.iter()
+        let high_priority: Vec<_> = self
+            .attention_items
+            .iter()
             .filter(|(_, high)| *high)
             .collect();
-        
+
         if !high_priority.is_empty() && y_offset < inner.height {
             let line = Line::from(Span::styled("! Watch:", Theme::warning()));
             buf.set_line(inner.x, inner.y + y_offset, &line, inner.width);
@@ -412,7 +427,11 @@ impl Widget for ContextPanel {
         if y_offset < inner.height {
             let stats_text = format!("{} done | {} viol", self.completed_count, self.violations);
             let truncated = truncate_to_width(&stats_text, w);
-            let style = if self.violations > 0 { Theme::warning() } else { Theme::dim() };
+            let style = if self.violations > 0 {
+                Theme::warning()
+            } else {
+                Theme::dim()
+            };
             let line = Line::from(Span::styled(truncated, style));
             buf.set_line(inner.x, inner.y + y_offset, &line, inner.width);
             y_offset += 1;
@@ -549,14 +568,29 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
 
     // Codex-style role prefix: minimal markers instead of heavy badges
     let (role_prefix, role_style) = match msg.role {
-        MessageRole::User => ("› ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::DIM)),
+        MessageRole::User => (
+            "› ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::DIM),
+        ),
         MessageRole::Codex => ("", Style::default()),
         MessageRole::Thinking => ("", Theme::muted()),
         MessageRole::CommandExec => ("", Style::default().fg(Color::Yellow)),
         MessageRole::FileChange => ("", Style::default().fg(Color::Cyan)),
         MessageRole::Gugugaga => ("", Style::default()),
-        MessageRole::UserToGugugaga => ("› ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::DIM)),
-        MessageRole::Correction => ("! ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        MessageRole::UserToGugugaga => (
+            "› ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD | Modifier::DIM),
+        ),
+        MessageRole::Correction => (
+            "! ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         MessageRole::System => ("", Theme::system_badge()),
     };
 
@@ -598,13 +632,13 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
     ) {
         for raw_line in content.lines() {
             for wrapped in wrap_content(raw_line, avail) {
-                    lines.push(Line::from(vec![
-                        Span::raw(indent.to_string()),
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
                     Span::styled(wrapped, style),
-                    ]));
-                }
+                ]));
             }
         }
+    }
 
     /// Render markdown content using pulldown-cmark, with styles aligned to Codex.
     ///
@@ -622,28 +656,29 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
     ///   list markers → ordered: LightBlue, unordered: `- `
     ///   code blocks  → no wrapping, blank line before/after
     ///   hr           → `———`
-    fn add_markdown(
-        lines: &mut Vec<Line<'static>>,
-        content: &str,
-        avail: usize,
-        indent: &str,
-    ) {
-        use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, HeadingLevel};
+    fn add_markdown(lines: &mut Vec<Line<'static>>, content: &str, avail: usize, indent: &str) {
+        use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
         // ── Codex-aligned styles ──
         let style_code = Style::default().fg(Color::Cyan);
         let style_bold = Style::default().add_modifier(Modifier::BOLD);
         let style_italic = Style::default().add_modifier(Modifier::ITALIC);
         let style_strikethrough = Style::default().add_modifier(Modifier::CROSSED_OUT);
-        let style_link = Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
+        let style_link = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::UNDERLINED);
         let style_blockquote = Style::default().fg(Color::Green);
         let style_ol_marker = Style::default().fg(Color::LightBlue);
 
         fn heading_style(level: HeadingLevel) -> Style {
             match level {
-                HeadingLevel::H1 => Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                HeadingLevel::H1 => {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                }
                 HeadingLevel::H2 => Style::default().add_modifier(Modifier::BOLD),
-                HeadingLevel::H3 => Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                HeadingLevel::H3 => {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC)
+                }
                 _ => Style::default().add_modifier(Modifier::ITALIC),
             }
         }
@@ -657,9 +692,8 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
         let mut needs_blank = false;
         let mut link_url: Option<String> = None;
 
-        let current_style = |stack: &[Style]| -> Style {
-            stack.last().copied().unwrap_or_default()
-        };
+        let current_style =
+            |stack: &[Style]| -> Style { stack.last().copied().unwrap_or_default() };
 
         // Flush current_spans into `lines`, with wrapping for non-code-block content.
         let flush = |lines: &mut Vec<Line<'static>>,
@@ -768,10 +802,8 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                     let depth = list_indices.len();
                     let pad = "  ".repeat(depth.saturating_sub(1));
                     if let Some(Some(idx)) = list_indices.last_mut() {
-                        current_spans.push(Span::styled(
-                            format!("{}{}. ", pad, idx),
-                            style_ol_marker,
-                        ));
+                        current_spans
+                            .push(Span::styled(format!("{}{}. ", pad, idx), style_ol_marker));
                         *idx += 1;
                     } else {
                         current_spans.push(Span::raw(format!("{}- ", pad)));
@@ -913,14 +945,20 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
         }
 
         let is_completed = status_line.is_some();
-        let is_failed = status_line.map(|s| s.starts_with('\u{2717}')).unwrap_or(false);
+        let is_failed = status_line
+            .map(|s| s.starts_with('\u{2717}'))
+            .unwrap_or(false);
 
         let bullet_style = if is_failed {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         } else if is_completed {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         };
         let title = if is_completed { "Ran " } else { "Running " };
 
@@ -931,9 +969,12 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
             let cmd_wrapped = wrap_content(&cmd_text, cmd_avail);
 
             if let Some(first) = cmd_wrapped.first() {
-            lines.push(Line::from(vec![
+                lines.push(Line::from(vec![
                     Span::styled("• ", bullet_style),
-                    Span::styled(title.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        title.to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(first.clone(), Style::default().add_modifier(Modifier::DIM)),
                 ]));
             }
@@ -942,20 +983,25 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                 lines.push(Line::from(vec![
                     Span::raw(indent.to_string()),
                     Span::styled("  │ ", Style::default().add_modifier(Modifier::DIM)),
-                    Span::styled(wrapped_line.clone(), Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        wrapped_line.clone(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
                 ]));
             }
         } else {
             lines.push(Line::from(vec![
                 Span::styled("• ", bullet_style),
-                Span::styled(title.trim().to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    title.trim().to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
             ]));
         }
 
         // Output block with └ prefix
-        let non_empty_output: Vec<&&str> = output_lines_vec.iter()
-            .filter(|l| !l.is_empty())
-            .collect();
+        let non_empty_output: Vec<&&str> =
+            output_lines_vec.iter().filter(|l| !l.is_empty()).collect();
         if !non_empty_output.is_empty() {
             let output_avail = text_avail.saturating_sub(4); // "  └ " or "    " prefix
             for (i, &&out_line) in non_empty_output.iter().enumerate() {
@@ -966,11 +1012,21 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                 };
                 let out_wrapped = wrap_content(out_line, output_avail);
                 for (j, wrapped) in out_wrapped.iter().enumerate() {
-                    let pfx = if j == 0 { initial_prefix } else { continuation_prefix };
+                    let pfx = if j == 0 {
+                        initial_prefix
+                    } else {
+                        continuation_prefix
+                    };
                     lines.push(Line::from(vec![
                         Span::raw(indent.to_string()),
-                        Span::styled(pfx.to_string(), Style::default().add_modifier(Modifier::DIM)),
-                        Span::styled(wrapped.clone(), Style::default().add_modifier(Modifier::DIM)),
+                        Span::styled(
+                            pfx.to_string(),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ),
+                        Span::styled(
+                            wrapped.clone(),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ),
                     ]));
                 }
             }
@@ -986,7 +1042,9 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
         // Status line: ✓ • 50ms or ✗ (1) • 50ms
         if let Some(status) = status_line {
             let style = if status.starts_with('\u{2713}') {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
             };
@@ -1029,7 +1087,7 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
             MessageRole::Correction => {
                 // Correction prefix on first line
                 if !role_prefix.is_empty() {
-        lines.push(Line::from(vec![
+                    lines.push(Line::from(vec![
                         Span::raw(indent.to_string()),
                         Span::styled(role_prefix, role_style),
                     ]));
@@ -1048,17 +1106,14 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                     .add_modifier(Modifier::BOLD);
 
                 // Top padding line with background
-                lines.push(Line::from(Span::styled(
-                    " ".repeat(max_width),
-                    user_bg,
-                )));
+                lines.push(Line::from(Span::styled(" ".repeat(max_width), user_bg)));
 
                 let wrapped = wrap_content(&content, text_avail.saturating_sub(2));
                 for (i, line_text) in wrapped.iter().enumerate() {
                     let text_len = line_text.width();
                     let pad_len = text_avail.saturating_sub(2).saturating_sub(text_len);
                     if i == 0 {
-        lines.push(Line::from(vec![
+                        lines.push(Line::from(vec![
                             Span::styled(indent.to_string(), user_bg),
                             Span::styled("› ", prefix_style),
                             Span::styled(line_text.clone(), user_text),
@@ -1075,10 +1130,7 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                 }
 
                 // Bottom padding line with background
-                lines.push(Line::from(Span::styled(
-                    " ".repeat(max_width),
-                    user_bg,
-                )));
+                lines.push(Line::from(Span::styled(" ".repeat(max_width), user_bg)));
             }
             MessageRole::UserToGugugaga => {
                 // User message to Gugugaga: magenta left bar (matches Gugugaga's accent)
@@ -1121,9 +1173,13 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
 
                 if is_tool_call {
                     // Tool-call card: "▎ $ tool(args)" style
-                    let cmd_style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+                    let cmd_style = Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD);
                     let output_style = Style::default().fg(Color::Rgb(170, 165, 180));
-                    let result_ok = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+                    let result_ok = Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD);
                     let result_fail = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
 
                     let content_lines: Vec<&str> = content.lines().collect();
@@ -1136,8 +1192,14 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                         if i == 0 {
                             spans.push(Span::styled(line_text.to_string(), cmd_style));
                         } else if line_text.starts_with('✓') || line_text.starts_with('✗') {
-                            let (icon, rest) = line_text.split_at(line_text.chars().next().map(|c| c.len_utf8()).unwrap_or(1));
-                            let icon_style = if icon == "✓" { result_ok } else { result_fail };
+                            let (icon, rest) = line_text.split_at(
+                                line_text.chars().next().map(|c| c.len_utf8()).unwrap_or(1),
+                            );
+                            let icon_style = if icon == "✓" {
+                                result_ok
+                            } else {
+                                result_fail
+                            };
                             spans.push(Span::styled(icon.to_string(), icon_style));
                             spans.push(Span::styled(rest.to_string(), dim_style));
                         } else {
@@ -1148,7 +1210,12 @@ pub fn render_message_lines(msg: &Message, max_width: usize) -> Vec<Line<'static
                 } else {
                     // Regular Gugugaga message: "▎ content" with left accent bar
                     let mut md_lines = Vec::new();
-                    add_markdown(&mut md_lines, &content, text_avail.saturating_sub(bar_w + 1), "");
+                    add_markdown(
+                        &mut md_lines,
+                        &content,
+                        text_avail.saturating_sub(bar_w + 1),
+                        "",
+                    );
                     for (_i, md_line) in md_lines.into_iter().enumerate() {
                         let mut spans = Vec::new();
                         spans.push(Span::styled(indent.to_string(), Style::default()));
@@ -1199,7 +1266,7 @@ fn render_file_change_diff(
             if raw_line.starts_with("[fc:") || raw_line.starts_with("[turn diff]") {
                 continue;
             }
-        lines.push(Line::from(vec![
+            lines.push(Line::from(vec![
                 Span::raw(indent.to_string()),
                 Span::styled(raw_line.to_string(), Theme::dim()),
             ]));
@@ -1216,7 +1283,10 @@ fn render_file_change_diff(
         let noun = if file_count == 1 { "file" } else { "files" };
         lines.push(Line::from(vec![
             Span::styled(format!("{}• ", indent), style_gutter),
-            Span::styled("Edited".to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Edited".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw(format!(" {} {} ", file_count, noun)),
             Span::raw("("),
             Span::styled(format!("+{}", total_added), style_add),
@@ -1240,13 +1310,16 @@ fn render_file_change_diff(
 
         let file_prefix = if file_count > 1 {
             format!("{}  └ ", indent)
-            } else {
+        } else {
             format!("{}• ", indent)
-            };
+        };
 
-            lines.push(Line::from(vec![
+        lines.push(Line::from(vec![
             Span::styled(file_prefix, style_gutter),
-            Span::styled(verb.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                verb.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw(format!(" {} ", block.filename)),
             Span::raw("("),
             Span::styled(format!("+{}", block.added), style_add),
@@ -1263,17 +1336,12 @@ fn render_file_change_diff(
         for hunk in &block.hunks {
             if !is_first_hunk {
                 // Hunk separator
-                let spacer = format!(
-                    "{}{:>width$} ",
-                    indent,
-                    "",
-                    width = gutter_width
-                );
+                let spacer = format!("{}{:>width$} ", indent, "", width = gutter_width);
                 lines.push(Line::from(vec![
                     Span::styled(spacer, style_gutter),
                     Span::styled("⋮".to_string(), style_gutter),
-            ]));
-        }
+                ]));
+            }
             is_first_hunk = false;
 
             for diff_line in &hunk.lines {
@@ -1299,25 +1367,15 @@ fn render_file_change_diff(
                     remaining = rest;
 
                     if first {
-                        let gutter = format!(
-                            "{}{:>width$} ",
-                            indent,
-                            ln,
-                            width = gutter_width
-                        );
+                        let gutter = format!("{}{:>width$} ", indent, ln, width = gutter_width);
                         lines.push(Line::from(vec![
                             Span::styled(gutter, style_gutter),
                             Span::styled(format!("{}{}", sign, chunk), line_style),
                         ]));
                         first = false;
-    } else {
-                        let gutter = format!(
-                            "{}{:>width$}  ",
-                            indent,
-                            "",
-                            width = gutter_width
-                        );
-        lines.push(Line::from(vec![
+                    } else {
+                        let gutter = format!("{}{:>width$}  ", indent, "", width = gutter_width);
+                        lines.push(Line::from(vec![
                             Span::styled(gutter, style_gutter),
                             Span::styled(chunk.to_string(), line_style),
                         ]));
@@ -1440,7 +1498,8 @@ fn parse_diff_blocks(content: &str) -> Vec<DiffBlock> {
                 i += 1;
             }
 
-            let (hunks, added, removed, max_ln) = parse_unified_diff(&diff_text, DiffChangeType::Update);
+            let (hunks, added, removed, max_ln) =
+                parse_unified_diff(&diff_text, DiffChangeType::Update);
             let change_type = if removed == 0 && added > 0 {
                 DiffChangeType::Add
             } else if added == 0 && removed > 0 {
@@ -1526,7 +1585,11 @@ fn parse_unified_diff(text: &str, hint: DiffChangeType) -> (Vec<DiffHunk>, usize
             old_ln += 1;
             total_removed += 1;
         } else if line.starts_with(' ') || (!line.is_empty() && !line.starts_with('\\')) {
-            let text = if line.starts_with(' ') { &line[1..] } else { line };
+            let text = if line.starts_with(' ') {
+                &line[1..]
+            } else {
+                line
+            };
             max_line_number = max_line_number.max(new_ln);
             current_hunk_lines.push(DiffLine::Context(new_ln, text.to_string()));
             old_ln += 1;
@@ -1612,7 +1675,7 @@ fn extract_filename_from_diff_header(line: &str) -> String {
 #[cfg(test)]
 mod md_test {
     use super::*;
-    
+
     #[test]
     fn test_markdown_rendering() {
         let content = "可以，文件在：\n\n- calculator.py:1\n\n功能包括：\n- 支持加减\n- 支持退出\n\n运行：\n\n```bash\npython3 calc.py\n```";
@@ -1620,11 +1683,21 @@ mod md_test {
         let lines = render_message_lines(&msg, 80);
         // Badge + paragraph + blank + list item + blank + paragraph + blank
         // + 2 list items + blank + paragraph + blank + code line + spacing = 14
-        assert!(lines.len() > 5, "Expected multiple lines, got {}", lines.len());
+        assert!(
+            lines.len() > 5,
+            "Expected multiple lines, got {}",
+            lines.len()
+        );
         // Check list items are on separate lines
-        let texts: Vec<String> = lines.iter().map(|l| {
-            l.spans.iter().map(|s| s.content.as_ref().to_string()).collect()
-        }).collect();
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref().to_string())
+                    .collect()
+            })
+            .collect();
         assert!(texts.iter().any(|t| t.contains("- 支持加减")));
         assert!(texts.iter().any(|t| t.contains("- 支持退出")));
         assert!(texts.iter().any(|t| t.contains("python3 calc.py")));
@@ -1634,6 +1707,9 @@ mod md_test {
     fn test_sanitize_preserves_newlines() {
         let input = "Hello\nWorld\n\n- item";
         let output = sanitize_for_display(input);
-        assert_eq!(output, input, "sanitize_for_display should preserve newlines");
+        assert_eq!(
+            output, input,
+            "sanitize_for_display should preserve newlines"
+        );
     }
 }

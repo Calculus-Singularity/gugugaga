@@ -193,15 +193,15 @@ pub fn create_turn_interrupt_request(id: u64, thread_id: &str) -> JsonRpcRequest
 /// Extract text from agent message delta
 pub fn extract_agent_message_text(params: &Value) -> Option<String> {
     // The field is "delta", not "text"
-    params.get("delta").and_then(|v| v.as_str()).map(String::from)
+    params
+        .get("delta")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Extract questions from user input request
 pub fn extract_user_input_questions(params: &Value) -> Option<Vec<Value>> {
-    params
-        .get("questions")
-        .and_then(|v| v.as_array())
-        .cloned()
+    params.get("questions").and_then(|v| v.as_array()).cloned()
 }
 
 /// Check if this is a plan update notification

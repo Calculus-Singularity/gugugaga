@@ -2,12 +2,12 @@
 //!
 //! Starts app-server as a subprocess and intercepts all JSONL communication.
 
-use crate::memory::{PersistentMemory, GugugagaNotebook, SessionStore, TurnRole};
+use crate::gugugaga_agent::{EvaluationResult, GugugagaAgent};
 use crate::memory::session_store;
+use crate::memory::{GugugagaNotebook, PersistentMemory, SessionStore, TurnRole};
 use crate::protocol::{self, notifications};
 use crate::rules::ViolationDetector;
-use crate::gugugaga_agent::{EvaluationResult, GugugagaAgent};
-use crate::{Result, GugugagaConfig, GugugagaError};
+use crate::{GugugagaConfig, GugugagaError, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -68,14 +68,18 @@ impl Interceptor {
         let notebook = Arc::new(RwLock::new(notebook));
 
         // Initialize session store for per-thread state caching
-        let project_dir = config.memory_file.parent().unwrap_or(std::path::Path::new("."));
+        let project_dir = config
+            .memory_file
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
         let session_store = SessionStore::new(project_dir).await?;
         // Clean up old sessions (keep the 50 most recent)
         let _ = session_store.cleanup(50).await;
         let session_store = Arc::new(session_store);
 
         // Initialize gugugaga agent
-        let gugugaga_agent = GugugagaAgent::new(&config.codex_home, memory.clone(), notebook.clone()).await?;
+        let gugugaga_agent =
+            GugugagaAgent::new(&config.codex_home, memory.clone(), notebook.clone()).await?;
         let gugugaga_agent = Arc::new(gugugaga_agent);
 
         Ok(Self {
@@ -111,15 +115,20 @@ impl Interceptor {
 
         // Channel for messages to send to app-server
         let (to_server_tx, mut to_server_rx) = mpsc::channel::<String>(32);
-        
+
         // Notify TUI that gugugaga is active
-        let _ = output_tx.send(serde_json::json!({
-            "method": "gugugaga/status",
-            "params": {
-                "message": "Gugugaga active. Monitoring Codex behavior.",
-                "strictMode": self.config.strict_mode
-            }
-        }).to_string()).await;
+        let _ = output_tx
+            .send(
+                serde_json::json!({
+                    "method": "gugugaga/status",
+                    "params": {
+                        "message": "Gugugaga active. Monitoring Codex behavior.",
+                        "strictMode": self.config.strict_mode
+                    }
+                })
+                .to_string(),
+            )
+            .await;
 
         // Spawn task to read from app-server stdout
         let output_tx_clone = output_tx.clone();
@@ -141,7 +150,7 @@ impl Interceptor {
             let mut initialized_thread_id: Option<String> = None;
             // Track all active threads (main + sub-agents)
             let mut active_threads: HashMap<String, String> = HashMap::new(); // id -> source/label
-            // Legacy: single accumulator for when we don't know the thread
+                                                                              // Legacy: single accumulator for when we don't know the thread
             let mut current_turn_content = String::new();
             // Channel to send corrections to Codex
             let correction_tx = to_server_tx_clone;
@@ -178,17 +187,22 @@ impl Interceptor {
                                         // Build ordered session restore containing ALL turns
                                         // (User, Codex, Gugugaga) so the TUI can display them
                                         // in the correct interleaved order.
-                                        let has_gugugaga = snapshot.memory.conversation_history
+                                        let has_gugugaga = snapshot
+                                            .memory
+                                            .conversation_history
                                             .iter()
                                             .any(|t| t.role == TurnRole::Gugugaga);
                                         if has_gugugaga {
-                                            let turns: Vec<serde_json::Value> = snapshot.memory
+                                            let turns: Vec<serde_json::Value> = snapshot
+                                                .memory
                                                 .conversation_history
                                                 .iter()
                                                 .map(|t| {
                                                     let role = match t.role {
                                                         TurnRole::User => "user",
-                                                        TurnRole::UserToGugugaga => "user_to_gugugaga",
+                                                        TurnRole::UserToGugugaga => {
+                                                            "user_to_gugugaga"
+                                                        }
                                                         TurnRole::Codex => "codex",
                                                         TurnRole::Gugugaga => "gugugaga",
                                                     };
@@ -203,7 +217,8 @@ impl Interceptor {
                                                 serde_json::json!({
                                                     "method": "gugugaga/sessionRestore",
                                                     "params": { "turns": turns }
-                                                }).to_string()
+                                                })
+                                                .to_string(),
                                             );
                                         }
                                         // Resuming an existing thread — restore its state
@@ -211,7 +226,9 @@ impl Interceptor {
                                         let mut nb = notebook.write().await;
                                         if let Err(e) = session_store::restore_snapshot(
                                             &mut mem, &mut nb, snapshot,
-                                        ).await {
+                                        )
+                                        .await
+                                        {
                                             warn!("Failed to restore session for {}: {}", tid, e);
                                         }
                                     }
@@ -243,7 +260,7 @@ impl Interceptor {
                             .and_then(|p| p.get("threadId"))
                             .and_then(|t| t.as_str())
                             .map(|s| s.to_string());
-                        
+
                         // Accumulate agent message content
                         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
                         match method {
@@ -257,9 +274,16 @@ impl Interceptor {
                             }
                             "item/agentMessage/delta" => {
                                 // Accumulate agent output (per-thread)
-                                if let Some(delta) = msg.get("params").and_then(|p| p.get("delta")).and_then(|d| d.as_str()) {
+                                if let Some(delta) = msg
+                                    .get("params")
+                                    .and_then(|p| p.get("delta"))
+                                    .and_then(|d| d.as_str())
+                                {
                                     if let Some(tid) = &notif_thread_id {
-                                        thread_turn_content.entry(tid.clone()).or_default().push_str(delta);
+                                        thread_turn_content
+                                            .entry(tid.clone())
+                                            .or_default()
+                                            .push_str(delta);
                                     }
                                     current_turn_content.push_str(delta);
                                 }
@@ -268,18 +292,27 @@ impl Interceptor {
                             // knows what Codex actually DID (not just what it said).
                             "item/started" => {
                                 if let Some(item) = msg.get("params").and_then(|p| p.get("item")) {
-                                    let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                    let item_type =
+                                        item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                     let annotation = match item_type {
                                         "commandExecution" => {
-                                            let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("?");
+                                            let cmd = item
+                                                .get("command")
+                                                .and_then(|c| c.as_str())
+                                                .unwrap_or("?");
                                             Some(format!("\n[EXECUTED COMMAND] $ {}", cmd))
                                         }
                                         "fileChange" => {
                                             let mut paths = Vec::new();
-                                            if let Some(changes) = item.get("changes").and_then(|c| c.as_array()) {
+                                            if let Some(changes) =
+                                                item.get("changes").and_then(|c| c.as_array())
+                                            {
                                                 for change in changes {
-                                                    if let Some(p) = change.get("path").and_then(|p| p.as_str()) {
-                                                        let kind = change.get("kind")
+                                                    if let Some(p) =
+                                                        change.get("path").and_then(|p| p.as_str())
+                                                    {
+                                                        let kind = change
+                                                            .get("kind")
                                                             .and_then(|k| k.get("type"))
                                                             .and_then(|t| t.as_str())
                                                             .unwrap_or("modify");
@@ -288,7 +321,10 @@ impl Interceptor {
                                                 }
                                             }
                                             if !paths.is_empty() {
-                                                Some(format!("\n[FILE CHANGES] {}", paths.join(", ")))
+                                                Some(format!(
+                                                    "\n[FILE CHANGES] {}",
+                                                    paths.join(", ")
+                                                ))
                                             } else {
                                                 None
                                             }
@@ -297,7 +333,10 @@ impl Interceptor {
                                     };
                                     if let Some(text) = annotation {
                                         if let Some(tid) = &notif_thread_id {
-                                            thread_turn_content.entry(tid.clone()).or_default().push_str(&text);
+                                            thread_turn_content
+                                                .entry(tid.clone())
+                                                .or_default()
+                                                .push_str(&text);
                                         }
                                         current_turn_content.push_str(&text);
                                     }
@@ -306,21 +345,35 @@ impl Interceptor {
                             // Track command completion (exit code) and sub-agent spawns.
                             "item/completed" => {
                                 if let Some(item) = msg.get("params").and_then(|p| p.get("item")) {
-                                    let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                    let item_type =
+                                        item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                     match item_type {
                                         "commandExecution" => {
-                                            let exit_code = item.get("exitCode").and_then(|e| e.as_i64()).unwrap_or(-1);
-                                            let annotation = format!("\n[COMMAND EXIT {}]", exit_code);
+                                            let exit_code = item
+                                                .get("exitCode")
+                                                .and_then(|e| e.as_i64())
+                                                .unwrap_or(-1);
+                                            let annotation =
+                                                format!("\n[COMMAND EXIT {}]", exit_code);
                                             if let Some(tid) = &notif_thread_id {
-                                                thread_turn_content.entry(tid.clone()).or_default().push_str(&annotation);
+                                                thread_turn_content
+                                                    .entry(tid.clone())
+                                                    .or_default()
+                                                    .push_str(&annotation);
                                             }
                                             current_turn_content.push_str(&annotation);
                                         }
                                         "fileChange" => {
-                                            let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("completed");
+                                            let status = item
+                                                .get("status")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or("completed");
                                             let annotation = format!("\n[FILE CHANGE {}]", status);
                                             if let Some(tid) = &notif_thread_id {
-                                                thread_turn_content.entry(tid.clone()).or_default().push_str(&annotation);
+                                                thread_turn_content
+                                                    .entry(tid.clone())
+                                                    .or_default()
+                                                    .push_str(&annotation);
                                             }
                                             current_turn_content.push_str(&annotation);
                                         }
@@ -328,12 +381,20 @@ impl Interceptor {
                                     }
                                     // Track sub-agent spawns
                                     if let Some(details) = item.get("details") {
-                                        if let Some(tool) = details.get("tool").and_then(|t| t.as_str()) {
+                                        if let Some(tool) =
+                                            details.get("tool").and_then(|t| t.as_str())
+                                        {
                                             if tool == "spawnAgent" {
-                                                if let Some(ids) = details.get("receiverThreadIds").and_then(|r| r.as_array()) {
+                                                if let Some(ids) = details
+                                                    .get("receiverThreadIds")
+                                                    .and_then(|r| r.as_array())
+                                                {
                                                     for id in ids {
                                                         if let Some(tid) = id.as_str() {
-                                                            active_threads.insert(tid.to_string(), "sub-agent".to_string());
+                                                            active_threads.insert(
+                                                                tid.to_string(),
+                                                                "sub-agent".to_string(),
+                                                            );
                                                             debug!("Sub-agent spawned: {}", tid);
                                                         }
                                                     }
@@ -364,13 +425,14 @@ impl Interceptor {
                                     let thinking_msg = serde_json::json!({
                                         "method": "gugugaga/thinking",
                                         "params": { "message": "Evaluating..." }
-                                    }).to_string();
+                                    })
+                                    .to_string();
                                     let _ = output_tx_clone.send(thinking_msg).await;
                                 }
                             }
                             _ => {}
                         }
-                        
+
                         // Resolve per-thread content: prefer thread-specific, fallback to global
                         let effective_content = notif_thread_id
                             .as_ref()
@@ -443,7 +505,9 @@ impl Interceptor {
                                     }
                                 });
                                 let _ = output_tx_clone
-                                    .send(serde_json::to_string(&correction_msg).unwrap_or_default())
+                                    .send(
+                                        serde_json::to_string(&correction_msg).unwrap_or_default(),
+                                    )
                                     .await;
                             }
                             InterceptAction::CorrectAgent(correction) => {
@@ -451,7 +515,7 @@ impl Interceptor {
                                 if output_tx_clone.send(line).await.is_err() {
                                     break;
                                 }
-                                
+
                                 // Need threadId to send correction
                                 if let Some(thread_id) = &current_thread_id {
                                     // Send correction directly to Codex as a user message
@@ -496,7 +560,10 @@ impl Interceptor {
                     Err(_) => {
                         // Non-JSON lines (e.g. tracing log output from app-server)
                         // — silently drop, do NOT forward to TUI.
-                        debug!("Dropping non-JSON server output: {}", &line[..line.len().min(120)]);
+                        debug!(
+                            "Dropping non-JSON server output: {}",
+                            &line[..line.len().min(120)]
+                        );
                     }
                 }
             }
@@ -533,7 +600,8 @@ impl Interceptor {
                     if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
                         // Handle gugugaga/chat locally — don't forward to app-server
                         if method == "gugugaga/chat" {
-                            let user_msg = msg.get("params")
+                            let user_msg = msg
+                                .get("params")
                                 .and_then(|p| p.get("message"))
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("")
@@ -543,14 +611,17 @@ impl Interceptor {
                                 // Record user message (as UserToGugugaga so restore shows correct style)
                                 {
                                     let mut mem = chat_memory.write().await;
-                                    let _ = mem.add_turn(
-                                        crate::memory::TurnRole::UserToGugugaga,
-                                        user_msg.clone(),
-                                    ).await;
+                                    let _ = mem
+                                        .add_turn(
+                                            crate::memory::TurnRole::UserToGugugaga,
+                                            user_msg.clone(),
+                                        )
+                                        .await;
                                 }
 
                                 // Call Gugugaga agent with event streaming
-                                let response = chat_agent.chat(&user_msg, Some(&chat_output_tx)).await;
+                                let response =
+                                    chat_agent.chat(&user_msg, Some(&chat_output_tx)).await;
 
                                 // Send response back to TUI
                                 let reply = match response {
@@ -571,15 +642,21 @@ impl Interceptor {
                         // Record user message to memory if it's a turn start
                         if method == protocol::methods::TURN_START {
                             if let Some(params) = msg.get("params") {
-                                if let Some(input_arr) = params.get("input").and_then(|i| i.as_array()) {
+                                if let Some(input_arr) =
+                                    params.get("input").and_then(|i| i.as_array())
+                                {
                                     let mut mem = memory.write().await;
                                     for item in input_arr {
-                                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                        if let Some(text) =
+                                            item.get("text").and_then(|t| t.as_str())
+                                        {
                                             // Record to conversation history
-                                            let _ = mem.add_turn(
-                                                crate::memory::TurnRole::User,
-                                                text.to_string()
-                                            ).await;
+                                            let _ = mem
+                                                .add_turn(
+                                                    crate::memory::TurnRole::User,
+                                                    text.to_string(),
+                                                )
+                                                .await;
                                             // Also record as instruction if applicable
                                             let _ = mem.record_user_instruction(text).await;
                                         }
@@ -659,16 +736,11 @@ impl Interceptor {
         event_tx: &tokio::sync::mpsc::Sender<String>,
         server_tx: &tokio::sync::mpsc::Sender<String>,
     ) -> InterceptAction {
-        let method = msg
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
         match method {
             // Check for plan updates
-            m if protocol::is_plan_update(m) => {
-                InterceptAction::Forward
-            }
+            m if protocol::is_plan_update(m) => InterceptAction::Forward,
 
             // Check agent messages for violations
             notifications::ITEM_AGENT_MESSAGE_DELTA => {
@@ -684,22 +756,26 @@ impl Interceptor {
                             // In non-strict mode, notify user but don't interrupt
                             let mut mem = memory.write().await;
                             let _ = mem
-                                .record_behavior(&format!("Violation: {}", violation.description), false)
+                                .record_behavior(
+                                    &format!("Violation: {}", violation.description),
+                                    false,
+                                )
                                 .await;
-                            let _ = mem.add_turn(
-                                crate::memory::TurnRole::Gugugaga,
-                                format!("⚠️ {}", violation.description),
-                            ).await;
-                            
+                            let _ = mem
+                                .add_turn(
+                                    crate::memory::TurnRole::Gugugaga,
+                                    format!("⚠️ {}", violation.description),
+                                )
+                                .await;
+
                             // Send violation notification so TUI can display it
-                            return InterceptAction::InjectBefore(vec![
-                                serde_json::json!({
-                                    "method": "gugugaga/violation",
-                                    "params": {
-                                        "message": violation.description.clone()
-                                    }
-                                }).to_string()
-                            ]);
+                            return InterceptAction::InjectBefore(vec![serde_json::json!({
+                                "method": "gugugaga/violation",
+                                "params": {
+                                    "message": violation.description.clone()
+                                }
+                            })
+                            .to_string()]);
                         }
                     }
                 }
@@ -717,35 +793,43 @@ impl Interceptor {
                 // Record Codex output to conversation history
                 {
                     let mut mem = memory.write().await;
-                    let _ = mem.add_turn(
-                        crate::memory::TurnRole::Codex,
-                        current_turn_content.to_string()
-                    ).await;
+                    let _ = mem
+                        .add_turn(
+                            crate::memory::TurnRole::Codex,
+                            current_turn_content.to_string(),
+                        )
+                        .await;
                 }
-                
+
                 // Perform LLM evaluation with actual turn content
                 // Pass event_tx so thinking/tool-call activity is streamed to TUI
-                let eval_result = gugugaga_agent.detect_violation(current_turn_content, Some(event_tx)).await;
-                
+                let eval_result = gugugaga_agent
+                    .detect_violation(current_turn_content, Some(event_tx))
+                    .await;
+
                 match eval_result {
                     Ok(result) => {
                         if let Some(violation) = result.violation {
                             // Record mistake to GugugagaNotebook (not PersistentMemory)
                             {
                                 let mut nb = notebook.write().await;
-                                let _ = nb.record_mistake(
-                                    violation.description.clone(),
-                                    violation.correction.clone(),
-                                    format!("Codex violated: {}", violation.description),
-                                ).await;
+                                let _ = nb
+                                    .record_mistake(
+                                        violation.description.clone(),
+                                        violation.correction.clone(),
+                                        format!("Codex violated: {}", violation.description),
+                                    )
+                                    .await;
                             }
                             // Record Gugugaga output to conversation history
                             {
                                 let mut mem = memory.write().await;
-                                let _ = mem.add_turn(
-                                    crate::memory::TurnRole::Gugugaga,
-                                    format!("🛡️ Violation: {}", violation.description),
-                                ).await;
+                                let _ = mem
+                                    .add_turn(
+                                        crate::memory::TurnRole::Gugugaga,
+                                        format!("🛡️ Violation: {}", violation.description),
+                                    )
+                                    .await;
                             }
                             // Found a violation - send correction directly to Codex
                             // Use LLM's correction as-is, no template wrapper
@@ -756,10 +840,9 @@ impl Interceptor {
                             // Record Gugugaga output to conversation history
                             {
                                 let mut mem = memory.write().await;
-                                let _ = mem.add_turn(
-                                    crate::memory::TurnRole::Gugugaga,
-                                    summary.clone(),
-                                ).await;
+                                let _ = mem
+                                    .add_turn(crate::memory::TurnRole::Gugugaga, summary.clone())
+                                    .await;
                             }
                             let mut params = serde_json::json!({
                                 "status": "ok",
@@ -772,7 +855,8 @@ impl Interceptor {
                             let msg = serde_json::json!({
                                 "method": "gugugaga/check",
                                 "params": params
-                            }).to_string();
+                            })
+                            .to_string();
                             return InterceptAction::InjectAfter(vec![msg]);
                         }
                     }
@@ -839,14 +923,13 @@ impl Interceptor {
                         Ok(EvaluationResult::Correct(correction)) => {
                             // Show correction context, but keep the original request so
                             // the user can still provide an explicit answer.
-                            InterceptAction::InjectBefore(vec![
-                                serde_json::json!({
-                                    "method": "gugugaga/correction",
-                                    "params": {
-                                        "message": correction
-                                    }
-                                }).to_string()
-                            ])
+                            InterceptAction::InjectBefore(vec![serde_json::json!({
+                                "method": "gugugaga/correction",
+                                "params": {
+                                    "message": correction
+                                }
+                            })
+                            .to_string()])
                         }
                         Ok(EvaluationResult::ForwardToUser) => InterceptAction::Forward,
                         Err(e) => {
