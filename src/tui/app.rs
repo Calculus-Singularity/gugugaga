@@ -542,6 +542,8 @@ pub struct App {
     token_usage_snapshot: Option<TokenUsageSnapshot>,
     /// Latest account rate limits snapshot from account/rateLimits/updated.
     rate_limit_snapshot: Option<RateLimitSnapshotCache>,
+    /// Latest account auth mode from account/updated (e.g. apikey/chatgpt).
+    account_auth_mode: Option<String>,
     /// Active command execution terminals keyed by item_id.
     active_terminals: HashMap<String, ActiveTerminal>,
     /// Images attached via clipboard paste (Ctrl/Alt+V or pasted file paths).
@@ -633,6 +635,7 @@ impl App {
             pending_session_restore: None,
             token_usage_snapshot: None,
             rate_limit_snapshot: None,
+            account_auth_mode: None,
             active_terminals: HashMap::new(),
             attached_images: Vec::new(),
             statusline_editor: None,
@@ -1739,25 +1742,28 @@ impl App {
         ];
 
         let mut usage_rows: Vec<(String, String)> = Vec::new();
+        let prefer_limits_only = self.status_prefers_limits_over_tokens();
         if let Some(usage) = &self.token_usage_snapshot {
-            let non_cached_input = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
-            usage_rows.push((
-                "Token usage".to_string(),
-                format!(
-                    "{} total  ({} input + {} output)",
-                    Self::format_tokens_compact(usage.total_tokens),
-                    Self::format_tokens_compact(non_cached_input),
-                    Self::format_tokens_compact(usage.output_tokens)
-                ),
-            ));
-            usage_rows.push((
-                "Cached input".to_string(),
-                Self::format_tokens_compact(usage.cached_input_tokens),
-            ));
-            usage_rows.push((
-                "Reasoning output".to_string(),
-                Self::format_tokens_compact(usage.reasoning_output_tokens),
-            ));
+            if !prefer_limits_only {
+                let non_cached_input = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
+                usage_rows.push((
+                    "Token usage".to_string(),
+                    format!(
+                        "{} total  ({} input + {} output)",
+                        Self::format_tokens_compact(usage.total_tokens),
+                        Self::format_tokens_compact(non_cached_input),
+                        Self::format_tokens_compact(usage.output_tokens)
+                    ),
+                ));
+                usage_rows.push((
+                    "Cached input".to_string(),
+                    Self::format_tokens_compact(usage.cached_input_tokens),
+                ));
+                usage_rows.push((
+                    "Reasoning output".to_string(),
+                    Self::format_tokens_compact(usage.reasoning_output_tokens),
+                ));
+            }
             if let Some(window) = usage.model_context_window {
                 let remaining_pct = if window > 0 {
                     (100.0 - ((usage.total_tokens as f64 / window as f64) * 100.0))
@@ -1775,10 +1781,12 @@ impl App {
                     ),
                 ));
             }
-            if let Some(turn_id) = &usage.turn_id {
-                usage_rows.push(("Last turn".to_string(), turn_id.clone()));
+            if !prefer_limits_only {
+                if let Some(turn_id) = &usage.turn_id {
+                    usage_rows.push(("Last turn".to_string(), turn_id.clone()));
+                }
             }
-        } else {
+        } else if !prefer_limits_only {
             usage_rows.push((
                 "Token usage".to_string(),
                 "unavailable (no turn usage update yet)".to_string(),
@@ -1832,6 +1840,8 @@ impl App {
             if let Some(plan_type) = &snapshot.plan_type {
                 limit_rows.push(("Plan".to_string(), plan_type.clone()));
             }
+        } else if prefer_limits_only {
+            limit_rows.push(("Limits".to_string(), "data not available yet".to_string()));
         }
 
         let supervisor_rows = vec![
@@ -1861,8 +1871,10 @@ impl App {
         ];
 
         Self::append_status_rows(&mut content_lines, &overview_rows, label_width);
-        content_lines.push(String::new());
-        Self::append_status_rows(&mut content_lines, &usage_rows, label_width);
+        if !usage_rows.is_empty() {
+            content_lines.push(String::new());
+            Self::append_status_rows(&mut content_lines, &usage_rows, label_width);
+        }
         if !limit_rows.is_empty() {
             content_lines.push(String::new());
             Self::append_status_rows(&mut content_lines, &limit_rows, label_width);
@@ -1871,6 +1883,18 @@ impl App {
         Self::append_status_rows(&mut content_lines, &supervisor_rows, label_width);
 
         format!("/status\n\n{}", self.render_status_card(&content_lines))
+    }
+
+    fn status_prefers_limits_over_tokens(&self) -> bool {
+        match self
+            .account_auth_mode
+            .as_deref()
+            .map(|m| m.to_ascii_lowercase())
+        {
+            Some(mode) if mode == "chatgpt" || mode == "chatgptauthtokens" => true,
+            Some(mode) if mode == "apikey" || mode == "api_key" => false,
+            _ => self.rate_limit_snapshot.is_some(),
+        }
     }
 
     fn append_status_rows(lines: &mut Vec<String>, rows: &[(String, String)], label_width: usize) {
@@ -4597,7 +4621,19 @@ Make it comprehensive but concise."#;
                             .and_then(Self::parse_rate_limit_snapshot);
                         if snapshot.is_some() {
                             self.rate_limit_snapshot = snapshot;
+                            if self.account_auth_mode.is_none() {
+                                self.account_auth_mode = Some("chatgpt".to_string());
+                            }
                         }
+                    }
+                }
+                "account/updated" => {
+                    if let Some(params) = json.get("params") {
+                        self.account_auth_mode = params
+                            .get("authMode")
+                            .or_else(|| params.get("auth_mode"))
+                            .and_then(|v| v.as_str())
+                            .map(ToOwned::to_owned);
                     }
                 }
                 "thread/started" => {
