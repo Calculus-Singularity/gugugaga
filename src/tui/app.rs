@@ -105,6 +105,10 @@ fn format_tool_args_for_display(args: &str) -> String {
     }
 }
 
+fn format_json_value_for_display(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
 use super::ascii_animation::AsciiAnimation;
 use super::clipboard_paste::paste_image_to_temp_png;
 use super::input::{InputAction, InputState};
@@ -4392,17 +4396,42 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("tool"))
                         .and_then(|t| t.as_str())
                         .unwrap_or("?");
+                    let call_id = params
+                        .and_then(|p| p.get("call_id"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
                     let args = params
                         .and_then(|p| p.get("args"))
                         .and_then(|a| a.as_str())
                         .unwrap_or("");
+                    let normalized_args = params
+                        .and_then(|p| p.get("normalized_args"))
+                        .and_then(|a| a.as_str());
+                    let normalized_error = params
+                        .and_then(|p| p.get("normalized_error"))
+                        .and_then(|a| a.as_str());
+                    let raw_item = params.and_then(|p| p.get("raw_item"));
+                    let duplicate = params
+                        .and_then(|p| p.get("duplicate"))
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false);
+                    let guarded = params
+                        .and_then(|p| p.get("guarded"))
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false);
                     let args_preview = tool_args_preview(args, 120);
                     let args_display = format_tool_args_for_display(args);
 
                     match status {
                         "started" => {
                             // Show tool call start in status bar
-                            self.gugugaga_status = Some(format!("$ {}({})", tool, args_preview));
+                            if call_id.is_empty() {
+                                self.gugugaga_status =
+                                    Some(format!("$ {}({})", tool, args_preview));
+                            } else {
+                                self.gugugaga_status =
+                                    Some(format!("$ {}#{}({})", tool, call_id, args_preview));
+                            }
                         }
                         "completed" => {
                             let output = params
@@ -4429,6 +4458,33 @@ Make it comprehensive but concise."#;
                             // Show tool call + result as a Gugugaga message in chat
                             // Format like Codex: $ command → output → result
                             let mut content = format!("$ {}({})\n", tool, args_display);
+                            if !call_id.is_empty() {
+                                content.push_str(&format!("call_id: {}\n", call_id));
+                            }
+                            if let Some(normalized) = normalized_args {
+                                let pretty = format_tool_args_for_display(normalized);
+                                if !pretty.trim().is_empty() && pretty.trim() != args_display.trim()
+                                {
+                                    content.push_str("normalized args:\n");
+                                    content.push_str(&pretty);
+                                    content.push('\n');
+                                }
+                            }
+                            if let Some(err) = normalized_error {
+                                if !err.trim().is_empty() {
+                                    content.push_str(&format!("argument error: {}\n", err));
+                                }
+                            }
+                            if let Some(item) = raw_item {
+                                let payload = format_json_value_for_display(item);
+                                let capped_payload = truncate_utf8(&payload, 4_000);
+                                content.push_str("raw payload:\n");
+                                content.push_str(capped_payload);
+                                if capped_payload.len() < payload.len() {
+                                    content.push_str("\n... (payload truncated)");
+                                }
+                                content.push('\n');
+                            }
                             if !output.is_empty() {
                                 // Show rich tool output while still keeping message size bounded.
                                 let capped_output = truncate_utf8(output, 10_000);
@@ -4448,16 +4504,27 @@ Make it comprehensive but concise."#;
                                 }
                                 content.push('\n');
                             }
+                            if guarded {
+                                if duplicate {
+                                    content.push_str("guard: duplicate call skipped\n");
+                                } else {
+                                    content.push_str("guard: tool-call limit reached\n");
+                                }
+                            }
                             content.push_str(&format!("{} {}", icon, duration_str));
 
                             self.messages.push(Message::gugugaga(&content));
                             self.scroll_to_bottom();
 
                             // Update status bar
-                            self.gugugaga_status = Some(format!(
-                                "{} {}({}) {}",
-                                icon, tool, args_preview, duration_str
-                            ));
+                            let mut status_line =
+                                format!("{} {}({}) {}", icon, tool, args_preview, duration_str);
+                            if guarded && duplicate {
+                                status_line.push_str(" duplicate-skip");
+                            } else if guarded {
+                                status_line.push_str(" guarded");
+                            }
+                            self.gugugaga_status = Some(status_line);
                         }
                         _ => {}
                     }

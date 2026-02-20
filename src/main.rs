@@ -287,6 +287,9 @@ async fn run_tui_mode(
                 "name": "codex-gugugaga",
                 "title": "Gugugaga",
                 "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true
             }
         }
     })
@@ -648,6 +651,9 @@ fn create_init_message(_prompt: &str) -> String {
                 "name": "codex-gugugaga",
                 "title": "Gugugaga",
                 "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true
             }
         }
     })
@@ -670,5 +676,6 @@ mod tests {
         let msg = create_init_message("test prompt");
         let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(parsed["method"], "initialize");
+        assert_eq!(parsed["params"]["capabilities"]["experimentalApi"], true);
     }
 }

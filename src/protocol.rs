@@ -149,6 +149,9 @@ pub fn create_initialize_request(id: u64, client_name: &str, version: &str) -> J
                 "name": client_name,
                 "title": "Gugugaga",
                 "version": version
+            },
+            "capabilities": {
+                "experimentalApi": true
             }
         })),
     }

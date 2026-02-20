@@ -5,7 +5,9 @@
 mod evaluator;
 mod responder;
 
-pub use evaluator::{Evaluator, GugugagaThinking, ParsedResponse};
+pub use evaluator::{
+    Evaluator, GugugagaThinking, ParsedResponse, StructuredToolCall, StructuredTurnResponse,
+};
 pub use responder::Responder;
 
 use crate::memory::compact::DEFAULT_CONTEXT_WINDOW;
@@ -15,6 +17,7 @@ use crate::memory::{
 use crate::rules::Violation;
 use crate::Result;
 use glob::glob;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
@@ -32,16 +35,18 @@ pub struct CheckResult {
 }
 
 #[derive(Debug, Clone)]
-struct ParsedToolCall {
-    tool_name: String,
-    args: String,
-    trailing_response: Option<String>,
+struct ToolExecutionOutcome {
+    call_id: String,
+    tool_result: String,
 }
 
-#[derive(Debug, Clone)]
-struct ToolExecutionOutcome {
-    tool_result: String,
-    trailing_response: Option<String>,
+struct ToolCallEventMeta<'a> {
+    duration_ms: u64,
+    success: bool,
+    normalized_args: Option<&'a str>,
+    normalized_error: Option<&'a str>,
+    guarded: bool,
+    duplicate: bool,
 }
 
 /// The gugugaga agent that monitors and corrects Codex behavior
@@ -113,15 +118,30 @@ impl GugugagaAgent {
                 let _ = tx.try_send(msg);
             };
 
-        let mut tool_results: Vec<String> = Vec::new();
-        const TOOL_RESULTS_MAX_TOKENS: usize = 6_000;
+        let mut turn_items: Vec<serde_json::Value> = Vec::new();
+        let mut executed_tool_signatures: HashSet<String> = HashSet::new();
+        let mut executed_tool_calls: usize = 0;
+        let mut iteration = 0u32;
+        const MAX_FOLLOW_UP_ROUNDS: u32 = 8;
+        const MAX_TOOL_CALLS_PER_TURN: usize = 24;
 
         loop {
+            iteration += 1;
+            if iteration > MAX_FOLLOW_UP_ROUNDS {
+                let final_response =
+                    "Stopping follow-up after guard limit; share remaining constraints explicitly."
+                        .to_string();
+                let mut mem = self.memory.write().await;
+                let _ = mem
+                    .add_turn(crate::memory::TurnRole::Gugugaga, final_response.clone())
+                    .await;
+                return Ok(final_response);
+            }
             if let Some(tx) = event_tx {
-                let label = if tool_results.is_empty() {
+                let label = if iteration == 1 {
                     "Thinking...".to_string()
                 } else {
-                    format!("Thinking (follow-up #{})...", tool_results.len())
+                    format!("Thinking (follow-up #{})...", iteration - 1)
                 };
                 emit(
                     tx,
@@ -134,18 +154,16 @@ impl GugugagaAgent {
                 let memory = self.memory.read().await;
                 let notebook = self.notebook.read().await;
                 let context_builder = ContextBuilder::new(&memory).with_notebook(&notebook);
-                let mut p = context_builder.for_chat(user_message);
-                if !tool_results.is_empty() {
-                    p.push_str("\n\n=== Tool call results ===\n");
-                    p.push_str(&tool_results.join("\n"));
-                }
-                p
+                context_builder.for_chat(user_message)
             };
 
             let started = std::time::Instant::now();
-            let parsed = self.evaluator.call_llm_with_thinking(&prompt).await?;
+            let parsed = self
+                .evaluator
+                .call_llm_with_structured_tools(&prompt, &turn_items)
+                .await?;
             let duration = started.elapsed();
-            let response = parsed.response.trim();
+            let response = parsed.response.trim().to_string();
 
             if let (Some(tx), Some(thinking)) = (event_tx, &parsed.thinking) {
                 emit(
@@ -159,42 +177,59 @@ impl GugugagaAgent {
                 );
             }
 
-            // Check for tool calls
-            if let Some(outcome) = self.execute_tool_call_with_events(response, event_tx).await {
-                tool_results.push(outcome.tool_result);
-                let _ = Compactor::compact_tool_results_if_needed(
-                    &self.evaluator,
-                    &mut tool_results,
-                    TOOL_RESULTS_MAX_TOKENS,
-                )
-                .await;
-
-                if let Some(final_response) = outcome.trailing_response {
-                    let final_response = final_response.trim();
-                    if !final_response.is_empty() {
-                        // Record the exchange in memory
-                        let mut mem = self.memory.write().await;
-                        let _ = mem
-                            .add_turn(
-                                crate::memory::TurnRole::Gugugaga,
-                                final_response.to_string(),
-                            )
-                            .await;
-                        return Ok(final_response.to_string());
-                    }
-                }
-                continue;
-            }
-
-            // Record the exchange in memory
-            {
+            if parsed.tool_calls.is_empty() {
                 let mut mem = self.memory.write().await;
                 let _ = mem
-                    .add_turn(crate::memory::TurnRole::Gugugaga, response.to_string())
+                    .add_turn(crate::memory::TurnRole::Gugugaga, response.clone())
                     .await;
+                return Ok(response);
             }
 
-            return Ok(response.to_string());
+            for tool_call in parsed.tool_calls {
+                turn_items.push(tool_call.item.clone());
+                let signature = format!("{}::{}", tool_call.tool_name, tool_call.arguments);
+
+                if !executed_tool_signatures.insert(signature) {
+                    let output = self.emit_guarded_tool_call_result(
+                        &tool_call,
+                        event_tx,
+                        "duplicate tool call skipped in same turn; continue without re-running equivalent calls",
+                        true,
+                    );
+                    turn_items.push(Evaluator::responses_function_output_item(
+                        &output.call_id,
+                        &output.tool_result,
+                    ));
+                    continue;
+                }
+
+                if executed_tool_calls >= MAX_TOOL_CALLS_PER_TURN {
+                    let output = self.emit_guarded_tool_call_result(
+                        &tool_call,
+                        event_tx,
+                        "tool-call limit reached for this turn; finalize with currently available evidence",
+                        false,
+                    );
+                    turn_items.push(Evaluator::responses_function_output_item(
+                        &output.call_id,
+                        &output.tool_result,
+                    ));
+                    continue;
+                }
+
+                executed_tool_calls += 1;
+                let output = self
+                    .execute_tool_call_with_events(&tool_call, event_tx)
+                    .await
+                    .unwrap_or_else(|| ToolExecutionOutcome {
+                        call_id: tool_call.call_id.clone(),
+                        tool_result: "tool execution failed".to_string(),
+                    });
+                turn_items.push(Evaluator::responses_function_output_item(
+                    &output.call_id,
+                    &output.tool_result,
+                ));
+            }
         }
     }
 
@@ -213,7 +248,7 @@ impl GugugagaAgent {
     ///
     /// Includes compaction aligned with Codex:
     /// - Before first LLM call: compact conversation history if token usage >= 90%
-    /// - After each LLM call with tool follow-up: compact tool results if too large
+    /// - Continue follow-up requests when structured tool outputs are pending
     ///
     /// If `event_tx` is provided, emits real-time `gugugaga/*` notifications so
     /// the TUI can display thinking and tool-call activity (like Codex does).
@@ -242,14 +277,22 @@ impl GugugagaAgent {
             .await;
         }
 
-        let mut tool_results: Vec<String> = Vec::new();
-        let mut last_thinking: Option<String>;
-        // Token budget for accumulated tool results before compaction
-        const TOOL_RESULTS_MAX_TOKENS: usize = 6_000;
+        let mut turn_items: Vec<serde_json::Value> = Vec::new();
+        let mut executed_tool_signatures: HashSet<String> = HashSet::new();
+        let mut executed_tool_calls: usize = 0;
+        let mut last_thinking: Option<String> = None;
         let mut iteration = 0u32;
+        const MAX_FOLLOW_UP_ROUNDS: u32 = 8;
+        const MAX_TOOL_CALLS_PER_TURN: usize = 24;
 
         loop {
             iteration += 1;
+            if iteration > MAX_FOLLOW_UP_ROUNDS {
+                return self.parse_check_response(
+                    r#"{"result":"ok","summary":"Supervisor reached follow-up guard limit and returned conservative OK."}"#,
+                    last_thinking,
+                );
+            }
 
             // Notify TUI that we're calling the LLM
             if let Some(tx) = event_tx {
@@ -269,21 +312,17 @@ impl GugugagaAgent {
                 let memory = self.memory.read().await;
                 let notebook = self.notebook.read().await;
                 let context_builder = ContextBuilder::new(&memory).with_notebook(&notebook);
-                let mut p = context_builder.for_violation_detection(agent_message);
-
-                // Append tool results if any
-                if !tool_results.is_empty() {
-                    p.push_str("\n\n=== Tool call results ===\n");
-                    p.push_str(&tool_results.join("\n"));
-                }
-                p
+                context_builder.for_violation_detection(agent_message)
             };
 
             let started = std::time::Instant::now();
-            let parsed = self.evaluator.call_llm_with_thinking(&prompt).await?;
+            let parsed = self
+                .evaluator
+                .call_llm_with_structured_tools(&prompt, &turn_items)
+                .await?;
             let llm_duration = started.elapsed();
             last_thinking = parsed.thinking.clone();
-            let response = parsed.response.trim();
+            let response = parsed.response.trim().to_string();
 
             // Emit thinking content if present
             if let (Some(tx), Some(thinking)) = (event_tx, &parsed.thinking) {
@@ -298,92 +337,268 @@ impl GugugagaAgent {
                 );
             }
 
-            // Check for tool calls
-            if let Some(outcome) = self.execute_tool_call_with_events(response, event_tx).await {
-                tool_results.push(outcome.tool_result);
-
-                if let Some(final_response) = outcome.trailing_response {
-                    let final_response = final_response.trim();
-                    if !final_response.is_empty() {
-                        return self.parse_check_response(final_response, last_thinking);
-                    }
-                }
-
-                // ── Mid-loop compaction (aligned with Codex: after sampling, if needs follow-up) ──
-                // Compact tool results if they've grown too large
-                let _ = Compactor::compact_tool_results_if_needed(
-                    &self.evaluator,
-                    &mut tool_results,
-                    TOOL_RESULTS_MAX_TOKENS,
-                )
-                .await;
-
-                continue;
+            if parsed.tool_calls.is_empty() {
+                return self.parse_check_response(&response, last_thinking);
             }
 
-            // Parse final response
-            return self.parse_check_response(response, last_thinking);
+            for tool_call in parsed.tool_calls {
+                turn_items.push(tool_call.item.clone());
+                let signature = format!("{}::{}", tool_call.tool_name, tool_call.arguments);
+
+                if !executed_tool_signatures.insert(signature) {
+                    let output = self.emit_guarded_tool_call_result(
+                        &tool_call,
+                        event_tx,
+                        "duplicate tool call skipped in same turn; continue without re-running equivalent calls",
+                        true,
+                    );
+                    turn_items.push(Evaluator::responses_function_output_item(
+                        &output.call_id,
+                        &output.tool_result,
+                    ));
+                    continue;
+                }
+
+                if executed_tool_calls >= MAX_TOOL_CALLS_PER_TURN {
+                    let output = self.emit_guarded_tool_call_result(
+                        &tool_call,
+                        event_tx,
+                        "tool-call limit reached for this turn; finalize with currently available evidence",
+                        false,
+                    );
+                    turn_items.push(Evaluator::responses_function_output_item(
+                        &output.call_id,
+                        &output.tool_result,
+                    ));
+                    continue;
+                }
+
+                executed_tool_calls += 1;
+                let output = self
+                    .execute_tool_call_with_events(&tool_call, event_tx)
+                    .await
+                    .unwrap_or_else(|| ToolExecutionOutcome {
+                        call_id: tool_call.call_id.clone(),
+                        tool_result: "tool execution failed".to_string(),
+                    });
+                turn_items.push(Evaluator::responses_function_output_item(
+                    &output.call_id,
+                    &output.tool_result,
+                ));
+            }
         }
     }
 
-    /// Execute a tool call, emitting events to the TUI if event_tx is provided.
-    async fn execute_tool_call_with_events(
-        &self,
-        response: &str,
-        event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
-    ) -> Option<ToolExecutionOutcome> {
-        let parsed = Self::parse_tool_call(response)?;
-        let tool_name = parsed.tool_name.clone();
-        let args = parsed.args.clone();
-        let args_for_execution = Self::unwrap_matching_quotes(parsed.args.trim());
+    fn normalize_tool_arguments(
+        tool_name: &str,
+        raw_args: &str,
+    ) -> std::result::Result<String, String> {
+        let value: serde_json::Value = if raw_args.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(raw_args).map_err(|e| format!("invalid JSON: {}", e))?
+        };
 
-        // Notify TUI that a tool call is starting
+        let pick_str = |keys: &[&str]| -> Option<String> {
+            keys.iter().find_map(|key| {
+                value
+                    .get(*key)
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned)
+            })
+        };
+        let pick_usize = |keys: &[&str]| -> Option<usize> {
+            keys.iter()
+                .find_map(|key| value.get(*key).and_then(|v| v.as_u64()).map(|n| n as usize))
+        };
+
+        match tool_name {
+            "search_history" => pick_str(&["query", "keyword", "text", "pattern"])
+                .ok_or_else(|| "missing query".to_string()),
+            "read_recent" => Ok(pick_usize(&["count", "n"]).unwrap_or(5).to_string()),
+            "read_turn" => pick_usize(&["index"])
+                .map(|v| v.to_string())
+                .ok_or_else(|| "missing index".to_string()),
+            "history_stats" | "clear_activity" => Ok(String::new()),
+            "update_notebook" => {
+                if value.is_object() {
+                    Ok(value.to_string())
+                } else {
+                    Err("payload must be an object".to_string())
+                }
+            }
+            "set_activity" => pick_str(&["activity"]).ok_or_else(|| "missing activity".to_string()),
+            "add_completed" => {
+                let what = pick_str(&["what"]).ok_or_else(|| "missing what".to_string())?;
+                let significance = pick_str(&["significance"]).unwrap_or_default();
+                Ok(format!("{}|{}", what, significance))
+            }
+            "add_attention" => {
+                let content =
+                    pick_str(&["content"]).ok_or_else(|| "missing content".to_string())?;
+                let priority = pick_str(&["priority"]).unwrap_or_else(|| "medium".to_string());
+                Ok(format!("{}|{}", content, priority))
+            }
+            "notebook_mistake" => {
+                let what = pick_str(&["what"]).ok_or_else(|| "missing what".to_string())?;
+                let how = pick_str(&["how_corrected"]).unwrap_or_default();
+                let lesson = pick_str(&["lesson"]).ok_or_else(|| "missing lesson".to_string())?;
+                Ok(format!("{}|{}|{}", what, how, lesson))
+            }
+            "read_file" => {
+                let path = pick_str(&["path"]).ok_or_else(|| "missing path".to_string())?;
+                let offset = pick_usize(&["offset"]).unwrap_or(1);
+                let limit = pick_usize(&["limit"]).unwrap_or(100);
+                if value.get("offset").is_some() || value.get("limit").is_some() {
+                    Ok(format!("{}|{}|{}", path, offset, limit))
+                } else {
+                    Ok(path)
+                }
+            }
+            "glob" => pick_str(&["pattern"]).ok_or_else(|| "missing pattern".to_string()),
+            "shell" => pick_str(&["cmd", "command"]).ok_or_else(|| "missing cmd".to_string()),
+            "rg" => pick_str(&["pattern"]).ok_or_else(|| "missing pattern".to_string()),
+            "ls" => pick_str(&["path"]).ok_or_else(|| "missing path".to_string()),
+            _ => {
+                if let Some(s) = value.as_str() {
+                    Ok(s.to_string())
+                } else {
+                    Ok(value.to_string())
+                }
+            }
+        }
+    }
+
+    fn emit_tool_call_started_event(
+        &self,
+        tool_call: &StructuredToolCall,
+        event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) {
         if let Some(tx) = event_tx {
             let msg = serde_json::json!({
                 "method": "gugugaga/toolCall",
                 "params": {
                     "status": "started",
-                    "tool": tool_name,
-                    "args": args,
+                    "call_id": &tool_call.call_id,
+                    "tool": &tool_call.tool_name,
+                    "args": &tool_call.arguments,
+                    "raw_item": &tool_call.item,
                 }
             })
             .to_string();
             let _ = tx.try_send(msg);
         }
+    }
 
-        let started = std::time::Instant::now();
-        let result = self
-            .execute_tool_call(&parsed.tool_name, args_for_execution)
-            .await;
-        let duration = started.elapsed();
-
-        // Notify TUI of tool result
+    fn emit_tool_call_completed_event(
+        &self,
+        tool_call: &StructuredToolCall,
+        event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+        output: &str,
+        meta: ToolCallEventMeta<'_>,
+    ) {
         if let Some(tx) = event_tx {
-            let output = result.as_deref().unwrap_or("(no result)");
-            // Truncate for display
             let display_output = if output.len() > 4000 {
                 format!("{}...[truncated]", &output[..4000])
             } else {
                 output.to_string()
             };
+
             let msg = serde_json::json!({
                 "method": "gugugaga/toolCall",
                 "params": {
                     "status": "completed",
-                    "tool": tool_name,
-                    "args": args,
+                    "call_id": &tool_call.call_id,
+                    "tool": &tool_call.tool_name,
+                    "args": &tool_call.arguments,
+                    "raw_item": &tool_call.item,
+                    "normalized_args": meta.normalized_args,
+                    "normalized_error": meta.normalized_error,
                     "output": display_output,
-                    "duration_ms": duration.as_millis() as u64,
-                    "success": result.is_some(),
+                    "duration_ms": meta.duration_ms,
+                    "success": meta.success,
+                    "guarded": meta.guarded,
+                    "duplicate": meta.duplicate,
                 }
             })
             .to_string();
             let _ = tx.try_send(msg);
         }
+    }
+
+    fn emit_guarded_tool_call_result(
+        &self,
+        tool_call: &StructuredToolCall,
+        event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+        output: &str,
+        duplicate: bool,
+    ) -> ToolExecutionOutcome {
+        self.emit_tool_call_started_event(tool_call, event_tx);
+        self.emit_tool_call_completed_event(
+            tool_call,
+            event_tx,
+            output,
+            ToolCallEventMeta {
+                duration_ms: 0,
+                success: false,
+                normalized_args: None,
+                normalized_error: None,
+                guarded: true,
+                duplicate,
+            },
+        );
+        ToolExecutionOutcome {
+            call_id: tool_call.call_id.clone(),
+            tool_result: output.to_string(),
+        }
+    }
+
+    /// Execute a structured tool call, emitting events to the TUI.
+    async fn execute_tool_call_with_events(
+        &self,
+        tool_call: &StructuredToolCall,
+        event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) -> Option<ToolExecutionOutcome> {
+        self.emit_tool_call_started_event(tool_call, event_tx);
+
+        let started = std::time::Instant::now();
+        let normalized = Self::normalize_tool_arguments(&tool_call.tool_name, &tool_call.arguments);
+        let (result, normalized_args, normalized_error) = match normalized {
+            Ok(normalized_args) => (
+                self.execute_tool_call(&tool_call.tool_name, &normalized_args)
+                    .await,
+                Some(normalized_args),
+                None,
+            ),
+            Err(err) => (
+                Some(format!(
+                    "{}: Invalid arguments: {}",
+                    tool_call.tool_name, err
+                )),
+                None,
+                Some(err),
+            ),
+        };
+        let duration = started.elapsed();
+
+        let output_text = result.as_deref().unwrap_or("(no result)");
+        self.emit_tool_call_completed_event(
+            tool_call,
+            event_tx,
+            output_text,
+            ToolCallEventMeta {
+                duration_ms: duration.as_millis() as u64,
+                success: result.is_some(),
+                normalized_args: normalized_args.as_deref(),
+                normalized_error: normalized_error.as_deref(),
+                guarded: false,
+                duplicate: false,
+            },
+        );
 
         result.map(|tool_result| ToolExecutionOutcome {
+            call_id: tool_call.call_id.clone(),
             tool_result,
-            trailing_response: parsed.trailing_response,
         })
     }
 
@@ -640,108 +855,6 @@ impl GugugagaAgent {
                 }
             }
             _ => Some(format!("Unknown tool: {}", tool_name)),
-        }
-    }
-
-    /// Parse a `TOOL:name(args)` call and optional trailing final response.
-    ///
-    /// This intentionally does not use greedy regex matching so we can safely
-    /// handle `TOOL(...)` followed by a final JSON answer in the same response.
-    fn parse_tool_call(response: &str) -> Option<ParsedToolCall> {
-        let marker = "TOOL:";
-        let bytes = response.as_bytes();
-        let mut index = response.find(marker)? + marker.len();
-
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-
-        let name_start = index;
-        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-        {
-            index += 1;
-        }
-        if index == name_start {
-            return None;
-        }
-        let tool_name = response[name_start..index].to_string();
-
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() || bytes[index] != b'(' {
-            return None;
-        }
-        index += 1;
-
-        let args_start = index;
-        let mut depth = 1usize;
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut escaped = false;
-
-        while index < bytes.len() {
-            let ch = bytes[index];
-
-            if escaped {
-                escaped = false;
-                index += 1;
-                continue;
-            }
-            if (in_single || in_double) && ch == b'\\' {
-                escaped = true;
-                index += 1;
-                continue;
-            }
-
-            if in_single {
-                if ch == b'\'' {
-                    in_single = false;
-                }
-                index += 1;
-                continue;
-            }
-            if in_double {
-                if ch == b'"' {
-                    in_double = false;
-                }
-                index += 1;
-                continue;
-            }
-
-            match ch {
-                b'\'' => in_single = true,
-                b'"' => in_double = true,
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let args = response[args_start..index].trim().to_string();
-                        let trailing = response[index + 1..].trim().to_string();
-                        return Some(ParsedToolCall {
-                            tool_name,
-                            args,
-                            trailing_response: (!trailing.is_empty()).then_some(trailing),
-                        });
-                    }
-                }
-                _ => {}
-            }
-            index += 1;
-        }
-
-        None
-    }
-
-    fn unwrap_matching_quotes(s: &str) -> &str {
-        let bytes = s.as_bytes();
-        if bytes.len() >= 2
-            && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-                || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
-        {
-            &s[1..s.len() - 1]
-        } else {
-            s
         }
     }
 
@@ -1079,28 +1192,39 @@ mod tests {
     use super::GugugagaAgent;
 
     #[test]
-    fn parse_tool_call_extracts_trailing_response() {
-        let response = r#"TOOL: update_notebook({"current_activity":"Reviewing"}) {"result":"ok","summary":"done"}"#;
-        let parsed = GugugagaAgent::parse_tool_call(response).expect("should parse tool call");
-        assert_eq!(parsed.tool_name, "update_notebook");
-        assert_eq!(parsed.args, r#"{"current_activity":"Reviewing"}"#);
-        assert_eq!(
-            parsed.trailing_response.as_deref(),
-            Some(r#"{"result":"ok","summary":"done"}"#)
-        );
+    fn normalize_tool_arguments_maps_update_notebook_object() {
+        let normalized = GugugagaAgent::normalize_tool_arguments(
+            "update_notebook",
+            r#"{"current_activity":"Reviewing"}"#,
+        )
+        .expect("should normalize");
+        assert_eq!(normalized, r#"{"current_activity":"Reviewing"}"#);
     }
 
     #[test]
-    fn parse_tool_call_handles_nested_parentheses_and_quotes() {
-        let response = r#"TOOL: shell("printf '(a(b))'")"#;
-        let parsed = GugugagaAgent::parse_tool_call(response).expect("should parse tool call");
-        assert_eq!(parsed.tool_name, "shell");
-        assert_eq!(parsed.args, r#""printf '(a(b))'""#);
-        assert!(parsed.trailing_response.is_none());
+    fn normalize_tool_arguments_maps_read_file_window() {
+        let normalized = GugugagaAgent::normalize_tool_arguments(
+            "read_file",
+            r#"{"path":"src/main.rs","offset":5,"limit":10}"#,
+        )
+        .expect("should normalize");
+        assert_eq!(normalized, "src/main.rs|5|10");
     }
 
     #[test]
-    fn parse_tool_call_returns_none_without_marker() {
-        assert!(GugugagaAgent::parse_tool_call("no tool call here").is_none());
+    fn normalize_tool_arguments_rejects_invalid_json() {
+        let err = GugugagaAgent::normalize_tool_arguments("shell", "not-json")
+            .expect_err("invalid arguments should fail");
+        assert!(err.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn normalize_tool_arguments_maps_add_completed() {
+        let normalized = GugugagaAgent::normalize_tool_arguments(
+            "add_completed",
+            r#"{"what":"done","significance":"important"}"#,
+        )
+        .expect("should normalize");
+        assert_eq!(normalized, "done|important");
     }
 }

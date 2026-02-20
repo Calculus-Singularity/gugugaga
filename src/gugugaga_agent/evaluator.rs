@@ -146,7 +146,7 @@ struct StreamDelta {
 struct ResponsesRequest {
     model: String,
     instructions: String,
-    input: Vec<ResponsesInputItem>,
+    input: Vec<serde_json::Value>,
     tools: Vec<serde_json::Value>,
     tool_choice: &'static str,
     parallel_tool_calls: bool,
@@ -169,19 +169,21 @@ struct ResponsesReasoning {
     summary: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct ResponsesInputItem {
-    #[serde(rename = "type")]
-    item_type: String,
-    role: String,
-    content: Vec<ResponsesContentItem>,
+/// Structured tool call emitted by Responses API.
+#[derive(Debug, Clone)]
+pub struct StructuredToolCall {
+    pub call_id: String,
+    pub tool_name: String,
+    pub arguments: String,
+    pub item: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
-struct ResponsesContentItem {
-    #[serde(rename = "type")]
-    content_type: String,
-    text: String,
+/// One structured Responses sampling step.
+#[derive(Debug, Clone)]
+pub struct StructuredTurnResponse {
+    pub thinking: Option<String>,
+    pub response: String,
+    pub tool_calls: Vec<StructuredToolCall>,
 }
 
 // ─── Responses API SSE event types ──────────────────────────────────
@@ -199,6 +201,12 @@ struct ResponsesSseEvent {
     /// Response wrapper (for response.completed / response.failed)
     #[serde(default)]
     response: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct CollectedResponses {
+    text: String,
+    output_items: Vec<serde_json::Value>,
 }
 
 // ─── auth.json types ────────────────────────────────────────────────
@@ -881,7 +889,8 @@ impl Evaluator {
             .unwrap_or(DEFAULT_RESPONSES_INSTRUCTIONS)
             .to_string();
 
-        let request = self.build_responses_request(instructions, user_prompt);
+        let input = vec![Self::responses_message_input_item(user_prompt)];
+        let request = self.build_responses_request(instructions, input, Vec::new(), false);
 
         let headers = self.fresh_auth_headers().await?;
         let mut req_builder = self
@@ -905,19 +914,16 @@ impl Evaluator {
 
         let response = Self::check_response_status(response).await?;
 
-        Self::collect_responses_stream(response).await
+        Ok(Self::collect_responses_stream(response).await?.text)
     }
 
-    fn build_responses_request(&self, instructions: String, user_prompt: &str) -> ResponsesRequest {
-        let input = vec![ResponsesInputItem {
-            item_type: "message".to_string(),
-            role: "user".to_string(),
-            content: vec![ResponsesContentItem {
-                content_type: "input_text".to_string(),
-                text: user_prompt.to_string(),
-            }],
-        }];
-
+    fn build_responses_request(
+        &self,
+        instructions: String,
+        input: Vec<serde_json::Value>,
+        tools: Vec<serde_json::Value>,
+        parallel_tool_calls: bool,
+    ) -> ResponsesRequest {
         let reasoning = self
             .reasoning_effort
             .as_ref()
@@ -935,9 +941,9 @@ impl Evaluator {
             model: self.model.clone(),
             instructions,
             input,
-            tools: Vec::new(),
+            tools,
             tool_choice: "auto",
-            parallel_tool_calls: false,
+            parallel_tool_calls,
             store: false,
             stream: true, // Responses API is streaming-only
             include,
@@ -945,6 +951,202 @@ impl Evaluator {
             prompt_cache_key: Some(self.responses_prompt_cache_key.clone()),
             text: None,
         }
+    }
+
+    fn responses_message_input_item(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": text
+                }
+            ]
+        })
+    }
+
+    pub fn responses_function_output_item(call_id: &str, output: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output
+        })
+    }
+
+    fn responses_tools_schema() -> Vec<serde_json::Value> {
+        fn function_tool(
+            name: &str,
+            description: &str,
+            properties: serde_json::Value,
+            required: &[&str],
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "strict": false,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": false
+                }
+            })
+        }
+
+        vec![
+            function_tool(
+                "update_notebook",
+                "Update supervisor notebook with activity/progress/attention/mistakes in one call.",
+                serde_json::json!({
+                    "current_activity": {"type": "string", "description": "Current activity status."},
+                    "add_completed": {
+                        "type": "object",
+                        "properties": {
+                            "what": {"type": "string"},
+                            "significance": {"type": "string"}
+                        },
+                        "required": ["what", "significance"],
+                        "additionalProperties": false
+                    },
+                    "add_attention": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "priority": {"type": "string", "enum": ["high", "medium", "low"]}
+                        },
+                        "required": ["content"],
+                        "additionalProperties": false
+                    },
+                    "record_mistake": {
+                        "type": "object",
+                        "properties": {
+                            "what": {"type": "string"},
+                            "how_corrected": {"type": "string"},
+                            "lesson": {"type": "string"}
+                        },
+                        "required": ["what", "lesson"],
+                        "additionalProperties": false
+                    }
+                }),
+                &[],
+            ),
+            function_tool(
+                "set_activity",
+                "Set current activity string in notebook.",
+                serde_json::json!({
+                    "activity": {"type": "string"}
+                }),
+                &["activity"],
+            ),
+            function_tool(
+                "clear_activity",
+                "Clear current activity in notebook.",
+                serde_json::json!({}),
+                &[],
+            ),
+            function_tool(
+                "add_completed",
+                "Add completed item into notebook.",
+                serde_json::json!({
+                    "what": {"type": "string"},
+                    "significance": {"type": "string"}
+                }),
+                &["what", "significance"],
+            ),
+            function_tool(
+                "add_attention",
+                "Add attention item into notebook.",
+                serde_json::json!({
+                    "content": {"type": "string"},
+                    "priority": {"type": "string", "enum": ["high", "medium", "low"]}
+                }),
+                &["content"],
+            ),
+            function_tool(
+                "notebook_mistake",
+                "Record a mistake and lesson in notebook.",
+                serde_json::json!({
+                    "what": {"type": "string"},
+                    "how_corrected": {"type": "string"},
+                    "lesson": {"type": "string"}
+                }),
+                &["what", "lesson"],
+            ),
+            function_tool(
+                "search_history",
+                "Search archived conversation history by keyword.",
+                serde_json::json!({
+                    "query": {"type": "string"}
+                }),
+                &["query"],
+            ),
+            function_tool(
+                "read_recent",
+                "Read recent conversation turns.",
+                serde_json::json!({
+                    "count": {"type": "integer"}
+                }),
+                &[],
+            ),
+            function_tool(
+                "read_turn",
+                "Read one conversation turn by index.",
+                serde_json::json!({
+                    "index": {"type": "integer"}
+                }),
+                &["index"],
+            ),
+            function_tool(
+                "history_stats",
+                "Get history and token stats.",
+                serde_json::json!({}),
+                &[],
+            ),
+            function_tool(
+                "read_file",
+                "Read file content by path and optional line window.",
+                serde_json::json!({
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"}
+                }),
+                &["path"],
+            ),
+            function_tool(
+                "glob",
+                "List files matching a glob pattern.",
+                serde_json::json!({
+                    "pattern": {"type": "string"}
+                }),
+                &["pattern"],
+            ),
+            function_tool(
+                "shell",
+                "Execute a read-only shell command in safety whitelist.",
+                serde_json::json!({
+                    "cmd": {"type": "string"}
+                }),
+                &["cmd"],
+            ),
+            function_tool(
+                "rg",
+                "Search files via ripgrep pattern.",
+                serde_json::json!({
+                    "pattern": {"type": "string"}
+                }),
+                &["pattern"],
+            ),
+            function_tool(
+                "ls",
+                "List directory entries.",
+                serde_json::json!({
+                    "path": {"type": "string"}
+                }),
+                &["path"],
+            ),
+        ]
     }
 
     fn responses_event_error(event: &ResponsesSseEvent, fallback: &str) -> String {
@@ -1000,12 +1202,108 @@ impl Evaluator {
             .map(|s| s.to_string())
     }
 
+    fn parse_structured_tool_call(item: &serde_json::Value) -> Option<StructuredToolCall> {
+        let item_type = item.get("type").and_then(|t| t.as_str())?;
+        if item_type != "function_call" {
+            return None;
+        }
+
+        let call_id = item
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())?
+            .to_string();
+        let tool_name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())?
+            .to_string();
+        let arguments = match item.get("arguments") {
+            Some(v) if v.is_string() => v.as_str().unwrap_or_default().to_string(),
+            Some(v) => v.to_string(),
+            None => "{}".to_string(),
+        };
+
+        Some(StructuredToolCall {
+            call_id,
+            tool_name,
+            arguments,
+            item: item.clone(),
+        })
+    }
+
+    fn extract_structured_tool_calls(items: &[serde_json::Value]) -> Vec<StructuredToolCall> {
+        items
+            .iter()
+            .filter_map(Self::parse_structured_tool_call)
+            .collect()
+    }
+
+    pub async fn call_llm_with_structured_tools(
+        &self,
+        prompt: &str,
+        turn_items: &[serde_json::Value],
+    ) -> Result<StructuredTurnResponse> {
+        if self.wire_api != WireApi::Responses {
+            let parsed = self.call_llm_with_thinking(prompt).await?;
+            return Ok(StructuredTurnResponse {
+                thinking: parsed.thinking,
+                response: parsed.response,
+                tool_calls: Vec::new(),
+            });
+        }
+
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let mut input = vec![Self::responses_message_input_item(prompt)];
+        input.extend(turn_items.iter().cloned());
+
+        let request = self.build_responses_request(
+            DEFAULT_RESPONSES_INSTRUCTIONS.to_string(),
+            input,
+            Self::responses_tools_schema(),
+            false,
+        );
+
+        let headers = self.fresh_auth_headers().await?;
+        let mut req_builder = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+
+        for (name, value) in &self.provider_headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
+        for (name, value) in &headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
+
+        let response = req_builder
+            .json(&request)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        let response = Self::check_response_status(response).await?;
+
+        let stream = Self::collect_responses_stream(response).await?;
+        let parsed = Self::parse_think_tags(&stream.text);
+        let tool_calls = Self::extract_structured_tool_calls(&stream.output_items);
+
+        Ok(StructuredTurnResponse {
+            thinking: parsed.thinking,
+            response: parsed.response,
+            tool_calls,
+        })
+    }
+
     /// Collect a Responses API SSE stream into the full text response.
-    async fn collect_responses_stream(response: reqwest::Response) -> Result<String> {
+    async fn collect_responses_stream(response: reqwest::Response) -> Result<CollectedResponses> {
         let mut stream = response.bytes_stream();
         let mut result_text = String::new();
+        let mut output_items = Vec::new();
         let mut line_buffer = String::new();
         let mut saw_output_text_delta = false;
+        let mut completed = false;
 
         while let Some(chunk_result) = stream.next().await {
             let bytes = chunk_result
@@ -1023,7 +1321,15 @@ impl Evaluator {
                 }
                 let data = &line[6..];
                 if data == "[DONE]" {
-                    return Ok(result_text);
+                    if completed {
+                        return Ok(CollectedResponses {
+                            text: result_text,
+                            output_items,
+                        });
+                    }
+                    return Err(GugugagaError::LlmEvaluation(
+                        "stream closed before response.completed".to_string(),
+                    ));
                 }
 
                 if let Ok(event) = serde_json::from_str::<ResponsesSseEvent>(data) {
@@ -1035,6 +1341,9 @@ impl Evaluator {
                             }
                         }
                         "response.output_item.done" => {
+                            if let Some(item) = event.item.clone() {
+                                output_items.push(item);
+                            }
                             if !saw_output_text_delta {
                                 if let Some(text) = Self::responses_output_item_text(&event) {
                                     result_text.push_str(&text);
@@ -1042,7 +1351,7 @@ impl Evaluator {
                             }
                         }
                         "response.completed" | "response.done" => {
-                            return Ok(result_text);
+                            completed = true;
                         }
                         "response.failed" => {
                             let error_msg = Self::responses_event_error(&event, "response.failed");
@@ -1063,7 +1372,16 @@ impl Evaluator {
             }
         }
 
-        Ok(result_text)
+        if completed {
+            Ok(CollectedResponses {
+                text: result_text,
+                output_items,
+            })
+        } else {
+            Err(GugugagaError::LlmEvaluation(
+                "stream closed before response.completed".to_string(),
+            ))
+        }
     }
 
     async fn check_response_status(response: reqwest::Response) -> Result<reqwest::Response> {
@@ -1361,7 +1679,8 @@ impl Evaluator {
             system_prompt.to_string()
         };
 
-        let request = self.build_responses_request(instructions, user_prompt);
+        let input = vec![Self::responses_message_input_item(user_prompt)];
+        let request = self.build_responses_request(instructions, input, Vec::new(), false);
 
         let headers = self.fresh_auth_headers().await?;
         let mut req_builder = self
@@ -1499,5 +1818,113 @@ impl Evaluator {
         });
 
         Ok(rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Evaluator, ResponsesSseEvent};
+
+    #[test]
+    fn parse_structured_tool_call_reads_function_call() {
+        let item = serde_json::json!({
+            "type": "function_call",
+            "name": "search_history",
+            "call_id": "call_123",
+            "arguments": "{\"query\":\"oauth\"}"
+        });
+        let parsed = Evaluator::parse_structured_tool_call(&item).expect("should parse");
+        assert_eq!(parsed.call_id, "call_123");
+        assert_eq!(parsed.tool_name, "search_history");
+        assert_eq!(parsed.arguments, "{\"query\":\"oauth\"}");
+    }
+
+    #[test]
+    fn parse_structured_tool_call_ignores_non_function_item() {
+        let item = serde_json::json!({
+            "type": "message",
+            "role": "assistant"
+        });
+        assert!(Evaluator::parse_structured_tool_call(&item).is_none());
+    }
+
+    #[test]
+    fn responses_function_output_item_has_expected_shape() {
+        let item = Evaluator::responses_function_output_item("call_abc", "ok");
+        assert_eq!(
+            item.get("type").and_then(|v| v.as_str()),
+            Some("function_call_output")
+        );
+        assert_eq!(
+            item.get("call_id").and_then(|v| v.as_str()),
+            Some("call_abc")
+        );
+        assert_eq!(item.get("output").and_then(|v| v.as_str()), Some("ok"));
+    }
+
+    #[test]
+    fn responses_output_item_text_does_not_leak_function_call_arguments() {
+        let event = ResponsesSseEvent {
+            event_type: "response.output_item.done".to_string(),
+            delta: None,
+            item: Some(serde_json::json!({
+                "type": "function_call",
+                "name": "update_notebook",
+                "call_id": "call_1",
+                "arguments": "{\"current_activity\":\"secret\"}"
+            })),
+            response: None,
+        };
+        assert!(Evaluator::responses_output_item_text(&event).is_none());
+    }
+
+    #[test]
+    fn extract_structured_tool_calls_filters_and_preserves_order() {
+        let items = vec![
+            serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "thinking"}]
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "name": "search_history",
+                "call_id": "call_a",
+                "arguments": "{\"query\":\"oauth\"}"
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "name": "read_file",
+                "call_id": "call_b",
+                "arguments": "{\"path\":\"src/main.rs\"}"
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "name": "broken_without_call_id",
+                "arguments": "{}"
+            }),
+        ];
+
+        let calls = Evaluator::extract_structured_tool_calls(&items);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].call_id, "call_a");
+        assert_eq!(calls[0].tool_name, "search_history");
+        assert_eq!(calls[1].call_id, "call_b");
+        assert_eq!(calls[1].tool_name, "read_file");
+    }
+
+    #[test]
+    fn extract_structured_tool_calls_stringifies_non_string_arguments() {
+        let items = vec![serde_json::json!({
+            "type": "function_call",
+            "name": "update_notebook",
+            "call_id": "call_obj",
+            "arguments": {"current_activity":"Reviewing"}
+        })];
+
+        let calls = Evaluator::extract_structured_tool_calls(&items);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "call_obj");
+        assert!(calls[0].arguments.contains("current_activity"));
     }
 }
