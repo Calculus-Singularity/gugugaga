@@ -983,22 +983,15 @@ impl App {
             .join(" ")
     }
 
-    fn attach_local_image(&mut self, path: PathBuf, dimensions: Option<(u32, u32)>) {
+    fn attach_local_image(&mut self, path: PathBuf, _dimensions: Option<(u32, u32)>) {
         let image_index = self.attached_images.len() + 1;
-        self.attached_images.push(path.clone());
-
-        let path_display = make_relative_path(&path.to_string_lossy(), &self.cwd);
-        match dimensions {
-            Some((w, h)) => self.messages.push(Message::system(format!(
-                "Attached [Image #{}] {}x{}: {}",
-                image_index, w, h, path_display
-            ))),
-            None => self.messages.push(Message::system(format!(
-                "Attached [Image #{}]: {}",
-                image_index, path_display
-            ))),
+        self.attached_images.push(path);
+        let placeholder = format!("[Image #{}]", image_index);
+        self.input.insert_text(&placeholder);
+        self.prune_pending_large_pastes();
+        if self.slash_popup.visible {
+            self.update_popup_filter();
         }
-        self.scroll_to_bottom();
     }
 
     fn has_composer_draft(&self) -> bool {
@@ -1091,6 +1084,7 @@ impl App {
 
         if let Some(path) = parse_pasted_image_path(&pasted) {
             self.attach_local_image(path, None);
+            self.input.insert_text(" ");
             return;
         }
 
@@ -1518,10 +1512,13 @@ impl App {
                     let local_images = std::mem::take(&mut self.attached_images);
                     let display_text = if local_images.is_empty() {
                         text.clone()
-                    } else if text.trim().is_empty() {
-                        Self::image_label_list(local_images.len())
                     } else {
-                        format!("{} {}", Self::image_label_list(local_images.len()), text)
+                        let trimmed = text.trim();
+                        if trimmed.is_empty() {
+                            Self::image_label_list(local_images.len())
+                        } else {
+                            text.clone()
+                        }
                     };
 
                     self.messages.push(Message::user(display_text));
