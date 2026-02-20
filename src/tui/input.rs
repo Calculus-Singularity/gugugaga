@@ -322,15 +322,6 @@ impl InputState {
         }
     }
 
-    /// Get cursor position for display (in terminal columns)
-    /// This accounts for wide characters (like CJK) taking 2 columns
-    pub fn cursor_display_width(&self) -> usize {
-        self.buffer
-            .chars()
-            .take(self.cursor)
-            .map(|c| if c.is_ascii() { 1 } else { 2 })
-            .sum()
-    }
 }
 
 #[cfg(test)]

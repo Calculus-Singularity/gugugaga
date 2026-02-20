@@ -19,6 +19,78 @@ pub fn truncate_to_width_str(text: &str, max_display_width: usize) -> String {
     truncate_to_width(text, max_display_width)
 }
 
+/// Wrap input text by display width, preserving explicit newlines and wide chars.
+pub fn wrap_input_lines(text: &str, avail: usize) -> Vec<String> {
+    if avail == 0 {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+    for raw_line in text.split('\n') {
+        if raw_line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut line = String::new();
+        let mut width = 0usize;
+        for c in raw_line.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c)
+                .unwrap_or(1)
+                .max(1);
+            if width + cw > avail && !line.is_empty() {
+                wrapped.push(line);
+                line = String::new();
+                width = 0;
+            }
+            line.push(c);
+            width += cw;
+        }
+        wrapped.push(line);
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    wrapped
+}
+
+/// Compute wrapped cursor row/column (display columns) for input text.
+pub fn wrapped_input_cursor_position(
+    text: &str,
+    cursor_chars: usize,
+    avail: usize,
+) -> (usize, usize) {
+    if avail == 0 {
+        return (0, 0);
+    }
+
+    let mut row = 0usize;
+    let mut col = 0usize;
+
+    for (idx, c) in text.chars().enumerate() {
+        if idx >= cursor_chars {
+            break;
+        }
+        if c == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+
+        let cw = unicode_width::UnicodeWidthChar::width(c)
+            .unwrap_or(1)
+            .max(1);
+        if col + cw > avail && col > 0 {
+            row += 1;
+            col = 0;
+        }
+        col += cw;
+    }
+
+    (row, col)
+}
+
 fn truncate_to_width(text: &str, max_display_width: usize) -> String {
     if text.width() <= max_display_width {
         return text.to_string();
@@ -438,7 +510,6 @@ impl Widget for ContextPanel {
 /// Input box widget
 pub struct InputBox<'a> {
     pub content: &'a str,
-    #[allow(dead_code)]
     pub cursor: usize,
     pub focused: bool,
 }
@@ -459,6 +530,10 @@ impl Widget for InputBox<'_> {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
         let display_text = if self.content.is_empty() {
             "Type your message... (Enter to send, Ctrl+C to clear/quit)"
         } else {
@@ -471,10 +546,25 @@ impl Widget for InputBox<'_> {
             Theme::text()
         };
 
-        let text = Paragraph::new(display_text)
-            .style(style)
-            .wrap(Wrap { trim: false });
-        text.render(inner, buf);
+        if self.content.is_empty() {
+            let text = Paragraph::new(display_text)
+                .style(style)
+                .wrap(Wrap { trim: false });
+            text.render(inner, buf);
+            return;
+        }
+
+        let wrapped = wrap_input_lines(self.content, inner.width as usize);
+        let (cursor_row, _) =
+            wrapped_input_cursor_position(self.content, self.cursor, inner.width as usize);
+        let visible_h = inner.height as usize;
+        let window_start = cursor_row.saturating_sub(visible_h.saturating_sub(1));
+
+        for i in 0..visible_h {
+            let text = wrapped.get(window_start + i).cloned().unwrap_or_default();
+            let line = Line::from(Span::styled(text, style));
+            buf.set_line(inner.x, inner.y + i as u16, &line, inner.width);
+        }
     }
 }
 
@@ -1697,5 +1787,18 @@ mod md_test {
             output, input,
             "sanitize_for_display should preserve newlines"
         );
+    }
+
+    #[test]
+    fn test_input_wrap_preserves_newlines_and_wide_chars() {
+        let wrapped = wrap_input_lines("abcd中文ef\ngh", 6);
+        assert_eq!(wrapped, vec!["abcd中", "文ef", "gh"]);
+    }
+
+    #[test]
+    fn test_wrapped_input_cursor_position_with_wide_chars() {
+        let text = "abcdef中文xyz";
+        assert_eq!(wrapped_input_cursor_position(text, 6, 6), (0, 6));
+        assert_eq!(wrapped_input_cursor_position(text, 7, 6), (1, 2));
     }
 }

@@ -213,7 +213,8 @@ use super::slash_commands::{
 };
 use super::theme::Theme;
 use super::widgets::{
-    render_message_lines, HeaderBar, HelpBar, InputBox, Message, MessageRole, StatusBar,
+    render_message_lines, wrapped_input_cursor_position, HeaderBar, HelpBar, InputBox, Message,
+    MessageRole, StatusBar,
 };
 
 /// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
@@ -6344,12 +6345,21 @@ Make it comprehensive but concise."#;
                 Self::render_slash_popup(f, main_chunks[3], slash_popup);
             }
 
-            // Set cursor position (use display width for proper CJK support)
-            let cursor_x = main_chunks[3].x + 1 + input.cursor_display_width() as u16;
-            let cursor_y = main_chunks[3].y + 1;
+            // Keep cursor aligned with wrapped input rendering (including wide chars/newlines).
+            let inner_w = main_chunks[3].width.saturating_sub(2) as usize;
+            let inner_h = main_chunks[3].height.saturating_sub(2) as usize;
+            let (cursor_row, cursor_col) =
+                wrapped_input_cursor_position(&input.buffer, input.cursor, inner_w);
+            let scroll_start = cursor_row.saturating_sub(inner_h.saturating_sub(1));
+            let visible_row = cursor_row
+                .saturating_sub(scroll_start)
+                .min(inner_h.saturating_sub(1));
+            let visible_col = cursor_col.min(inner_w.saturating_sub(1));
+            let cursor_x = main_chunks[3].x + 1 + visible_col as u16;
+            let cursor_y = main_chunks[3].y + 1 + visible_row as u16;
             f.set_cursor_position((
                 cursor_x.min(main_chunks[3].x + main_chunks[3].width - 2),
-                cursor_y,
+                cursor_y.min(main_chunks[3].y + main_chunks[3].height - 2),
             ));
 
             // Help bar
