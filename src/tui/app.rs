@@ -968,6 +968,18 @@ impl App {
             }
         }
 
+        // Global interruption hotkeys must win over picker/popup handling.
+        // Otherwise Esc can get consumed by UI overlays while active work keeps running.
+        let is_ctrl_c = matches!(key.code, crossterm::event::KeyCode::Char('c'))
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL);
+        let is_escape = matches!(key.code, crossterm::event::KeyCode::Esc);
+        if (is_ctrl_c || is_escape) && (self.is_processing || self.gugugaga_status.is_some()) {
+            let _ = self.interrupt_active_work().await;
+            return;
+        }
+
         // Handle picker keys
         if self.picker.visible {
             match key.code {
@@ -5679,7 +5691,9 @@ Make it comprehensive but concise."#;
     /// Interrupt whatever is currently running (Codex turn and/or Gugugaga supervision).
     async fn interrupt_active_work(&mut self) -> bool {
         let should_interrupt_turn = self.is_processing;
-        let should_interrupt_supervision = self.gugugaga_status.is_some();
+        // Supervision can be active before status text arrives (or if status events are dropped),
+        // so while a turn is active we always send the local supervision interrupt as well.
+        let should_interrupt_supervision = should_interrupt_turn || self.gugugaga_status.is_some();
         if !should_interrupt_turn && !should_interrupt_supervision {
             return false;
         }
