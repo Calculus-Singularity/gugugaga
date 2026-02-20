@@ -3690,6 +3690,8 @@ Make it comprehensive but concise."#;
 
             match self.picker_mode {
                 PickerMode::Resume => {
+                    // Clear stale restore payload from any previous resume attempt.
+                    self.pending_session_restore = None;
                     self.messages
                         .push(Message::system(format!("Resuming session: {}", item_title)));
                     if let Some(tx) = &self.input_tx {
@@ -5853,24 +5855,39 @@ Make it comprehensive but concise."#;
                     if let Some(thread) = result.get("thread") {
                         if let Some(id) = thread.get("id").and_then(|i| i.as_str()) {
                             self.set_active_thread_id(id.to_string());
+                            // Switching to another thread should replace the current transcript
+                            // instead of appending onto it.
+                            self.messages.clear();
+                            let mut rendered_history = false;
 
                             // If we have a pending session restore (from gugugaga/sessionRestore),
                             // use it to display ALL turns (User, Codex, Gugugaga) in correct
                             // chronological order. Otherwise fall back to display_turns().
                             if let Some(restore_turns) = self.pending_session_restore.take() {
-                                self.display_session_restore(&restore_turns);
-                                self.scroll_to_bottom();
-                            } else if let Some(turns) =
-                                thread.get("turns").and_then(|t| t.as_array())
-                            {
-                                if !turns.is_empty() {
-                                    self.display_turns(turns);
-                                    self.scroll_to_bottom();
+                                if !restore_turns.is_empty() {
+                                    self.display_session_restore(&restore_turns);
+                                    rendered_history = true;
                                 }
                             }
+
+                            if !rendered_history {
+                                if let Some(turns) = thread.get("turns").and_then(|t| t.as_array())
+                                {
+                                    if !turns.is_empty() {
+                                        self.display_turns(turns);
+                                        rendered_history = true;
+                                    }
+                                }
+                            }
+
+                            if !rendered_history {
+                                self.messages.push(Message::system("Session resumed."));
+                            }
+                            self.scroll_to_bottom();
                         }
                     }
                 } else if let Some(error) = json.get("error") {
+                    self.pending_session_restore = None;
                     let error_msg = error
                         .get("message")
                         .and_then(|m| m.as_str())
