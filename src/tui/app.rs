@@ -109,6 +109,28 @@ fn format_json_value_for_display(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+fn is_internal_supervision_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "update_notebook"
+            | "set_activity"
+            | "clear_activity"
+            | "add_completed"
+            | "add_attention"
+            | "notebook_mistake"
+    )
+}
+
+fn supervisor_tool_trace_debug_enabled() -> bool {
+    std::env::var("GUGUGAGA_DEBUG_TOOL_TRACE")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
 use super::ascii_animation::AsciiAnimation;
 use super::clipboard_paste::paste_image_to_temp_png;
 use super::input::{InputAction, InputState};
@@ -4431,13 +4453,17 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("guarded"))
                         .and_then(|b| b.as_bool())
                         .unwrap_or(false);
+                    let debug_tool_trace = supervisor_tool_trace_debug_enabled();
+                    let internal_tool = is_internal_supervision_tool(tool);
                     let args_preview = tool_args_preview(args, 120);
                     let args_display = format_tool_args_for_display(args);
 
                     match status {
                         "started" => {
                             // Show tool call start in status bar
-                            if call_id.is_empty() {
+                            if internal_tool && !debug_tool_trace {
+                                self.gugugaga_status = Some("Supervising...".to_string());
+                            } else if call_id.is_empty() {
                                 self.gugugaga_status =
                                     Some(format!("$ {}({})", tool, args_preview));
                             } else {
@@ -4467,48 +4493,58 @@ Make it comprehensive but concise."#;
 
                             let icon = if success { "✓" } else { "✗" };
 
-                            // Show tool call + result as a Gugugaga message in chat
-                            // Format like Codex: $ command → output → result
-                            let mut content = format!("$ {}({})\n", tool, args_display);
-                            if !call_id.is_empty() {
-                                content.push_str(&format!("call_id: {}\n", call_id));
-                            }
-                            if let Some(normalized) = normalized_args {
-                                let pretty = format_tool_args_for_display(normalized);
-                                if !pretty.trim().is_empty() && pretty.trim() != args_display.trim()
-                                {
-                                    content.push_str("normalized args:\n");
-                                    content.push_str(&pretty);
+                            let mut content = if internal_tool && !debug_tool_trace {
+                                format!("$ {}\n", tool)
+                            } else {
+                                format!("$ {}({})\n", tool, args_display)
+                            };
+
+                            if debug_tool_trace {
+                                if !call_id.is_empty() {
+                                    content.push_str(&format!("call_id: {}\n", call_id));
+                                }
+                                if let Some(normalized) = normalized_args {
+                                    let pretty = format_tool_args_for_display(normalized);
+                                    if !pretty.trim().is_empty()
+                                        && pretty.trim() != args_display.trim()
+                                    {
+                                        content.push_str("normalized args:\n");
+                                        content.push_str(&pretty);
+                                        content.push('\n');
+                                    }
+                                }
+                                if let Some(err) = normalized_error {
+                                    if !err.trim().is_empty() {
+                                        content.push_str(&format!("argument error: {}\n", err));
+                                    }
+                                }
+                                if let Some(item) = raw_item {
+                                    let payload = format_json_value_for_display(item);
+                                    let capped_payload = truncate_utf8(&payload, 4_000);
+                                    content.push_str("raw payload:\n");
+                                    content.push_str(capped_payload);
+                                    if capped_payload.len() < payload.len() {
+                                        content.push_str("\n... (payload truncated)");
+                                    }
                                     content.push('\n');
                                 }
                             }
-                            if let Some(err) = normalized_error {
-                                if !err.trim().is_empty() {
-                                    content.push_str(&format!("argument error: {}\n", err));
-                                }
-                            }
-                            if let Some(item) = raw_item {
-                                let payload = format_json_value_for_display(item);
-                                let capped_payload = truncate_utf8(&payload, 4_000);
-                                content.push_str("raw payload:\n");
-                                content.push_str(capped_payload);
-                                if capped_payload.len() < payload.len() {
-                                    content.push_str("\n... (payload truncated)");
-                                }
-                                content.push('\n');
-                            }
                             if !output.is_empty() {
-                                // Show rich tool output while still keeping message size bounded.
-                                let capped_output = truncate_utf8(output, 10_000);
+                                let (max_bytes, max_lines) = if internal_tool && !debug_tool_trace {
+                                    (2_000usize, 8usize)
+                                } else {
+                                    (10_000usize, 40usize)
+                                };
+                                let capped_output = truncate_utf8(output, max_bytes);
                                 let output_lines: Vec<&str> =
-                                    capped_output.lines().take(40).collect();
+                                    capped_output.lines().take(max_lines).collect();
                                 content.push_str(&output_lines.join("\n"));
                                 let total_lines = capped_output.lines().count();
                                 let bytes_truncated = capped_output.len() < output.len();
-                                if total_lines > 40 {
+                                if total_lines > max_lines {
                                     content.push_str(&format!(
                                         "\n... ({} more lines)",
-                                        total_lines - 40
+                                        total_lines - max_lines
                                     ));
                                 }
                                 if bytes_truncated {
@@ -4529,8 +4565,11 @@ Make it comprehensive but concise."#;
                             self.scroll_to_bottom();
 
                             // Update status bar
-                            let mut status_line =
-                                format!("{} {}({}) {}", icon, tool, args_preview, duration_str);
+                            let mut status_line = if internal_tool && !debug_tool_trace {
+                                format!("{} {} {}", icon, tool, duration_str)
+                            } else {
+                                format!("{} {}({}) {}", icon, tool, args_preview, duration_str)
+                            };
                             if guarded && duplicate {
                                 status_line.push_str(" duplicate-skip");
                             } else if guarded {
