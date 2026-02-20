@@ -40,6 +40,14 @@ struct ToolExecutionOutcome {
     tool_result: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct NotebookSnapshot {
+    current_activity: Option<String>,
+    completed: Vec<String>,
+    attention: Vec<String>,
+    mistakes: Vec<String>,
+}
+
 struct ToolCallEventMeta<'a> {
     duration_ms: u64,
     success: bool,
@@ -47,6 +55,7 @@ struct ToolCallEventMeta<'a> {
     normalized_error: Option<&'a str>,
     guarded: bool,
     duplicate: bool,
+    notebook_diff: Option<&'a serde_json::Value>,
 }
 
 /// The gugugaga agent that monitors and corrects Codex behavior
@@ -469,6 +478,85 @@ impl GugugagaAgent {
         }
     }
 
+    fn is_notebook_tool(tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            "update_notebook"
+                | "set_activity"
+                | "clear_activity"
+                | "add_completed"
+                | "add_attention"
+                | "notebook_mistake"
+        )
+    }
+
+    async fn capture_notebook_snapshot(&self) -> NotebookSnapshot {
+        let notebook = self.notebook.read().await;
+        NotebookSnapshot {
+            current_activity: notebook.current_activity.clone(),
+            completed: notebook
+                .completed
+                .iter()
+                .map(|item| format!("{} - {}", item.what, item.significance))
+                .collect(),
+            attention: notebook
+                .attention
+                .iter()
+                .map(|item| format!("[{}] {}", item.priority, item.content))
+                .collect(),
+            mistakes: notebook
+                .mistakes
+                .iter()
+                .map(|item| format!("{} -> {}", item.what_happened, item.lesson))
+                .collect(),
+        }
+    }
+
+    fn diff_added_strings(before: &[String], after: &[String]) -> Vec<String> {
+        let before_set: std::collections::HashSet<&String> = before.iter().collect();
+        after
+            .iter()
+            .filter(|entry| !before_set.contains(*entry))
+            .cloned()
+            .collect()
+    }
+
+    fn build_notebook_diff(
+        before: &NotebookSnapshot,
+        after: &NotebookSnapshot,
+    ) -> Option<serde_json::Value> {
+        let completed_added = Self::diff_added_strings(&before.completed, &after.completed);
+        let attention_added = Self::diff_added_strings(&before.attention, &after.attention);
+        let mistakes_added = Self::diff_added_strings(&before.mistakes, &after.mistakes);
+        let activity_changed = before.current_activity != after.current_activity;
+        let count_changed = before.completed.len() != after.completed.len()
+            || before.attention.len() != after.attention.len()
+            || before.mistakes.len() != after.mistakes.len();
+
+        if !activity_changed
+            && !count_changed
+            && completed_added.is_empty()
+            && attention_added.is_empty()
+            && mistakes_added.is_empty()
+        {
+            return None;
+        }
+
+        Some(serde_json::json!({
+            "activity_before": before.current_activity,
+            "activity_after": after.current_activity,
+            "completed_before": before.completed.len(),
+            "completed_after": after.completed.len(),
+            "completed_added": completed_added,
+            "attention_before": before.attention.len(),
+            "attention_after": after.attention.len(),
+            "attention_added": attention_added,
+            "mistakes_before": before.mistakes.len(),
+            "mistakes_after": after.mistakes.len(),
+            "mistakes_added": mistakes_added,
+        }))
+    }
+
     fn emit_tool_call_started_event(
         &self,
         tool_call: &StructuredToolCall,
@@ -519,6 +607,7 @@ impl GugugagaAgent {
                     "success": meta.success,
                     "guarded": meta.guarded,
                     "duplicate": meta.duplicate,
+                    "notebook_diff": meta.notebook_diff,
                 }
             })
             .to_string();
@@ -545,6 +634,7 @@ impl GugugagaAgent {
                 normalized_error: None,
                 guarded: true,
                 duplicate,
+                notebook_diff: None,
             },
         );
         ToolExecutionOutcome {
@@ -560,6 +650,11 @@ impl GugugagaAgent {
         event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
     ) -> Option<ToolExecutionOutcome> {
         self.emit_tool_call_started_event(tool_call, event_tx);
+        let notebook_before = if Self::is_notebook_tool(&tool_call.tool_name) {
+            Some(self.capture_notebook_snapshot().await)
+        } else {
+            None
+        };
 
         let started = std::time::Instant::now();
         let normalized = Self::normalize_tool_arguments(&tool_call.tool_name, &tool_call.arguments);
@@ -580,6 +675,15 @@ impl GugugagaAgent {
             ),
         };
         let duration = started.elapsed();
+        let notebook_after = if notebook_before.is_some() {
+            Some(self.capture_notebook_snapshot().await)
+        } else {
+            None
+        };
+        let notebook_diff = match (notebook_before.as_ref(), notebook_after.as_ref()) {
+            (Some(before), Some(after)) => Self::build_notebook_diff(before, after),
+            _ => None,
+        };
 
         let output_text = result.as_deref().unwrap_or("(no result)");
         self.emit_tool_call_completed_event(
@@ -593,6 +697,7 @@ impl GugugagaAgent {
                 normalized_error: normalized_error.as_deref(),
                 guarded: false,
                 duplicate: false,
+                notebook_diff: notebook_diff.as_ref(),
             },
         );
 
@@ -1226,5 +1331,48 @@ mod tests {
         )
         .expect("should normalize");
         assert_eq!(normalized, "done|important");
+    }
+
+    #[test]
+    fn build_notebook_diff_reports_activity_and_added_items() {
+        let before = super::NotebookSnapshot {
+            current_activity: Some("A".to_string()),
+            completed: vec!["old - keep".to_string()],
+            attention: vec![],
+            mistakes: vec![],
+        };
+        let after = super::NotebookSnapshot {
+            current_activity: Some("B".to_string()),
+            completed: vec!["old - keep".to_string(), "new - sig".to_string()],
+            attention: vec!["[high] watch".to_string()],
+            mistakes: vec![],
+        };
+
+        let diff = GugugagaAgent::build_notebook_diff(&before, &after).expect("has diff");
+        assert_eq!(
+            diff.get("activity_before").and_then(|v| v.as_str()),
+            Some("A")
+        );
+        assert_eq!(
+            diff.get("activity_after").and_then(|v| v.as_str()),
+            Some("B")
+        );
+        let completed_added = diff
+            .get("completed_added")
+            .and_then(|v| v.as_array())
+            .expect("array");
+        assert_eq!(completed_added.len(), 1);
+        assert_eq!(completed_added[0].as_str(), Some("new - sig"));
+    }
+
+    #[test]
+    fn build_notebook_diff_none_when_unchanged() {
+        let snapshot = super::NotebookSnapshot {
+            current_activity: Some("Same".to_string()),
+            completed: vec!["item - sig".to_string()],
+            attention: vec!["[medium] note".to_string()],
+            mistakes: vec!["m -> l".to_string()],
+        };
+        assert!(GugugagaAgent::build_notebook_diff(&snapshot, &snapshot).is_none());
     }
 }

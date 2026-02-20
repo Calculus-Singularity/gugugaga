@@ -131,6 +131,79 @@ fn supervisor_tool_trace_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn notebook_activity_label(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "(none)".to_string())
+}
+
+fn format_notebook_diff_for_display(diff: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let activity_before = diff.get("activity_before").and_then(|v| v.as_str());
+    let activity_after = diff.get("activity_after").and_then(|v| v.as_str());
+    let before_label = notebook_activity_label(activity_before);
+    let after_label = notebook_activity_label(activity_after);
+    if before_label != after_label {
+        lines.push(format!("activity: {} -> {}", before_label, after_label));
+    }
+
+    let section = |prefix: &str, key_added: &str, key_before: &str, key_after: &str| {
+        let mut section_lines = Vec::new();
+        let before = diff.get(key_before).and_then(|v| v.as_u64()).unwrap_or(0);
+        let after = diff.get(key_after).and_then(|v| v.as_u64()).unwrap_or(0);
+        let added = diff
+            .get(key_added)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if !added.is_empty() {
+            section_lines.push(format!(
+                "{} +{} ({} -> {})",
+                prefix,
+                added.len(),
+                before,
+                after
+            ));
+            for entry in added.iter().take(3) {
+                if let Some(text) = entry.as_str() {
+                    section_lines.push(format!("  + {}", text));
+                }
+            }
+            if added.len() > 3 {
+                section_lines.push(format!("  ... ({} more)", added.len() - 3));
+            }
+        } else if before != after {
+            section_lines.push(format!("{} {} -> {}", prefix, before, after));
+        }
+
+        section_lines
+    };
+
+    lines.extend(section(
+        "completed",
+        "completed_added",
+        "completed_before",
+        "completed_after",
+    ));
+    lines.extend(section(
+        "attention",
+        "attention_added",
+        "attention_before",
+        "attention_after",
+    ));
+    lines.extend(section(
+        "mistakes",
+        "mistakes_added",
+        "mistakes_before",
+        "mistakes_after",
+    ));
+
+    lines
+}
+
 use super::ascii_animation::AsciiAnimation;
 use super::clipboard_paste::paste_image_to_temp_png;
 use super::input::{InputAction, InputState};
@@ -4445,6 +4518,7 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("normalized_error"))
                         .and_then(|a| a.as_str());
                     let raw_item = params.and_then(|p| p.get("raw_item"));
+                    let notebook_diff = params.and_then(|p| p.get("notebook_diff"));
                     let duplicate = params
                         .and_then(|p| p.get("duplicate"))
                         .and_then(|b| b.as_bool())
@@ -4498,6 +4572,17 @@ Make it comprehensive but concise."#;
                             } else {
                                 format!("$ {}({})\n", tool, args_display)
                             };
+                            let mut notebook_diff_rendered = false;
+                            if internal_tool && !debug_tool_trace {
+                                if let Some(diff) = notebook_diff {
+                                    let diff_lines = format_notebook_diff_for_display(diff);
+                                    if !diff_lines.is_empty() {
+                                        content.push_str(&diff_lines.join("\n"));
+                                        content.push('\n');
+                                        notebook_diff_rendered = true;
+                                    }
+                                }
+                            }
 
                             if debug_tool_trace {
                                 if !call_id.is_empty() {
@@ -4529,7 +4614,9 @@ Make it comprehensive but concise."#;
                                     content.push('\n');
                                 }
                             }
-                            if !output.is_empty() {
+                            if !(output.is_empty()
+                                || (internal_tool && !debug_tool_trace && notebook_diff_rendered))
+                            {
                                 let (max_bytes, max_lines) = if internal_tool && !debug_tool_trace {
                                     (2_000usize, 8usize)
                                 } else {
