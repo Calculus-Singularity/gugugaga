@@ -164,8 +164,8 @@ impl CodexCommand {
             CodexCommand::Clean => "stop all background terminals",
             CodexCommand::Personality => "choose communication style",
             CodexCommand::TestApproval => "test approval request",
-            CodexCommand::MemoryDrop => "DO NOT USE",
-            CodexCommand::MemoryUpdate => "DO NOT USE",
+            CodexCommand::MemoryDrop => "debug command (internal use)",
+            CodexCommand::MemoryUpdate => "debug command (internal use)",
         }
     }
 

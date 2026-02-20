@@ -76,6 +76,35 @@ fn parse_pasted_image_path(pasted: &str) -> Option<PathBuf> {
     (candidate.exists() && is_supported_image_path(&candidate)).then_some(candidate)
 }
 
+fn tool_args_preview(args: &str, max_bytes: usize) -> String {
+    let compact = args
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return String::new();
+    }
+    let preview = truncate_utf8(&compact, max_bytes);
+    if preview.len() < compact.len() {
+        format!("{preview}...")
+    } else {
+        preview.to_string()
+    }
+}
+
+fn format_tool_args_for_display(args: &str) -> String {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(json) => serde_json::to_string_pretty(&json).unwrap_or_else(|_| trimmed.to_string()),
+        Err(_) => trimmed.to_string(),
+    }
+}
+
 use super::ascii_animation::AsciiAnimation;
 use super::clipboard_paste::paste_image_to_temp_png;
 use super::input::{InputAction, InputState};
@@ -4367,11 +4396,13 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("args"))
                         .and_then(|a| a.as_str())
                         .unwrap_or("");
+                    let args_preview = tool_args_preview(args, 120);
+                    let args_display = format_tool_args_for_display(args);
 
                     match status {
                         "started" => {
                             // Show tool call start in status bar
-                            self.gugugaga_status = Some(format!("$ {}({})", tool, args));
+                            self.gugugaga_status = Some(format!("$ {}({})", tool, args_preview));
                         }
                         "completed" => {
                             let output = params
@@ -4397,17 +4428,23 @@ Make it comprehensive but concise."#;
 
                             // Show tool call + result as a Gugugaga message in chat
                             // Format like Codex: $ command → output → result
-                            let mut content = format!("$ {}({})\n", tool, args);
+                            let mut content = format!("$ {}({})\n", tool, args_display);
                             if !output.is_empty() {
-                                // Limit output lines for display
-                                let output_lines: Vec<&str> = output.lines().take(8).collect();
+                                // Show rich tool output while still keeping message size bounded.
+                                let capped_output = truncate_utf8(output, 10_000);
+                                let output_lines: Vec<&str> =
+                                    capped_output.lines().take(40).collect();
                                 content.push_str(&output_lines.join("\n"));
-                                let total_lines = output.lines().count();
-                                if total_lines > 8 {
+                                let total_lines = capped_output.lines().count();
+                                let bytes_truncated = capped_output.len() < output.len();
+                                if total_lines > 40 {
                                     content.push_str(&format!(
                                         "\n... ({} more lines)",
-                                        total_lines - 8
+                                        total_lines - 40
                                     ));
+                                }
+                                if bytes_truncated {
+                                    content.push_str("\n... (output truncated by size)");
                                 }
                                 content.push('\n');
                             }
@@ -4417,8 +4454,10 @@ Make it comprehensive but concise."#;
                             self.scroll_to_bottom();
 
                             // Update status bar
-                            self.gugugaga_status =
-                                Some(format!("{} {}({}) {}", icon, tool, args, duration_str));
+                            self.gugugaga_status = Some(format!(
+                                "{} {}({}) {}",
+                                icon, tool, args_preview, duration_str
+                            ));
                         }
                         _ => {}
                     }
@@ -4453,6 +4492,11 @@ Make it comprehensive but concise."#;
                     // Clear gugugaga status (thinking is done)
                     self.gugugaga_status = None;
 
+                    let thinking = json
+                        .get("params")
+                        .and_then(|p| p.get("thinking"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
                     let status = json
                         .get("params")
                         .and_then(|p| p.get("status"))
@@ -4464,6 +4508,10 @@ Make it comprehensive but concise."#;
                         .and_then(|p| p.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("");
+
+                    if !thinking.trim().is_empty() {
+                        self.messages.push(Message::thinking(thinking.trim()));
+                    }
 
                     if !msg.is_empty() {
                         match status {

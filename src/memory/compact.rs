@@ -24,7 +24,7 @@ pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
 /// Prompt sent to LLM to generate a handoff summary (aligned with Codex's
 /// `codex-rs/core/templates/compact/prompt.md`)
-pub const COMPACT_PROMPT: &str = r#"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+pub const COMPACT_PROMPT: &str = r#"You are generating a context-checkpoint handoff summary for another LLM that will continue this task.
 
 Include:
 - Current progress and key decisions made
@@ -32,7 +32,7 @@ Include:
 - What remains to be done (clear next steps)
 - Any critical data, examples, or references needed to continue
 
-Be concise, structured, and focused on helping the next LLM seamlessly continue the work."#;
+Keep the summary concise, structured, and directly useful for continuing the work."#;
 
 /// Prefix added to summary messages to identify them (aligned with Codex's
 /// `codex-rs/core/templates/compact/summary_prefix.md`)

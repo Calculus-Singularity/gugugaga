@@ -31,6 +31,19 @@ pub struct CheckResult {
     pub thinking: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ParsedToolCall {
+    tool_name: String,
+    args: String,
+    trailing_response: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolExecutionOutcome {
+    tool_result: String,
+    trailing_response: Option<String>,
+}
+
 /// The gugugaga agent that monitors and corrects Codex behavior
 pub struct GugugagaAgent {
     /// Evaluator for LLM-based evaluation
@@ -147,15 +160,29 @@ impl GugugagaAgent {
             }
 
             // Check for tool calls
-            if let Some(tool_result) = self.execute_tool_call_with_events(response, event_tx).await
-            {
-                tool_results.push(tool_result);
+            if let Some(outcome) = self.execute_tool_call_with_events(response, event_tx).await {
+                tool_results.push(outcome.tool_result);
                 let _ = Compactor::compact_tool_results_if_needed(
                     &self.evaluator,
                     &mut tool_results,
                     TOOL_RESULTS_MAX_TOKENS,
                 )
                 .await;
+
+                if let Some(final_response) = outcome.trailing_response {
+                    let final_response = final_response.trim();
+                    if !final_response.is_empty() {
+                        // Record the exchange in memory
+                        let mut mem = self.memory.write().await;
+                        let _ = mem
+                            .add_turn(
+                                crate::memory::TurnRole::Gugugaga,
+                                final_response.to_string(),
+                            )
+                            .await;
+                        return Ok(final_response.to_string());
+                    }
+                }
                 continue;
             }
 
@@ -272,9 +299,15 @@ impl GugugagaAgent {
             }
 
             // Check for tool calls
-            if let Some(tool_result) = self.execute_tool_call_with_events(response, event_tx).await
-            {
-                tool_results.push(tool_result);
+            if let Some(outcome) = self.execute_tool_call_with_events(response, event_tx).await {
+                tool_results.push(outcome.tool_result);
+
+                if let Some(final_response) = outcome.trailing_response {
+                    let final_response = final_response.trim();
+                    if !final_response.is_empty() {
+                        return self.parse_check_response(final_response, last_thinking);
+                    }
+                }
 
                 // ── Mid-loop compaction (aligned with Codex: after sampling, if needs follow-up) ──
                 // Compact tool results if they've grown too large
@@ -298,18 +331,11 @@ impl GugugagaAgent {
         &self,
         response: &str,
         event_tx: Option<&tokio::sync::mpsc::Sender<String>>,
-    ) -> Option<String> {
-        // Parse tool call first
-        let tool_regex = regex::Regex::new(r"TOOL:\s*(\w+)\s*\((.+)\)").ok()?;
-        let caps = tool_regex.captures(response)?;
-        let tool_name = caps.get(1)?.as_str().to_string();
-        let args = caps
-            .get(2)?
-            .as_str()
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
+    ) -> Option<ToolExecutionOutcome> {
+        let parsed = Self::parse_tool_call(response)?;
+        let tool_name = parsed.tool_name.clone();
+        let args = parsed.args.clone();
+        let args_for_execution = Self::unwrap_matching_quotes(parsed.args.trim());
 
         // Notify TUI that a tool call is starting
         if let Some(tx) = event_tx {
@@ -326,15 +352,17 @@ impl GugugagaAgent {
         }
 
         let started = std::time::Instant::now();
-        let result = self.execute_tool_call(response).await;
+        let result = self
+            .execute_tool_call(&parsed.tool_name, args_for_execution)
+            .await;
         let duration = started.elapsed();
 
         // Notify TUI of tool result
         if let Some(tx) = event_tx {
             let output = result.as_deref().unwrap_or("(no result)");
             // Truncate for display
-            let display_output = if output.len() > 500 {
-                format!("{}...[truncated]", &output[..500])
+            let display_output = if output.len() > 4000 {
+                format!("{}...[truncated]", &output[..4000])
             } else {
                 output.to_string()
             };
@@ -353,23 +381,14 @@ impl GugugagaAgent {
             let _ = tx.try_send(msg);
         }
 
-        result
+        result.map(|tool_result| ToolExecutionOutcome {
+            tool_result,
+            trailing_response: parsed.trailing_response,
+        })
     }
 
-    /// Execute a tool call if present in response
-    async fn execute_tool_call(&self, response: &str) -> Option<String> {
-        // Parse TOOL: command(args) format - use greedy match for args to handle nested content
-        let tool_regex = regex::Regex::new(r"TOOL:\s*(\w+)\s*\((.+)\)").ok()?;
-        let caps = tool_regex.captures(response)?;
-
-        let tool_name = caps.get(1)?.as_str();
-        let args = caps
-            .get(2)?
-            .as_str()
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'');
-
+    /// Execute a tool call.
+    async fn execute_tool_call(&self, tool_name: &str, args: &str) -> Option<String> {
         match tool_name {
             // === History query tools ===
             "search_history" => {
@@ -624,6 +643,108 @@ impl GugugagaAgent {
         }
     }
 
+    /// Parse a `TOOL:name(args)` call and optional trailing final response.
+    ///
+    /// This intentionally does not use greedy regex matching so we can safely
+    /// handle `TOOL(...)` followed by a final JSON answer in the same response.
+    fn parse_tool_call(response: &str) -> Option<ParsedToolCall> {
+        let marker = "TOOL:";
+        let bytes = response.as_bytes();
+        let mut index = response.find(marker)? + marker.len();
+
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+
+        let name_start = index;
+        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+        {
+            index += 1;
+        }
+        if index == name_start {
+            return None;
+        }
+        let tool_name = response[name_start..index].to_string();
+
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] != b'(' {
+            return None;
+        }
+        index += 1;
+
+        let args_start = index;
+        let mut depth = 1usize;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        while index < bytes.len() {
+            let ch = bytes[index];
+
+            if escaped {
+                escaped = false;
+                index += 1;
+                continue;
+            }
+            if (in_single || in_double) && ch == b'\\' {
+                escaped = true;
+                index += 1;
+                continue;
+            }
+
+            if in_single {
+                if ch == b'\'' {
+                    in_single = false;
+                }
+                index += 1;
+                continue;
+            }
+            if in_double {
+                if ch == b'"' {
+                    in_double = false;
+                }
+                index += 1;
+                continue;
+            }
+
+            match ch {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let args = response[args_start..index].trim().to_string();
+                        let trailing = response[index + 1..].trim().to_string();
+                        return Some(ParsedToolCall {
+                            tool_name,
+                            args,
+                            trailing_response: (!trailing.is_empty()).then_some(trailing),
+                        });
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+
+        None
+    }
+
+    fn unwrap_matching_quotes(s: &str) -> &str {
+        let bytes = s.as_bytes();
+        if bytes.len() >= 2
+            && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+                || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+        {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        }
+    }
+
     /// Read file lines with offset and limit
     async fn read_file_lines(
         &self,
@@ -731,14 +852,27 @@ impl GugugagaAgent {
 
     /// Handle update_notebook tool with JSON format
     async fn handle_update_notebook(&self, args: &str) -> Option<String> {
+        let trimmed = args.trim();
         // Try to parse as JSON
-        let json: serde_json::Value = match serde_json::from_str(args) {
+        let json: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
-            Err(_) => {
+            Err(err) => {
+                let looks_like_json = trimmed.starts_with('{')
+                    || trimmed.starts_with('[')
+                    || trimmed.starts_with("\"{")
+                    || trimmed.starts_with("'{'");
+                if looks_like_json {
+                    return Some(format!(
+                        "update_notebook: Invalid JSON payload (not applied): {}",
+                        err
+                    ));
+                }
                 // Fallback: treat as activity update
                 let mut notebook = self.notebook.write().await;
-                let _ = notebook.set_current_activity(Some(args.to_string())).await;
-                return Some(format!("update_notebook: Activity set to '{}'", args));
+                let _ = notebook
+                    .set_current_activity(Some(trimmed.to_string()))
+                    .await;
+                return Some(format!("update_notebook: Activity set to '{}'", trimmed));
             }
         };
 
@@ -938,4 +1072,35 @@ pub struct UserInputAnalysis {
     pub main_goal: Option<String>,
     pub constraints: Vec<String>,
     pub explicit_instructions: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GugugagaAgent;
+
+    #[test]
+    fn parse_tool_call_extracts_trailing_response() {
+        let response = r#"TOOL: update_notebook({"current_activity":"Reviewing"}) {"result":"ok","summary":"done"}"#;
+        let parsed = GugugagaAgent::parse_tool_call(response).expect("should parse tool call");
+        assert_eq!(parsed.tool_name, "update_notebook");
+        assert_eq!(parsed.args, r#"{"current_activity":"Reviewing"}"#);
+        assert_eq!(
+            parsed.trailing_response.as_deref(),
+            Some(r#"{"result":"ok","summary":"done"}"#)
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_handles_nested_parentheses_and_quotes() {
+        let response = r#"TOOL: shell("printf '(a(b))'")"#;
+        let parsed = GugugagaAgent::parse_tool_call(response).expect("should parse tool call");
+        assert_eq!(parsed.tool_name, "shell");
+        assert_eq!(parsed.args, r#""printf '(a(b))'""#);
+        assert!(parsed.trailing_response.is_none());
+    }
+
+    #[test]
+    fn parse_tool_call_returns_none_without_marker() {
+        assert!(GugugagaAgent::parse_tool_call("no tool call here").is_none());
+    }
 }
