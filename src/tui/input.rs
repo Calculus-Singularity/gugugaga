@@ -248,6 +248,17 @@ impl InputState {
         self.cursor = self.char_count();
     }
 
+    /// Insert text at the current cursor position.
+    pub fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let byte_idx = self.char_to_byte_index(self.cursor);
+        self.buffer.insert_str(byte_idx, text);
+        self.cursor += text.chars().count();
+    }
+
     fn delete_word(&mut self) {
         if self.cursor == 0 {
             return;

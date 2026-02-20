@@ -14,8 +14,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, info, warn};
+
+const SUPERVISION_INTERRUPTED_ERROR: &str = "__supervision_interrupted__";
 
 /// Message interceptor that wraps Codex app-server
 pub struct Interceptor {
@@ -115,6 +117,8 @@ impl Interceptor {
 
         // Channel for messages to send to app-server
         let (to_server_tx, mut to_server_rx) = mpsc::channel::<String>(32);
+        // Cancellation handle for the currently running Gugugaga supervision task.
+        let supervision_cancel_tx = Arc::new(Mutex::new(None::<oneshot::Sender<()>>));
 
         // Notify TUI that gugugaga is active
         let _ = output_tx
@@ -139,6 +143,7 @@ impl Interceptor {
         let config = self.config.clone();
         let session_store = self.session_store.clone();
         let shared_thread_id = self.current_thread_id.clone();
+        let supervision_cancel_tx_stdout = supervision_cancel_tx.clone();
 
         let stdout_task = tokio::spawn(async move {
             let violation_detector = ViolationDetector::new();
@@ -450,6 +455,7 @@ impl Interceptor {
                             effective_content,
                             &output_tx_clone,
                             &correction_tx,
+                            &supervision_cancel_tx_stdout,
                         )
                         .await;
 
@@ -592,12 +598,38 @@ impl Interceptor {
         let chat_agent = self.gugugaga_agent.clone();
         let chat_memory = self.memory.clone();
         let chat_output_tx = output_tx.clone();
+        let supervision_cancel_tx_input = supervision_cancel_tx.clone();
 
         while let Some(input) = user_input_rx.recv().await {
             // Process user input
             match serde_json::from_str::<Value>(&input) {
                 Ok(msg) => {
                     if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                        if method == "gugugaga/interrupt" {
+                            let interrupted = {
+                                let mut slot = supervision_cancel_tx_input.lock().await;
+                                if let Some(cancel_tx) = slot.take() {
+                                    let _ = cancel_tx.send(());
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+
+                            if interrupted {
+                                let notify = serde_json::json!({
+                                    "method": "gugugaga/check",
+                                    "params": {
+                                        "status": "interrupted",
+                                        "message": "Supervising interrupted by user."
+                                    }
+                                })
+                                .to_string();
+                                let _ = chat_output_tx.send(notify).await;
+                            }
+                            continue;
+                        }
+
                         // Handle gugugaga/chat locally — don't forward to app-server
                         if method == "gugugaga/chat" {
                             let user_msg = msg
@@ -736,6 +768,7 @@ impl Interceptor {
         current_turn_content: &str,
         event_tx: &tokio::sync::mpsc::Sender<String>,
         server_tx: &tokio::sync::mpsc::Sender<String>,
+        supervision_cancel_tx: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
     ) -> InterceptAction {
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -804,9 +837,21 @@ impl Interceptor {
 
                 // Perform LLM evaluation with actual turn content
                 // Pass event_tx so thinking/tool-call activity is streamed to TUI
-                let eval_result = gugugaga_agent
-                    .detect_violation(current_turn_content, Some(event_tx))
-                    .await;
+                let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+                {
+                    let mut slot = supervision_cancel_tx.lock().await;
+                    *slot = Some(cancel_tx);
+                }
+                let eval_result = tokio::select! {
+                    _ = &mut cancel_rx => Err(GugugagaError::LlmEvaluation(
+                        SUPERVISION_INTERRUPTED_ERROR.to_string()
+                    )),
+                    result = gugugaga_agent.detect_violation(current_turn_content, Some(event_tx)) => result,
+                };
+                {
+                    let mut slot = supervision_cancel_tx.lock().await;
+                    *slot = None;
+                }
 
                 match eval_result {
                     Ok(result) => {
@@ -860,6 +905,11 @@ impl Interceptor {
                             .to_string();
                             InterceptAction::InjectAfter(vec![msg])
                         }
+                    }
+                    Err(GugugagaError::LlmEvaluation(msg))
+                        if msg == SUPERVISION_INTERRUPTED_ERROR =>
+                    {
+                        InterceptAction::Forward
                     }
                     Err(e) => {
                         // LLM evaluation failed — tell the user so they know

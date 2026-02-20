@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,7 +38,46 @@ fn make_relative_path(raw_path: &str, cwd: &str) -> String {
     }
 }
 
+fn is_supported_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Parse pasted text and return a local image path if it looks like one.
+fn parse_pasted_image_path(pasted: &str) -> Option<PathBuf> {
+    let trimmed = pasted.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
+        .unwrap_or(trimmed);
+
+    let candidate = if let Some(rest) = unquoted.strip_prefix("file://") {
+        PathBuf::from(rest)
+    } else {
+        PathBuf::from(unquoted)
+    };
+
+    (candidate.exists() && is_supported_image_path(&candidate)).then_some(candidate)
+}
+
 use super::ascii_animation::AsciiAnimation;
+use super::clipboard_paste::paste_image_to_temp_png;
 use super::input::{InputAction, InputState};
 use super::picker::{Picker, PickerItem};
 use super::slash_commands::{
@@ -376,6 +416,8 @@ pub struct App {
     rate_limit_snapshot: Option<RateLimitSnapshotCache>,
     /// Active command execution terminals keyed by item_id.
     active_terminals: HashMap<String, ActiveTerminal>,
+    /// Images attached via clipboard paste (Ctrl/Alt+V or pasted file paths).
+    attached_images: Vec<PathBuf>,
     /// In-progress state for /statusline editor UI.
     statusline_editor: Option<StatuslineEditorState>,
     /// When the current turn started processing (for elapsed time display)
@@ -416,7 +458,8 @@ impl App {
         execute!(
             stdout,
             EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste
         )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
@@ -463,6 +506,7 @@ impl App {
             token_usage_snapshot: None,
             rate_limit_snapshot: None,
             active_terminals: HashMap::new(),
+            attached_images: Vec::new(),
             statusline_editor: None,
             turn_start_time: None,
             // Skip the Welcome animation if trust is already established
@@ -614,6 +658,11 @@ impl App {
                             Event::Key(key) => {
                                 self.handle_input(key).await;
                             }
+                            Event::Paste(pasted) => {
+                                // Normalize CR from terminals like iTerm2.
+                                let pasted = pasted.replace('\r', "\n");
+                                self.handle_paste_event(pasted);
+                            }
                             Event::Mouse(mouse) => {
                                 self.handle_mouse(mouse);
                             }
@@ -756,6 +805,47 @@ impl App {
                 let _ = stdin.write_all(text.as_bytes());
             }
             let _ = child.wait();
+        }
+    }
+
+    fn image_label_list(count: usize) -> String {
+        (1..=count)
+            .map(|i| format!("[Image #{i}]"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn attach_local_image(&mut self, path: PathBuf, dimensions: Option<(u32, u32)>) {
+        let image_index = self.attached_images.len() + 1;
+        self.attached_images.push(path.clone());
+
+        let path_display = make_relative_path(&path.to_string_lossy(), &self.cwd);
+        match dimensions {
+            Some((w, h)) => self.messages.push(Message::system(format!(
+                "Attached [Image #{}] {}x{}: {}",
+                image_index, w, h, path_display
+            ))),
+            None => self.messages.push(Message::system(format!(
+                "Attached [Image #{}]: {}",
+                image_index, path_display
+            ))),
+        }
+        self.scroll_to_bottom();
+    }
+
+    fn handle_paste_event(&mut self, pasted: String) {
+        if pasted.trim().is_empty() {
+            return;
+        }
+
+        if let Some(path) = parse_pasted_image_path(&pasted) {
+            self.attach_local_image(path, None);
+            return;
+        }
+
+        self.input.insert_text(&pasted);
+        if self.slash_popup.visible {
+            self.update_popup_filter();
         }
     }
 
@@ -923,22 +1013,69 @@ impl App {
             }
         }
 
+        // Ctrl/Alt+V: attempt clipboard image paste.
+        if let crossterm::event::KeyCode::Char(c) = key.code {
+            if key.modifiers.intersects(
+                crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+            ) && c.eq_ignore_ascii_case(&'v')
+            {
+                match paste_image_to_temp_png() {
+                    Ok((path, info)) => {
+                        self.attach_local_image(path, Some((info.width, info.height)));
+                    }
+                    Err(err) => {
+                        self.messages.push(Message::system(format!(
+                            "Failed to paste image from clipboard: {}",
+                            err
+                        )));
+                        self.scroll_to_bottom();
+                    }
+                }
+                return;
+            }
+        }
+
+        // Support "images-only" submission when input text is empty.
+        if key.code == crossterm::event::KeyCode::Enter
+            && self.pending_user_input.is_none()
+            && self.input.buffer.trim().is_empty()
+            && !self.attached_images.is_empty()
+        {
+            if self.is_processing {
+                self.messages
+                    .push(Message::system("⏳ Please wait for current processing"));
+                self.scroll_to_bottom();
+                return;
+            }
+
+            let local_images = std::mem::take(&mut self.attached_images);
+            let preview = Self::image_label_list(local_images.len());
+            self.messages.push(Message::user(preview));
+            self.scroll_to_bottom();
+            self.start_processing();
+
+            let msg = self.create_turn_message("", &local_images);
+            if let Some(tx) = &self.input_tx {
+                let _ = tx.send(msg).await;
+            }
+            return;
+        }
+
         match self.input.handle_key(key) {
             InputAction::Quit => {
                 // Ctrl+C: double-press mechanism
-                if self.is_processing && self.current_turn_id.is_some() {
-                    // Interrupt the running turn
-                    self.send_turn_interrupt().await;
-                } else if self.quit_armed {
-                    // Second press within timeout — actually quit
-                    self.should_quit = true;
-                } else {
-                    // First press — arm the quit
-                    self.quit_armed = true;
-                    self.quit_armed_at = Some(std::time::Instant::now());
-                    self.messages
-                        .push(Message::system("Press Ctrl+C again to quit."));
-                    self.scroll_to_bottom();
+                if !self.interrupt_active_work().await {
+                    if self.quit_armed {
+                        // Second press within timeout — actually quit
+                        self.should_quit = true;
+                    } else {
+                        // First press — arm the quit
+                        self.quit_armed = true;
+                        self.quit_armed_at = Some(std::time::Instant::now());
+                        self.messages
+                            .push(Message::system("Press Ctrl+C again to quit."));
+                        self.scroll_to_bottom();
+                    }
                 }
             }
             InputAction::Submit(text) => {
@@ -1008,11 +1145,20 @@ impl App {
                             .push(Message::system("⏳ Please wait for current processing"));
                         return;
                     }
-                    self.messages.push(Message::user(&text));
+                    let local_images = std::mem::take(&mut self.attached_images);
+                    let display_text = if local_images.is_empty() {
+                        text.clone()
+                    } else if text.trim().is_empty() {
+                        Self::image_label_list(local_images.len())
+                    } else {
+                        format!("{} {}", Self::image_label_list(local_images.len()), text)
+                    };
+
+                    self.messages.push(Message::user(display_text));
                     self.scroll_to_bottom();
                     self.start_processing();
 
-                    let msg = self.create_turn_message(&text);
+                    let msg = self.create_turn_message(&text, &local_images);
                     if let Some(tx) = &self.input_tx {
                         let _ = tx.send(msg).await;
                     }
@@ -1038,13 +1184,19 @@ impl App {
                 self.handle_tab_completion();
             }
             InputAction::Escape => {
-                // Priority: slash_popup > running turn > nothing
+                // Priority: slash_popup > interrupt running work > nothing
                 if self.slash_popup.visible {
                     self.slash_popup.close();
-                } else if self.is_processing && self.current_turn_id.is_some() {
-                    self.send_turn_interrupt().await;
+                } else if self.is_processing || self.gugugaga_status.is_some() {
+                    let _ = self.interrupt_active_work().await;
                 }
                 // Otherwise ignore
+            }
+            InputAction::ClearInput => {
+                self.attached_images.clear();
+                if self.slash_popup.visible {
+                    self.update_popup_filter();
+                }
             }
             InputAction::Input('/') => {
                 // Check for // (gugugaga) or / (codex)
@@ -2464,7 +2616,7 @@ impl App {
 
 Make it comprehensive but concise."#;
 
-        let msg = self.create_turn_message(INIT_PROMPT);
+        let msg = self.create_turn_message(INIT_PROMPT, &[]);
         if let Some(tx) = &self.input_tx {
             let _ = tx.send(msg).await;
             self.messages.push(Message::user("/init"));
@@ -5343,20 +5495,30 @@ Make it comprehensive but concise."#;
             .to_string()
     }
 
-    fn create_turn_message(&mut self, text: &str) -> String {
+    fn create_turn_message(&mut self, text: &str, local_images: &[PathBuf]) -> String {
         self.request_counter += 1;
         let thread_id = self.thread_id.as_deref().unwrap_or("main");
+        let mut input_items = Vec::<serde_json::Value>::new();
+        if !text.trim().is_empty() {
+            input_items.push(serde_json::json!({
+                "type": "text",
+                "text": text,
+                "textElements": []
+            }));
+        }
+        for image_path in local_images {
+            input_items.push(serde_json::json!({
+                "type": "localImage",
+                "path": image_path.to_string_lossy().to_string()
+            }));
+        }
         serde_json::json!({
             "jsonrpc": "2.0",
             "method": "turn/start",
             "id": self.request_counter,
             "params": {
                 "threadId": thread_id,
-                "input": [{
-                    "type": "text",
-                    "text": text,
-                    "textElements": []
-                }]
+                "input": input_items
             }
         })
         .to_string()
@@ -5364,21 +5526,58 @@ Make it comprehensive but concise."#;
 
     /// Send turn/interrupt RPC to cancel the current turn
     async fn send_turn_interrupt(&mut self) {
-        if let (Some(ref turn_id), Some(ref tx)) = (&self.current_turn_id, &self.input_tx) {
+        if let Some(ref tx) = self.input_tx {
             let thread_id = self.thread_id.as_deref().unwrap_or("main");
             self.request_counter += 1;
+            let mut params = serde_json::json!({
+                "threadId": thread_id
+            });
+            if let Some(turn_id) = self.current_turn_id.as_ref() {
+                params["turnId"] = serde_json::json!(turn_id);
+            }
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "turn/interrupt",
                 "id": self.request_counter,
-                "params": {
-                    "threadId": thread_id,
-                    "turnId": turn_id
-                }
+                "params": params
             })
             .to_string();
             let _ = tx.send(msg).await;
         }
+    }
+
+    /// Send gugugaga/interrupt RPC to cancel the local supervision task.
+    async fn send_gugugaga_interrupt(&mut self) {
+        if let Some(ref tx) = self.input_tx {
+            self.request_counter += 1;
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "gugugaga/interrupt",
+                "id": self.request_counter,
+                "params": {}
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+        }
+    }
+
+    /// Interrupt whatever is currently running (Codex turn and/or Gugugaga supervision).
+    async fn interrupt_active_work(&mut self) -> bool {
+        let should_interrupt_turn = self.is_processing;
+        let should_interrupt_supervision = self.gugugaga_status.is_some();
+        if !should_interrupt_turn && !should_interrupt_supervision {
+            return false;
+        }
+
+        if should_interrupt_turn {
+            self.send_turn_interrupt().await;
+        }
+        if should_interrupt_supervision {
+            self.send_gugugaga_interrupt().await;
+            // Clear status immediately; the interceptor will also send a final check update.
+            self.gugugaga_status = None;
+        }
+        true
     }
 
     /// Mark the start of processing (sets timer if not already running).
@@ -6051,6 +6250,7 @@ impl Drop for App {
         let _ = execute!(
             self.terminal.backend_mut(),
             crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();

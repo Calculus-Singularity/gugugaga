@@ -4,6 +4,7 @@
 
 mod app;
 pub mod ascii_animation;
+mod clipboard_paste;
 pub mod frames;
 mod input;
 mod picker;
