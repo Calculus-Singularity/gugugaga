@@ -351,6 +351,11 @@ const STATUS_LINE_AVAILABLE_ITEMS: [(&str, &str, &str, &str); 15] = [
 enum PickerMode {
     None,
     Resume,
+    ReviewPreset,
+    ReviewBranch,
+    ReviewCommit,
+    FeedbackCategory,
+    FeedbackIncludeLogs,
     Model,
     ModelReasoning,         // /model second stage: select reasoning effort
     GugugagaModel,          // //model — select model for gugugaga supervisor
@@ -358,7 +363,6 @@ enum PickerMode {
     SkillsMenu,             // First-level: "List skills" / "Enable/Disable"
     SkillsSelect,           // Second-level: select a skill to insert as $mention
     SkillsManage,           // Second-level: toggle individual skills on/off
-    Approvals,
     Permissions,
     Personality,
     Collab,
@@ -528,6 +532,16 @@ pub struct App {
     pending_approval: Option<PendingApproval>,
     /// Pending request_user_input prompt from app-server.
     pending_user_input: Option<PendingUserInput>,
+    /// Waiting for the next user submission to provide thread rename text.
+    pending_rename_input: bool,
+    /// Waiting for the next user submission to provide custom review instructions.
+    pending_review_custom_input: bool,
+    /// Waiting for optional feedback note text before upload.
+    pending_feedback_note_input: bool,
+    /// Feedback classification selected from /feedback picker.
+    pending_feedback_classification: Option<String>,
+    /// Whether to include logs for the pending feedback upload.
+    pending_feedback_include_logs: bool,
     /// Scroll offset for approval overlay content
     approval_scroll: usize,
     /// Gugugaga notebook reference (for TUI display)
@@ -549,6 +563,8 @@ pub struct App {
     account_auth_mode: Option<String>,
     /// Current collaboration mode key (e.g. "default", "plan") for UI indicator.
     collaboration_mode: Option<String>,
+    /// Whether collaboration modes feature is enabled in config (if known).
+    collaboration_modes_feature_enabled: Option<bool>,
     /// Last known collaboration mode options for Shift+Tab cycling.
     collaboration_mode_options: Vec<String>,
     /// Active command execution terminals keyed by item_id.
@@ -636,6 +652,11 @@ impl App {
             quit_armed_at: None,
             pending_approval: None,
             pending_user_input: None,
+            pending_rename_input: false,
+            pending_review_custom_input: false,
+            pending_feedback_note_input: false,
+            pending_feedback_classification: None,
+            pending_feedback_include_logs: true,
             approval_scroll: 0,
             notebook: None,
             notebook_current_activity: None,
@@ -648,6 +669,7 @@ impl App {
             rate_limit_snapshot: None,
             account_auth_mode: None,
             collaboration_mode: Some("default".to_string()),
+            collaboration_modes_feature_enabled: None,
             collaboration_mode_options: vec!["default".to_string(), "plan".to_string()],
             active_terminals: HashMap::new(),
             attached_images: Vec::new(),
@@ -1202,7 +1224,12 @@ impl App {
 
         let is_shift_tab = matches!(key.code, crossterm::event::KeyCode::BackTab);
         if is_shift_tab && !self.picker.visible && !self.slash_popup.visible {
-            if self.is_processing || self.gugugaga_status.is_some() {
+            if !self.collaboration_modes_enabled() {
+                self.messages.push(Message::system(
+                    "Collaboration modes are disabled. Enable collaboration modes to use Shift+Tab.",
+                ));
+                self.scroll_to_bottom();
+            } else if self.is_processing || self.gugugaga_status.is_some() {
                 self.messages.push(Message::system(
                     "Cannot switch collaboration mode while a task is running.",
                 ));
@@ -1362,6 +1389,93 @@ impl App {
                             "Sent response for pending user input request.",
                         ));
                     }
+                    self.scroll_to_bottom();
+                    return;
+                }
+
+                if self.pending_rename_input {
+                    let trimmed = expanded_text.trim();
+                    if trimmed.eq_ignore_ascii_case("/cancel")
+                        || trimmed.eq_ignore_ascii_case("cancel")
+                    {
+                        self.pending_rename_input = false;
+                        self.messages.push(Message::system("Rename cancelled."));
+                        self.scroll_to_bottom();
+                        return;
+                    }
+                    if trimmed.is_empty() {
+                        self.messages.push(Message::system(
+                            "Thread name cannot be empty. Enter a name, or type /cancel.",
+                        ));
+                        self.scroll_to_bottom();
+                        return;
+                    }
+                    self.pending_rename_input = false;
+                    self.request_rename(trimmed).await;
+                    self.scroll_to_bottom();
+                    return;
+                }
+
+                if self.pending_review_custom_input {
+                    let trimmed = expanded_text.trim();
+                    if trimmed.eq_ignore_ascii_case("/cancel")
+                        || trimmed.eq_ignore_ascii_case("cancel")
+                    {
+                        self.pending_review_custom_input = false;
+                        self.messages
+                            .push(Message::system("Custom review request cancelled."));
+                        self.scroll_to_bottom();
+                        return;
+                    }
+                    if trimmed.is_empty() {
+                        self.messages.push(Message::system(
+                            "Review instructions cannot be empty. Enter text, or type /cancel.",
+                        ));
+                        self.scroll_to_bottom();
+                        return;
+                    }
+                    self.pending_review_custom_input = false;
+                    self.request_review_custom(trimmed).await;
+                    self.scroll_to_bottom();
+                    return;
+                }
+
+                if self.pending_feedback_note_input {
+                    let trimmed = expanded_text.trim();
+                    if trimmed.eq_ignore_ascii_case("/cancel")
+                        || trimmed.eq_ignore_ascii_case("cancel")
+                    {
+                        self.pending_feedback_note_input = false;
+                        self.pending_feedback_classification = None;
+                        self.pending_feedback_include_logs = true;
+                        self.messages.push(Message::system("Feedback cancelled."));
+                        self.scroll_to_bottom();
+                        return;
+                    }
+
+                    let note = if trimmed.eq_ignore_ascii_case("/skip")
+                        || trimmed.eq_ignore_ascii_case("skip")
+                    {
+                        None
+                    } else if trimmed.is_empty() {
+                        self.messages.push(Message::system(
+                            "Type feedback details, /skip to send without a note, or /cancel.",
+                        ));
+                        self.scroll_to_bottom();
+                        return;
+                    } else {
+                        Some(trimmed)
+                    };
+
+                    let classification = self
+                        .pending_feedback_classification
+                        .take()
+                        .unwrap_or_else(|| "other".to_string());
+                    let include_logs = self.pending_feedback_include_logs;
+                    self.pending_feedback_note_input = false;
+                    self.pending_feedback_include_logs = true;
+                    self.request_feedback_upload(&classification, note, include_logs)
+                        .await;
                     self.scroll_to_bottom();
                     return;
                 }
@@ -1654,14 +1768,25 @@ impl App {
                 self.open_skills_menu().await;
             }
             CodexCommand::Review => {
-                self.request_review().await;
+                if args.trim().is_empty() {
+                    self.open_review_picker();
+                } else {
+                    self.request_review_custom(args.trim()).await;
+                }
             }
             CodexCommand::Rename => {
-                if args.is_empty() {
-                    self.messages
-                        .push(Message::system("Usage: /rename <new name>"));
+                if args.trim().is_empty() {
+                    if self.thread_id.is_some() {
+                        self.pending_rename_input = true;
+                        self.messages.push(Message::system(
+                            "Rename thread: type a new name and press Enter (or /cancel).",
+                        ));
+                    } else {
+                        self.messages
+                            .push(Message::system("No active thread to rename"));
+                    }
                 } else {
-                    self.request_rename(&args).await;
+                    self.request_rename(args.trim()).await;
                 }
             }
             CodexCommand::Fork => {
@@ -1671,7 +1796,7 @@ impl App {
                 self.request_logout().await;
             }
             CodexCommand::Feedback => {
-                self.request_feedback().await;
+                self.open_feedback_category_picker();
             }
             CodexCommand::Mcp => {
                 self.show_mcp_tools().await;
@@ -1698,6 +1823,16 @@ impl App {
             }
             CodexCommand::Plan => {
                 self.set_plan_mode().await;
+                let trimmed = args.trim();
+                if !trimmed.is_empty() {
+                    self.messages.push(Message::user(trimmed.to_string()));
+                    self.scroll_to_bottom();
+                    self.start_processing();
+                    let msg = self.create_turn_message(trimmed, &[]);
+                    if let Some(tx) = &self.input_tx {
+                        let _ = tx.send(msg).await;
+                    }
+                }
             }
             CodexCommand::Agent => {
                 self.open_agent_picker().await;
@@ -1735,9 +1870,7 @@ impl App {
                 self.execute_init().await;
             }
             CodexCommand::Mention => {
-                // Insert @ at cursor - simple local action
-                self.input.buffer.push('@');
-                self.input.cursor += 1;
+                self.input.insert_text("@");
             }
             CodexCommand::SandboxReadRoot => {
                 let trimmed = args.trim();
@@ -2621,8 +2754,171 @@ impl App {
         }
     }
 
-    /// Request code review
-    async fn request_review(&mut self) {
+    /// Open review preset picker (Codex-style entry for /review with no args).
+    fn open_review_picker(&mut self) {
+        if self.thread_id.is_none() {
+            self.messages.push(Message::system(
+                "No active thread. Start a conversation first.",
+            ));
+            return;
+        }
+
+        self.picker_mode = PickerMode::ReviewPreset;
+        self.picker.title = "Select Review Preset".to_string();
+        self.picker.open(vec![
+            PickerItem {
+                id: "base-branch".to_string(),
+                title: "Review against a base branch".to_string(),
+                subtitle: "PR-style review against a selected branch".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "uncommitted".to_string(),
+                title: "Review uncommitted changes".to_string(),
+                subtitle: "Review staged, unstaged, and untracked files".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "commit".to_string(),
+                title: "Review a commit".to_string(),
+                subtitle: "Pick a recent commit to review".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "custom".to_string(),
+                title: "Custom review instructions".to_string(),
+                subtitle: "Type custom reviewer instructions".to_string(),
+                metadata: None,
+            },
+        ]);
+    }
+
+    async fn open_review_branch_picker(&mut self) {
+        match self
+            .run_git_capture(&["rev-parse", "--is-inside-work-tree"])
+            .await
+        {
+            Ok(s) if s.trim() == "true" => {}
+            _ => {
+                self.messages
+                    .push(Message::system("`/review` — not inside a git repository."));
+                return;
+            }
+        }
+
+        let branches_raw = match self
+            .run_git_capture(&["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                self.messages.push(Message::system(format!(
+                    "Failed to list branches for review: {}",
+                    err.trim()
+                )));
+                return;
+            }
+        };
+
+        let current_branch = self
+            .run_git_capture(&["branch", "--show-current"])
+            .await
+            .unwrap_or_default();
+        let current_branch = current_branch.trim();
+
+        let mut branches: Vec<String> = branches_raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        branches.sort();
+        branches.dedup();
+
+        if branches.is_empty() {
+            self.messages
+                .push(Message::system("No local branches found for review."));
+            return;
+        }
+
+        let items: Vec<PickerItem> = branches
+            .into_iter()
+            .map(|branch| {
+                let title = if current_branch.is_empty() {
+                    branch.clone()
+                } else {
+                    format!("{current_branch} -> {branch}")
+                };
+                PickerItem {
+                    id: branch,
+                    title,
+                    subtitle: "Review diff against this branch".to_string(),
+                    metadata: None,
+                }
+            })
+            .collect();
+
+        self.picker_mode = PickerMode::ReviewBranch;
+        self.picker.title = "Select Base Branch".to_string();
+        self.picker.open(items);
+    }
+
+    async fn open_review_commit_picker(&mut self) {
+        match self
+            .run_git_capture(&["rev-parse", "--is-inside-work-tree"])
+            .await
+        {
+            Ok(s) if s.trim() == "true" => {}
+            _ => {
+                self.messages
+                    .push(Message::system("`/review` — not inside a git repository."));
+                return;
+            }
+        }
+
+        let commits_raw = match self
+            .run_git_capture(&["--no-pager", "log", "--oneline", "-n", "100"])
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                self.messages.push(Message::system(format!(
+                    "Failed to list commits for review: {}",
+                    err.trim()
+                )));
+                return;
+            }
+        };
+
+        let items: Vec<PickerItem> = commits_raw
+            .lines()
+            .filter_map(|line| {
+                let (sha, title) = line.trim().split_once(' ')?;
+                if sha.is_empty() || title.is_empty() {
+                    return None;
+                }
+                Some(PickerItem {
+                    id: sha.to_string(),
+                    title: format!("{} {}", sha, truncate_utf8(title, 72)),
+                    subtitle: "Review this commit".to_string(),
+                    metadata: Some(title.to_string()),
+                })
+            })
+            .collect();
+
+        if items.is_empty() {
+            self.messages.push(Message::system(
+                "No recent commits available for commit review.",
+            ));
+            return;
+        }
+
+        self.picker_mode = PickerMode::ReviewCommit;
+        self.picker.title = "Review a Commit".to_string();
+        self.picker.open(items);
+    }
+
+    async fn request_review_start(&mut self, target: serde_json::Value, status_msg: String) {
         if let Some(thread_id) = &self.thread_id {
             if let Some(tx) = &self.input_tx {
                 self.request_counter += 1;
@@ -2630,18 +2926,15 @@ impl App {
                     "jsonrpc": "2.0",
                     "method": "review/start",
                     "id": self.request_counter,
-                        "params": {
-                            "threadId": thread_id,
-                            "target": {
-                                "type": "uncommittedChanges"
-                            }
-                        }
+                    "params": {
+                        "threadId": thread_id,
+                        "delivery": "inline",
+                        "target": target
+                    }
                 })
                 .to_string();
                 let _ = tx.send(msg).await;
-                self.messages.push(Message::system(
-                    "Starting code review (uncommitted changes)...",
-                ));
+                self.messages.push(Message::system(status_msg));
                 self.start_processing();
             }
         } else {
@@ -2649,6 +2942,62 @@ impl App {
                 "No active thread. Start a conversation first.",
             ));
         }
+    }
+
+    async fn request_review_uncommitted(&mut self) {
+        self.request_review_start(
+            serde_json::json!({
+                "type": "uncommittedChanges"
+            }),
+            "Starting code review (uncommitted changes)...".to_string(),
+        )
+        .await;
+    }
+
+    async fn request_review_base_branch(&mut self, branch: &str) {
+        self.request_review_start(
+            serde_json::json!({
+                "type": "baseBranch",
+                "branch": branch
+            }),
+            format!("Starting code review against base branch `{branch}`..."),
+        )
+        .await;
+    }
+
+    async fn request_review_commit(&mut self, sha: &str, title: Option<&str>) {
+        let mut target = serde_json::json!({
+            "type": "commit",
+            "sha": sha
+        });
+        if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
+            target["title"] = serde_json::json!(title);
+        }
+
+        self.request_review_start(
+            target,
+            format!("Starting code review for commit `{sha}`..."),
+        )
+        .await;
+    }
+
+    async fn request_review_custom(&mut self, instructions: &str) {
+        let trimmed = instructions.trim();
+        if trimmed.is_empty() {
+            self.messages.push(Message::system(
+                "Review instructions cannot be empty. Run /review and choose a preset.",
+            ));
+            return;
+        }
+
+        self.request_review_start(
+            serde_json::json!({
+                "type": "custom",
+                "instructions": trimmed
+            }),
+            "Starting code review (custom instructions)...".to_string(),
+        )
+        .await;
     }
 
     /// Request thread rename
@@ -2721,8 +3070,56 @@ impl App {
         }
     }
 
-    /// Request feedback upload
-    async fn request_feedback(&mut self) {
+    fn open_feedback_category_picker(&mut self) {
+        if self.thread_id.is_none() {
+            self.messages.push(Message::system(
+                "No active thread. Start a conversation first.",
+            ));
+            return;
+        }
+
+        self.picker_mode = PickerMode::FeedbackCategory;
+        self.picker.title = "How was this?".to_string();
+        self.picker.open(vec![
+            PickerItem {
+                id: "bug".to_string(),
+                title: "bug".to_string(),
+                subtitle: "Crash, error message, hang, or broken UI/behavior.".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "bad_result".to_string(),
+                title: "bad result".to_string(),
+                subtitle: "Output was off-target, incorrect, incomplete, or unhelpful.".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "good_result".to_string(),
+                title: "good result".to_string(),
+                subtitle: "Helpful, correct, high-quality, or delightful result.".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "safety_check".to_string(),
+                title: "safety check".to_string(),
+                subtitle: "Benign usage blocked due to safety checks or refusals.".to_string(),
+                metadata: None,
+            },
+            PickerItem {
+                id: "other".to_string(),
+                title: "other".to_string(),
+                subtitle: "Slowness, feature request, UX feedback, or anything else.".to_string(),
+                metadata: None,
+            },
+        ]);
+    }
+
+    async fn request_feedback_upload(
+        &mut self,
+        classification: &str,
+        reason: Option<&str>,
+        include_logs: bool,
+    ) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
             self.pending_request_id = Some(self.request_counter);
@@ -2732,15 +3129,18 @@ impl App {
                 "method": "feedback/upload",
                 "id": self.request_counter,
                 "params": {
-                    "classification": "general",
-                    "reason": null,
+                    "classification": classification,
+                    "reason": reason,
                     "threadId": self.thread_id,
-                    "includeLogs": true
+                    "includeLogs": include_logs
                 }
             })
             .to_string();
             let _ = tx.send(msg).await;
-            self.messages.push(Message::system("Uploading feedback..."));
+            self.messages.push(Message::system(format!(
+                "Uploading feedback (classification: {classification}, include logs: {})...",
+                if include_logs { "yes" } else { "no" }
+            )));
         }
     }
 
@@ -2781,58 +3181,60 @@ impl App {
         }
     }
 
-    /// Open approvals picker - shows approval mode options
-    async fn open_approvals_picker(&mut self) {
-        self.picker_mode = PickerMode::Approvals;
-        self.picker.title = "Approval Mode".to_string();
-        let items = vec![
-            PickerItem {
-                id: "suggest".to_string(),
-                title: "Suggest".to_string(),
-                subtitle: "Approve everything".to_string(),
-                metadata: None,
-            },
-            PickerItem {
-                id: "auto-edit".to_string(),
-                title: "Auto Edit".to_string(),
-                subtitle: "Auto-approve file edits".to_string(),
-                metadata: None,
-            },
-            PickerItem {
-                id: "full-auto".to_string(),
-                title: "Full Auto".to_string(),
-                subtitle: "Auto-approve everything".to_string(),
-                metadata: None,
-            },
-        ];
-        self.picker.open(items);
-    }
-
-    /// Open permissions picker - shows sandbox policy options  
-    async fn open_permissions_picker(&mut self) {
-        self.picker_mode = PickerMode::Permissions;
-        self.picker.title = "Permissions".to_string();
-        let items = vec![
+    fn permissions_preset_items() -> Vec<PickerItem> {
+        vec![
             PickerItem {
                 id: "read-only".to_string(),
                 title: "Read Only".to_string(),
-                subtitle: "Can only read files".to_string(),
+                subtitle: "Codex can read files in the current workspace. Approval is required to edit files or access the internet.".to_string(),
                 metadata: None,
             },
             PickerItem {
-                id: "workspace-write".to_string(),
-                title: "Workspace Write".to_string(),
-                subtitle: "Can write in workspace".to_string(),
+                id: "auto".to_string(),
+                title: "Default".to_string(),
+                subtitle: "Codex can read and edit files in the workspace. Approval is required to access the internet or edit other files.".to_string(),
                 metadata: None,
             },
             PickerItem {
                 id: "full-access".to_string(),
                 title: "Full Access".to_string(),
-                subtitle: "Full system access".to_string(),
+                subtitle: "Codex can edit files outside this workspace and access the internet without asking.".to_string(),
                 metadata: None,
             },
-        ];
-        self.picker.open(items);
+        ]
+    }
+
+    async fn apply_permissions_preset(&mut self, preset_id: &str, label: &str) {
+        let (approval, sandbox) = match preset_id {
+            "read-only" => ("on-request", "read-only"),
+            "auto" => ("on-request", "workspace-write"),
+            "full-access" => ("never", "danger-full-access"),
+            other => {
+                self.messages.push(Message::system(format!(
+                    "Unknown permissions preset: {other}.",
+                )));
+                return;
+            }
+        };
+
+        self.write_config("approvalPolicy", &serde_json::json!(approval))
+            .await;
+        self.write_config("sandboxPolicy", &serde_json::json!(sandbox))
+            .await;
+        self.messages
+            .push(Message::system(format!("Permissions updated to {label}.")));
+    }
+
+    /// Open approvals picker (alias of /permissions, matching Codex behavior).
+    async fn open_approvals_picker(&mut self) {
+        self.open_permissions_picker().await;
+    }
+
+    /// Open permissions picker - shows approval+sandbox presets.
+    async fn open_permissions_picker(&mut self) {
+        self.picker_mode = PickerMode::Permissions;
+        self.picker.title = "Update Model Permissions".to_string();
+        self.picker.open(Self::permissions_preset_items());
     }
 
     /// Open personality picker
@@ -2877,6 +3279,14 @@ impl App {
 
     /// Open collaboration mode picker
     async fn open_collab_picker(&mut self) {
+        if !self.collaboration_modes_enabled() {
+            self.messages.push(Message::system(
+                "Collaboration modes are disabled.\nEnable collaboration modes to use /collab.",
+            ));
+            self.scroll_to_bottom();
+            return;
+        }
+
         self.picker_mode = PickerMode::Collab;
         self.picker.title = "Collaboration Mode".to_string();
         self.picker.open_loading();
@@ -2905,6 +3315,41 @@ impl App {
         }
     }
 
+    fn parse_bool_like(value: &serde_json::Value) -> Option<bool> {
+        if let Some(b) = value.as_bool() {
+            return Some(b);
+        }
+        if let Some(s) = value.as_str() {
+            let lowered = s.trim().to_ascii_lowercase();
+            return match lowered.as_str() {
+                "true" | "1" | "yes" | "on" => Some(true),
+                "false" | "0" | "no" | "off" => Some(false),
+                _ => None,
+            };
+        }
+        value.as_i64().map(|n| n != 0)
+    }
+
+    fn parse_collaboration_modes_feature_flag(config_result: &serde_json::Value) -> Option<bool> {
+        let config = config_result.get("config").unwrap_or(config_result);
+        let features = config.get("features")?;
+        features
+            .get("collaboration_modes")
+            .or_else(|| features.get("collaborationModes"))
+            .or_else(|| features.get("collab"))
+            .and_then(Self::parse_bool_like)
+    }
+
+    fn maybe_update_collaboration_modes_feature_flag(&mut self, config_result: &serde_json::Value) {
+        if let Some(enabled) = Self::parse_collaboration_modes_feature_flag(config_result) {
+            self.collaboration_modes_feature_enabled = Some(enabled);
+        }
+    }
+
+    fn collaboration_modes_enabled(&self) -> bool {
+        self.collaboration_modes_feature_enabled.unwrap_or(true)
+    }
+
     fn collaboration_mode_title(mode: &str) -> String {
         match mode {
             "plan" => "Plan mode".to_string(),
@@ -2924,6 +3369,9 @@ impl App {
     }
 
     fn collaboration_mode_hint_text(&self) -> Option<String> {
+        if !self.collaboration_modes_enabled() {
+            return None;
+        }
         self.collaboration_mode.as_deref().map(|mode| {
             format!(
                 "{} (shift+tab to cycle)",
@@ -3020,6 +3468,13 @@ impl App {
 
     /// Set plan mode directly
     async fn set_plan_mode(&mut self) {
+        if !self.collaboration_modes_enabled() {
+            self.messages.push(Message::system(
+                "Collaboration modes are disabled.\nEnable collaboration modes to use /plan.",
+            ));
+            self.scroll_to_bottom();
+            return;
+        }
         self.set_collaboration_mode("plan", true).await;
     }
 
@@ -3061,8 +3516,6 @@ impl App {
             })
             .to_string();
             let _ = tx.send(msg).await;
-            self.messages
-                .push(Message::system("Opening status line editor..."));
         } else {
             self.open_statusline_editor_with_items(Self::default_statusline_items());
         }
@@ -3263,6 +3716,60 @@ Make it comprehensive but concise."#;
                         .to_string();
                         let _ = tx.send(msg).await;
                     }
+                }
+                PickerMode::ReviewPreset => match item_id.as_str() {
+                    "base-branch" => {
+                        self.open_review_branch_picker().await;
+                        return;
+                    }
+                    "uncommitted" => {
+                        self.request_review_uncommitted().await;
+                    }
+                    "commit" => {
+                        self.open_review_commit_picker().await;
+                        return;
+                    }
+                    "custom" => {
+                        self.pending_review_custom_input = true;
+                        self.messages.push(Message::system(
+                            "Custom review: type instructions and press Enter (or /cancel).",
+                        ));
+                    }
+                    _ => {}
+                },
+                PickerMode::ReviewBranch => {
+                    self.request_review_base_branch(&item_id).await;
+                }
+                PickerMode::ReviewCommit => {
+                    self.request_review_commit(&item_id, item_metadata.as_deref())
+                        .await;
+                }
+                PickerMode::FeedbackCategory => {
+                    self.pending_feedback_classification = Some(item_id);
+                    self.picker_mode = PickerMode::FeedbackIncludeLogs;
+                    self.picker.title = "Upload logs?".to_string();
+                    self.picker.open(vec![
+                        PickerItem {
+                            id: "include-logs".to_string(),
+                            title: "Yes, include logs".to_string(),
+                            subtitle: "Include debug logs and rollout metadata".to_string(),
+                            metadata: None,
+                        },
+                        PickerItem {
+                            id: "no-logs".to_string(),
+                            title: "No, send feedback only".to_string(),
+                            subtitle: "Send only classification and optional note".to_string(),
+                            metadata: None,
+                        },
+                    ]);
+                    return;
+                }
+                PickerMode::FeedbackIncludeLogs => {
+                    self.pending_feedback_include_logs = item_id == "include-logs";
+                    self.pending_feedback_note_input = true;
+                    self.messages.push(Message::system(
+                        "Feedback note (optional): type details and press Enter. Use /skip or /cancel.",
+                    ));
                 }
                 PickerMode::Model => {
                     if let Some(model) = self
@@ -3510,17 +4017,8 @@ Make it comprehensive but concise."#;
                         .unwrap_or(&item_id);
                     self.toggle_skill(skill_name, currently_enabled).await;
                 }
-                PickerMode::Approvals => {
-                    self.messages
-                        .push(Message::system(format!("Approval mode: {}", item_title)));
-                    self.write_config("approvalPolicy", &serde_json::json!(item_id))
-                        .await;
-                }
                 PickerMode::Permissions => {
-                    self.messages
-                        .push(Message::system(format!("Permissions: {}", item_title)));
-                    self.write_config("sandboxPolicy", &serde_json::json!(item_id))
-                        .await;
+                    self.apply_permissions_preset(&item_id, &item_title).await;
                 }
                 PickerMode::Personality => {
                     self.messages
@@ -5780,6 +6278,7 @@ Make it comprehensive but concise."#;
             }
             PendingRequestType::ConfigRead => {
                 if let Some(result) = json.get("result") {
+                    self.maybe_update_collaboration_modes_feature_flag(result);
                     self.maybe_update_collaboration_mode_from_config_result(result);
                     let text = serde_json::to_string_pretty(result).unwrap_or_default();
                     self.messages
@@ -5799,6 +6298,7 @@ Make it comprehensive but concise."#;
             }
             PendingRequestType::StatusRead => {
                 if let Some(result) = json.get("result") {
+                    self.maybe_update_collaboration_modes_feature_flag(result);
                     self.maybe_update_collaboration_mode_from_config_result(result);
                     let summary = self.render_status_summary(result);
                     self.messages.push(Message::system(&summary));
@@ -5808,6 +6308,7 @@ Make it comprehensive but concise."#;
             }
             PendingRequestType::StatuslineConfigRead => {
                 if let Some(result) = json.get("result") {
+                    self.maybe_update_collaboration_modes_feature_flag(result);
                     let items = Self::parse_statusline_items_from_config(result);
                     self.open_statusline_editor_with_items(items);
                 } else {
