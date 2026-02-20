@@ -460,7 +460,7 @@ impl Widget for InputBox<'_> {
         block.render(area, buf);
 
         let display_text = if self.content.is_empty() {
-            "Type your message... (Enter to send, Ctrl+C to quit)"
+            "Type your message... (Enter to send, Ctrl+C to clear/quit)"
         } else {
             self.content
         };
@@ -489,7 +489,7 @@ impl Widget for HelpBar {
             ("Tab", "Complete"),
             ("Scroll/↑↓", "scroll"),
             ("Enter", "Send"),
-            ("Ctrl+C", "Quit"),
+            ("Ctrl+C", "Clear/Quit"),
         ];
 
         let mut spans = vec![Span::raw(" ")];

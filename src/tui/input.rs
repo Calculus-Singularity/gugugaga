@@ -24,6 +24,8 @@ pub enum InputAction {
     Backspace,
     /// Delete word
     DeleteWord,
+    /// Delete character at cursor
+    Delete,
     /// Clear input
     ClearInput,
     /// Move cursor left
@@ -161,7 +163,7 @@ impl InputState {
             }
             KeyCode::Delete => {
                 self.remove_char_at_cursor();
-                InputAction::None
+                InputAction::Delete
             }
 
             // Clear
@@ -246,6 +248,13 @@ impl InputState {
     pub fn set_buffer(&mut self, content: &str) {
         self.buffer = content.to_string();
         self.cursor = self.char_count();
+    }
+
+    /// Clear the current editable input (does not clear history).
+    pub fn clear_current_input(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+        self.history_index = -1;
     }
 
     /// Insert text at the current cursor position.

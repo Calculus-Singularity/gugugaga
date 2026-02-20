@@ -253,6 +253,8 @@ enum AppPhase {
 /// Frame is 17 rows × 42 cols; leave room for 3 lines of text below.
 const MIN_ANIMATION_WIDTH: u16 = 44;
 const MIN_ANIMATION_HEIGHT: u16 = 20;
+const QUIT_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
     ["model-with-reasoning", "context-remaining", "current-dir"];
 const STATUS_LINE_AVAILABLE_ITEMS: [(&str, &str, &str, &str); 15] = [
@@ -548,6 +550,10 @@ pub struct App {
     active_terminals: HashMap<String, ActiveTerminal>,
     /// Images attached via clipboard paste (Ctrl/Alt+V or pasted file paths).
     attached_images: Vec<PathBuf>,
+    /// Large paste placeholders that should be expanded on submit.
+    pending_large_pastes: Vec<(String, String)>,
+    /// Counter by char-count so repeated large pastes get unique placeholder labels.
+    large_paste_counters: HashMap<usize, usize>,
     /// In-progress state for /statusline editor UI.
     statusline_editor: Option<StatuslineEditorState>,
     /// When the current turn started processing (for elapsed time display)
@@ -638,6 +644,8 @@ impl App {
             account_auth_mode: None,
             active_terminals: HashMap::new(),
             attached_images: Vec::new(),
+            pending_large_pastes: Vec::new(),
+            large_paste_counters: HashMap::new(),
             statusline_editor: None,
             turn_start_time: None,
             // Skip the Welcome animation if trust is already established
@@ -964,8 +972,91 @@ impl App {
         self.scroll_to_bottom();
     }
 
+    fn has_composer_draft(&self) -> bool {
+        !self.input.buffer.is_empty()
+            || !self.attached_images.is_empty()
+            || self
+                .pending_large_pastes
+                .iter()
+                .any(|(placeholder, _)| self.input.buffer.contains(placeholder))
+    }
+
+    fn reset_quit_shortcut_if_expired(&mut self) {
+        if !self.quit_armed {
+            return;
+        }
+        if let Some(armed_at) = self.quit_armed_at {
+            if armed_at.elapsed() > QUIT_SHORTCUT_TIMEOUT {
+                self.quit_armed = false;
+                self.quit_armed_at = None;
+            }
+        }
+    }
+
+    fn arm_quit_shortcut(&mut self) {
+        if !self.quit_armed {
+            self.quit_armed = true;
+            self.quit_armed_at = Some(std::time::Instant::now());
+            self.messages
+                .push(Message::system("Press Ctrl+C again to quit."));
+            self.scroll_to_bottom();
+        }
+    }
+
+    fn clear_draft_for_ctrl_c(&mut self) {
+        self.input.clear_current_input();
+        self.attached_images.clear();
+        self.pending_large_pastes.clear();
+        if self.slash_popup.visible {
+            self.slash_popup.close();
+        }
+    }
+
+    fn next_large_paste_placeholder(&mut self, char_count: usize) -> String {
+        let base = format!("[Pasted Content {char_count} chars]");
+        let next_suffix = self.large_paste_counters.entry(char_count).or_insert(0);
+        *next_suffix += 1;
+        if *next_suffix == 1 {
+            base
+        } else {
+            format!("{base} #{next_suffix}")
+        }
+    }
+
+    fn prune_pending_large_pastes(&mut self) {
+        let text = self.input.buffer.as_str();
+        self.pending_large_pastes
+            .retain(|(placeholder, _)| text.contains(placeholder));
+    }
+
+    fn expand_pending_large_pastes(&mut self, text: &str) -> String {
+        if self.pending_large_pastes.is_empty() {
+            return text.to_string();
+        }
+
+        let mut expanded = text.to_string();
+        for (placeholder, payload) in &self.pending_large_pastes {
+            if expanded.contains(placeholder) {
+                expanded = expanded.replacen(placeholder, payload, 1);
+            }
+        }
+        self.pending_large_pastes.clear();
+        expanded
+    }
+
     fn handle_paste_event(&mut self, pasted: String) {
         if pasted.trim().is_empty() {
+            return;
+        }
+
+        let char_count = pasted.chars().count();
+        if char_count > LARGE_PASTE_CHAR_THRESHOLD {
+            let placeholder = self.next_large_paste_placeholder(char_count);
+            self.input.insert_text(&placeholder);
+            self.pending_large_pastes.push((placeholder, pasted));
+            if self.slash_popup.visible {
+                self.update_popup_filter();
+            }
             return;
         }
 
@@ -975,9 +1066,30 @@ impl App {
         }
 
         self.input.insert_text(&pasted);
+        self.prune_pending_large_pastes();
         if self.slash_popup.visible {
             self.update_popup_filter();
         }
+    }
+
+    async fn handle_ctrl_c_shortcut(&mut self) {
+        self.reset_quit_shortcut_if_expired();
+
+        if self.has_composer_draft() {
+            self.clear_draft_for_ctrl_c();
+            self.arm_quit_shortcut();
+            return;
+        }
+
+        if self.quit_armed {
+            self.should_quit = true;
+            self.quit_armed = false;
+            self.quit_armed_at = None;
+            return;
+        }
+
+        self.arm_quit_shortcut();
+        let _ = self.interrupt_active_work().await;
     }
 
     async fn handle_input(&mut self, key: event::KeyEvent) {
@@ -1073,7 +1185,11 @@ impl App {
                 .modifiers
                 .contains(crossterm::event::KeyModifiers::CONTROL);
         let is_escape = matches!(key.code, crossterm::event::KeyCode::Esc);
-        if (is_ctrl_c || is_escape) && self.interrupt_active_work().await {
+        if is_ctrl_c {
+            self.handle_ctrl_c_shortcut().await;
+            return;
+        }
+        if is_escape && self.interrupt_active_work().await {
             return;
         }
 
@@ -1145,16 +1261,6 @@ impl App {
             }
         }
 
-        // Reset quit_armed if timeout exceeded (2 seconds)
-        if self.quit_armed {
-            if let Some(armed_at) = self.quit_armed_at {
-                if armed_at.elapsed() > std::time::Duration::from_secs(2) {
-                    self.quit_armed = false;
-                    self.quit_armed_at = None;
-                }
-            }
-        }
-
         // Ctrl/Alt+V: attempt clipboard image paste.
         if let crossterm::event::KeyCode::Char(c) = key.code {
             if key.modifiers.intersects(
@@ -1205,26 +1311,14 @@ impl App {
 
         match self.input.handle_key(key) {
             InputAction::Quit => {
-                // Ctrl+C: double-press mechanism
-                if !self.interrupt_active_work().await {
-                    if self.quit_armed {
-                        // Second press within timeout — actually quit
-                        self.should_quit = true;
-                    } else {
-                        // First press — arm the quit
-                        self.quit_armed = true;
-                        self.quit_armed_at = Some(std::time::Instant::now());
-                        self.messages
-                            .push(Message::system("Press Ctrl+C again to quit."));
-                        self.scroll_to_bottom();
-                    }
-                }
+                self.should_quit = true;
             }
             InputAction::Submit(text) => {
                 self.slash_popup.close();
+                let expanded_text = self.expand_pending_large_pastes(&text);
 
                 if let Some(pending) = self.pending_user_input.take() {
-                    let trimmed = text.trim();
+                    let trimmed = expanded_text.trim();
                     if trimmed.is_empty() {
                         self.messages.push(Message::system(
                             "Input required. Enter an answer, or type /cancel to send an empty response.",
@@ -1253,7 +1347,7 @@ impl App {
                 }
 
                 // Parse and handle command
-                if let Some(parsed) = parse_command(&text) {
+                if let Some(parsed) = parse_command(&expanded_text) {
                     match parsed {
                         ParsedCommand::Codex(cmd, args) => {
                             if self.is_processing && !Self::codex_command_available_during_task(cmd)
@@ -1300,7 +1394,7 @@ impl App {
                     self.scroll_to_bottom();
                     self.start_processing();
 
-                    let msg = self.create_turn_message(&text, &local_images);
+                    let msg = self.create_turn_message(&expanded_text, &local_images);
                     if let Some(tx) = &self.input_tx {
                         let _ = tx.send(msg).await;
                     }
@@ -1336,6 +1430,7 @@ impl App {
             }
             InputAction::ClearInput => {
                 self.attached_images.clear();
+                self.pending_large_pastes.clear();
                 if self.slash_popup.visible {
                     self.update_popup_filter();
                 }
@@ -1350,7 +1445,11 @@ impl App {
                     self.update_popup_filter();
                 }
             }
-            InputAction::Input(_) | InputAction::Backspace | InputAction::DeleteWord => {
+            InputAction::Input(_)
+            | InputAction::Backspace
+            | InputAction::DeleteWord
+            | InputAction::Delete => {
+                self.prune_pending_large_pastes();
                 if self.slash_popup.visible {
                     self.update_popup_filter();
                 }
