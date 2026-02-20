@@ -640,33 +640,66 @@ impl Interceptor {
                                 .to_string();
 
                             if !user_msg.is_empty() {
-                                // Record user message (as UserToGugugaga so restore shows correct style)
-                                {
-                                    let mut mem = chat_memory.write().await;
-                                    let _ = mem
-                                        .add_turn(
-                                            crate::memory::TurnRole::UserToGugugaga,
-                                            user_msg.clone(),
-                                        )
-                                        .await;
-                                }
-
-                                // Call Gugugaga agent with event streaming
-                                let response =
-                                    chat_agent.chat(&user_msg, Some(&chat_output_tx)).await;
-
-                                // Send response back to TUI
-                                let reply = match response {
-                                    Ok(text) => serde_json::json!({
+                                let Some(mut cancel_rx) =
+                                    Self::begin_supervision_task(&supervision_cancel_tx_input)
+                                        .await
+                                else {
+                                    let busy_msg = serde_json::json!({
                                         "method": "gugugaga/chatReply",
-                                        "params": { "message": text }
-                                    }),
-                                    Err(e) => serde_json::json!({
-                                        "method": "gugugaga/chatReply",
-                                        "params": { "message": format!("Error: {}", e) }
-                                    }),
+                                        "params": {
+                                            "message": "Error: Supervisor is busy with another check. Try again in a moment."
+                                        }
+                                    })
+                                    .to_string();
+                                    let _ = chat_output_tx.send(busy_msg).await;
+                                    continue;
                                 };
-                                let _ = chat_output_tx.send(reply.to_string()).await;
+
+                                let chat_agent_task = chat_agent.clone();
+                                let chat_memory_task = chat_memory.clone();
+                                let chat_output_tx_task = chat_output_tx.clone();
+                                let supervision_cancel_tx_task =
+                                    supervision_cancel_tx_input.clone();
+
+                                tokio::spawn(async move {
+                                    // Record user message (as UserToGugugaga so restore shows correct style)
+                                    {
+                                        let mut mem = chat_memory_task.write().await;
+                                        let _ = mem
+                                            .add_turn(
+                                                crate::memory::TurnRole::UserToGugugaga,
+                                                user_msg.clone(),
+                                            )
+                                            .await;
+                                    }
+
+                                    // Keep input loop free so gugugaga/interrupt can be handled.
+                                    let response = tokio::select! {
+                                        _ = &mut cancel_rx => Err(Self::interrupted_supervision_error()),
+                                        result = chat_agent_task.chat(&user_msg, Some(&chat_output_tx_task)) => result,
+                                    };
+
+                                    Self::end_supervision_task(&supervision_cancel_tx_task).await;
+
+                                    let reply = match response {
+                                        Ok(text) => Some(serde_json::json!({
+                                            "method": "gugugaga/chatReply",
+                                            "params": { "message": text }
+                                        })),
+                                        Err(GugugagaError::LlmEvaluation(msg))
+                                            if msg == SUPERVISION_INTERRUPTED_ERROR =>
+                                        {
+                                            None
+                                        }
+                                        Err(e) => Some(serde_json::json!({
+                                            "method": "gugugaga/chatReply",
+                                            "params": { "message": format!("Error: {}", e) }
+                                        })),
+                                    };
+                                    if let Some(msg) = reply {
+                                        let _ = chat_output_tx_task.send(msg.to_string()).await;
+                                    }
+                                });
                             }
                             continue; // Don't forward to app-server
                         }
@@ -756,6 +789,27 @@ impl Interceptor {
         Ok(child)
     }
 
+    async fn begin_supervision_task(
+        supervision_cancel_tx: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    ) -> Option<oneshot::Receiver<()>> {
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let mut slot = supervision_cancel_tx.lock().await;
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(cancel_tx);
+        Some(cancel_rx)
+    }
+
+    async fn end_supervision_task(supervision_cancel_tx: &Arc<Mutex<Option<oneshot::Sender<()>>>>) {
+        let mut slot = supervision_cancel_tx.lock().await;
+        *slot = None;
+    }
+
+    fn interrupted_supervision_error() -> GugugagaError {
+        GugugagaError::LlmEvaluation(SUPERVISION_INTERRUPTED_ERROR.to_string())
+    }
+
     /// Process a message from the server
     #[allow(clippy::too_many_arguments)]
     async fn process_server_message(
@@ -837,21 +891,16 @@ impl Interceptor {
 
                 // Perform LLM evaluation with actual turn content
                 // Pass event_tx so thinking/tool-call activity is streamed to TUI
-                let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-                {
-                    let mut slot = supervision_cancel_tx.lock().await;
-                    *slot = Some(cancel_tx);
-                }
+                let Some(mut cancel_rx) = Self::begin_supervision_task(supervision_cancel_tx).await
+                else {
+                    debug!("Skipping turn-completed supervision because another task is active");
+                    return InterceptAction::Forward;
+                };
                 let eval_result = tokio::select! {
-                    _ = &mut cancel_rx => Err(GugugagaError::LlmEvaluation(
-                        SUPERVISION_INTERRUPTED_ERROR.to_string()
-                    )),
+                    _ = &mut cancel_rx => Err(Self::interrupted_supervision_error()),
                     result = gugugaga_agent.detect_violation(current_turn_content, Some(event_tx)) => result,
                 };
-                {
-                    let mut slot = supervision_cancel_tx.lock().await;
-                    *slot = None;
-                }
+                Self::end_supervision_task(supervision_cancel_tx).await;
 
                 match eval_result {
                     Ok(result) => {
@@ -936,7 +985,21 @@ impl Interceptor {
                         .collect();
 
                     // Evaluate with gugugaga agent
-                    match gugugaga_agent.evaluate_request(&request_str).await {
+                    let Some(mut cancel_rx) =
+                        Self::begin_supervision_task(supervision_cancel_tx).await
+                    else {
+                        debug!(
+                            "Skipping requestUserInput supervision because another task is active"
+                        );
+                        return InterceptAction::Forward;
+                    };
+                    let evaluation = tokio::select! {
+                        _ = &mut cancel_rx => Err(Self::interrupted_supervision_error()),
+                        result = gugugaga_agent.evaluate_request(&request_str) => result,
+                    };
+                    Self::end_supervision_task(supervision_cancel_tx).await;
+
+                    match evaluation {
                         Ok(EvaluationResult::AutoReply(reply)) => {
                             info!("Auto-replying to request: {}", reply);
                             // Conservative policy: only auto-answer when there is exactly
@@ -983,6 +1046,11 @@ impl Interceptor {
                             .to_string()])
                         }
                         Ok(EvaluationResult::ForwardToUser) => InterceptAction::Forward,
+                        Err(GugugagaError::LlmEvaluation(msg))
+                            if msg == SUPERVISION_INTERRUPTED_ERROR =>
+                        {
+                            InterceptAction::Forward
+                        }
                         Err(e) => {
                             warn!("Evaluation failed: {}", e);
                             InterceptAction::Forward

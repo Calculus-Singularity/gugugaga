@@ -1070,8 +1070,7 @@ impl App {
                 .modifiers
                 .contains(crossterm::event::KeyModifiers::CONTROL);
         let is_escape = matches!(key.code, crossterm::event::KeyCode::Esc);
-        if (is_ctrl_c || is_escape) && (self.is_processing || self.gugugaga_status.is_some()) {
-            let _ = self.interrupt_active_work().await;
+        if (is_ctrl_c || is_escape) && self.interrupt_active_work().await {
             return;
         }
 
