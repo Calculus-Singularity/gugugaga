@@ -487,7 +487,7 @@ impl SlashPopup {
             return None;
         }
 
-        let total_pages = (total + Self::MAX_VISIBLE_ROWS - 1) / Self::MAX_VISIBLE_ROWS;
+        let total_pages = total.div_ceil(Self::MAX_VISIBLE_ROWS);
         let current_page = (self.scroll_top / Self::MAX_VISIBLE_ROWS) + 1;
         Some((current_page, total_pages))
     }

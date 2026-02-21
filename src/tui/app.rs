@@ -15,9 +15,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-    },
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, RwLock};
@@ -7385,21 +7383,43 @@ Make it comprehensive but concise."#;
         sel_anchor: Option<(u16, u16)>,
         sel_end: Option<(u16, u16)>,
     ) -> (Vec<String>, Rect) {
-        use ratatui::style::{Color, Modifier};
+        use ratatui::style::{Color, Modifier, Style};
 
         // No border — clean layout like Codex
         let inner = area;
+        if inner.width == 0 || inner.height == 0 {
+            return (Vec::new(), inner);
+        }
 
-        // Build all lines with word wrapping
-        let content_width = inner.width as usize;
-        let mut all_lines: Vec<Line> = Vec::new();
-        for msg in messages {
-            all_lines.extend(render_message_lines(msg, content_width));
+        let visible_height = inner.height as usize;
+        let build_lines = |width: usize| -> Vec<Line> {
+            let mut lines = Vec::new();
+            for msg in messages {
+                lines.extend(render_message_lines(msg, width));
+            }
+            lines
+        };
+
+        // First pass uses full width. If content is scrollable, reserve one
+        // dedicated column for the scrollbar and re-wrap for stable geometry.
+        let mut all_lines = build_lines(inner.width as usize);
+        let show_scrollbar = all_lines.len() > visible_height && inner.width > 1;
+        let content_rect = if show_scrollbar {
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width.saturating_sub(1),
+                height: inner.height,
+            }
+        } else {
+            inner
+        };
+        if show_scrollbar {
+            all_lines = build_lines(content_rect.width as usize);
         }
 
         // Calculate scroll
         let total_lines = all_lines.len();
-        let visible_height = inner.height as usize;
         let max_scroll = total_lines.saturating_sub(visible_height);
         let actual_scroll = scroll_offset.min(max_scroll);
 
@@ -7507,30 +7527,40 @@ Make it comprehensive but concise."#;
         };
 
         let paragraph = Paragraph::new(visible);
-        f.render_widget(paragraph, inner);
+        f.render_widget(paragraph, content_rect);
 
-        // Scrollbar
-        if total_lines > visible_height {
-            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("▲"))
-                .end_symbol(Some("▼"))
-                .track_symbol(Some("│"))
-                .thumb_symbol("█");
+        if show_scrollbar {
+            let track_height = inner.height as usize;
+            let thumb_height = (visible_height * track_height / total_lines.max(1))
+                .max(1)
+                .min(track_height);
+            let max_thumb_offset = track_height.saturating_sub(thumb_height);
+            // `actual_scroll` is bottom-based (0 means newest view). Convert it to
+            // top-based offset for thumb positioning.
+            let scroll_from_top = max_scroll.saturating_sub(actual_scroll);
+            let thumb_offset = if max_scroll == 0 {
+                0
+            } else {
+                scroll_from_top.saturating_mul(max_thumb_offset) / max_scroll
+            };
+            let scrollbar_x = inner.x + inner.width - 1;
+            let buffer = f.buffer_mut();
 
-            let mut scrollbar_state =
-                ScrollbarState::new(max_scroll).position(max_scroll.saturating_sub(actual_scroll));
-
-            f.render_stateful_widget(
-                scrollbar,
-                area.inner(ratatui::layout::Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                }),
-                &mut scrollbar_state,
-            );
+            for i in 0..track_height {
+                let y = inner.y + i as u16;
+                buffer[(scrollbar_x, y)]
+                    .set_symbol("│")
+                    .set_style(Style::default().fg(Color::DarkGray));
+            }
+            for i in thumb_offset..thumb_offset + thumb_height {
+                let y = inner.y + i as u16;
+                buffer[(scrollbar_x, y)]
+                    .set_symbol("█")
+                    .set_style(Style::default().fg(Color::Gray));
+            }
         }
 
-        (line_texts, inner)
+        (line_texts, content_rect)
     }
 }
 
