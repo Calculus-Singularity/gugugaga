@@ -2142,6 +2142,39 @@ impl App {
         format!("/status\n\n{}", self.render_status_card(&content_lines))
     }
 
+    fn render_gugugaga_stats_summary(&self) -> String {
+        let rows = vec![
+            (
+                "Violations".to_string(),
+                self.violations_detected.to_string(),
+            ),
+            ("Corrections".to_string(), self.corrections_made.to_string()),
+            ("Auto replies".to_string(), self.auto_replies.to_string()),
+            (
+                "Current activity".to_string(),
+                self.notebook_current_activity
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+        ];
+
+        let label_width = rows
+            .iter()
+            .map(|(label, _)| label.chars().count())
+            .max()
+            .unwrap_or(12);
+
+        let mut content_lines = vec![
+            " >_ Gugugaga Supervisor".to_string(),
+            String::new(),
+            "Session monitoring status".to_string(),
+            String::new(),
+        ];
+        Self::append_status_rows(&mut content_lines, &rows, label_width);
+
+        format!("//stats\n\n{}", self.render_status_card(&content_lines))
+    }
+
     fn status_prefers_limits_over_tokens(&self) -> bool {
         match self
             .account_auth_mode
@@ -4308,10 +4341,8 @@ Make it comprehensive but concise."#;
                 self.messages.push(Message::system("Chat history cleared."));
             }
             GugugagaCommand::Stats => {
-                self.messages.push(Message::system(format!(
-                    "Session stats:\n  Violations: {}\n  Corrections: {}\n  Auto-replies: {}",
-                    self.violations_detected, self.corrections_made, self.auto_replies
-                )));
+                let summary = self.render_gugugaga_stats_summary();
+                self.messages.push(Message::system(&summary));
             }
             GugugagaCommand::Model => {
                 let arg = args.trim();
