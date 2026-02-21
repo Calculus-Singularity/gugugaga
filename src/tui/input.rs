@@ -26,8 +26,6 @@ pub enum InputAction {
     DeleteWord,
     /// Delete character at cursor
     Delete,
-    /// Clear input
-    ClearInput,
     /// Move cursor left
     CursorLeft,
     /// Move cursor right
@@ -66,6 +64,8 @@ pub struct InputState {
     /// Saved current input when browsing history
     #[allow(dead_code)]
     pub saved_input: String,
+    /// Last killed text chunk for Ctrl+Y yank.
+    kill_buffer: String,
 }
 
 impl Default for InputState {
@@ -82,6 +82,7 @@ impl InputState {
             history: Vec::new(),
             history_index: -1,
             saved_input: String::new(),
+            kill_buffer: String::new(),
         }
     }
 
@@ -138,8 +139,10 @@ impl InputState {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 InputAction::Quit
             }
+            // Ctrl+D is handled in App to match Codex quit semantics
+            // (only when composer is empty and no modal/popup is active).
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                InputAction::Quit
+                InputAction::None
             }
 
             // Submit
@@ -157,20 +160,31 @@ impl InputState {
             }
 
             // Editing
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.delete_word();
+                InputAction::DeleteWord
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.remove_char_before_cursor();
+                InputAction::Backspace
+            }
             KeyCode::Backspace => {
                 self.remove_char_before_cursor();
                 InputAction::Backspace
+            }
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.delete_word_forward();
+                InputAction::Delete
             }
             KeyCode::Delete => {
                 self.remove_char_at_cursor();
                 InputAction::Delete
             }
 
-            // Clear
+            // Kill to beginning of line
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.buffer.clear();
-                self.cursor = 0;
-                InputAction::ClearInput
+                self.kill_to_beginning_of_line();
+                InputAction::Delete
             }
 
             // Delete word
@@ -178,13 +192,39 @@ impl InputState {
                 self.delete_word();
                 InputAction::DeleteWord
             }
+            // Kill to end of line
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.kill_to_end_of_line();
+                InputAction::Delete
+            }
+            // Yank previously killed text
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.yank();
+                InputAction::Delete
+            }
 
             // Cursor movement
+            KeyCode::Left
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                self.cursor = self.beginning_of_previous_word();
+                InputAction::CursorLeft
+            }
             KeyCode::Left => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
                 }
                 InputAction::CursorLeft
+            }
+            KeyCode::Right
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                self.cursor = self.end_of_next_word();
+                InputAction::CursorRight
             }
             KeyCode::Right => {
                 if self.cursor < self.char_count() {
@@ -192,13 +232,39 @@ impl InputState {
                 }
                 InputAction::CursorRight
             }
-            KeyCode::Home | KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                }
+                InputAction::CursorLeft
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.cursor < self.char_count() {
+                    self.cursor += 1;
+                }
+                InputAction::CursorRight
+            }
+            KeyCode::Home => {
                 self.cursor = 0;
                 InputAction::CursorHome
             }
-            KeyCode::End | KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor = 0;
+                InputAction::CursorHome
+            }
+            KeyCode::End => {
                 self.cursor = self.char_count();
                 InputAction::CursorEnd
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor = self.char_count();
+                InputAction::CursorEnd
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                InputAction::HistoryPrev
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                InputAction::HistoryNext
             }
 
             // Up/Down for scrolling (alternate scroll mode converts mouse wheel to arrows)
@@ -288,6 +354,85 @@ impl InputState {
             }
             self.remove_char_before_cursor();
         }
+    }
+
+    fn delete_word_forward(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        if self.cursor >= chars.len() {
+            return;
+        }
+
+        let mut end = self.cursor;
+        while end < chars.len() && chars[end].is_whitespace() {
+            end += 1;
+        }
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+
+        if end > self.cursor {
+            let start_byte = self.char_to_byte_index(self.cursor);
+            let end_byte = self.char_to_byte_index(end);
+            self.buffer.replace_range(start_byte..end_byte, "");
+        }
+    }
+
+    fn kill_to_beginning_of_line(&mut self) {
+        if self.cursor == 0 {
+            self.kill_buffer.clear();
+            return;
+        }
+        let end_byte = self.char_to_byte_index(self.cursor);
+        self.kill_buffer = self.buffer[..end_byte].to_string();
+        self.buffer.replace_range(..end_byte, "");
+        self.cursor = 0;
+    }
+
+    fn kill_to_end_of_line(&mut self) {
+        let total = self.char_count();
+        if self.cursor >= total {
+            self.kill_buffer.clear();
+            return;
+        }
+        let start_byte = self.char_to_byte_index(self.cursor);
+        self.kill_buffer = self.buffer[start_byte..].to_string();
+        self.buffer.truncate(start_byte);
+    }
+
+    fn yank(&mut self) {
+        if self.kill_buffer.is_empty() {
+            return;
+        }
+        let byte_idx = self.char_to_byte_index(self.cursor);
+        self.buffer.insert_str(byte_idx, &self.kill_buffer);
+        self.cursor += self.kill_buffer.chars().count();
+    }
+
+    fn beginning_of_previous_word(&self) -> usize {
+        if self.cursor == 0 {
+            return 0;
+        }
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let mut idx = self.cursor;
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        while idx > 0 && !chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        idx
+    }
+
+    fn end_of_next_word(&self) -> usize {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let mut idx = self.cursor;
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        while idx < chars.len() && !chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        idx
     }
 
     #[allow(dead_code)]

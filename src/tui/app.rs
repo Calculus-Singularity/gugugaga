@@ -210,7 +210,7 @@ use super::slash_commands::{
 };
 use super::theme::Theme;
 use super::widgets::{
-    render_message_lines, truncate_to_width_str, wrapped_input_cursor_position, HeaderBar, HelpBar,
+    render_message_lines, truncate_to_width_str, wrapped_input_cursor_position, HeaderBar,
     InputBox, Message, MessageRole, StatusBar,
 };
 
@@ -481,6 +481,26 @@ struct StatuslineEditorState {
     selected_item: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitShortcutKey {
+    CtrlC,
+    CtrlD,
+}
+
+impl QuitShortcutKey {
+    fn label(self) -> &'static str {
+        match self {
+            QuitShortcutKey::CtrlC => "Ctrl+C",
+            QuitShortcutKey::CtrlD => "Ctrl+D",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TranscriptOverlayState {
+    scroll_offset: usize,
+}
+
 /// Application state
 pub struct App {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -523,6 +543,8 @@ pub struct App {
     current_turn_id: Option<String>,
     /// Ctrl+C double-press quit: armed when first Ctrl+C is pressed
     quit_armed: bool,
+    /// Which shortcut armed the double-press quit flow.
+    quit_armed_key: Option<QuitShortcutKey>,
     /// Timestamp of first Ctrl+C press for double-press timeout
     quit_armed_at: Option<std::time::Instant>,
     /// Pending approval request (waiting for user response)
@@ -595,6 +617,14 @@ pub struct App {
     rendered_lines: Vec<String>,
     /// The Rect of the inner message area (set each draw frame).
     msg_inner_rect: Rect,
+    /// Full transcript overlay state (opened with Ctrl+T).
+    transcript_overlay: Option<TranscriptOverlayState>,
+    /// Shortcut legend overlay state (toggled by ? when composer is empty).
+    shortcuts_overlay_visible: bool,
+    /// Esc-Esc backtrack armed state.
+    esc_backtrack_armed: bool,
+    /// Timestamp for Esc-Esc backtrack arming.
+    esc_backtrack_armed_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -646,6 +676,7 @@ impl App {
             thread_id: None,
             current_turn_id: None,
             quit_armed: false,
+            quit_armed_key: None,
             quit_armed_at: None,
             pending_approval: None,
             pending_user_input: None,
@@ -687,6 +718,10 @@ impl App {
             sel_end: None,
             rendered_lines: Vec::new(),
             msg_inner_rect: Rect::default(),
+            transcript_overlay: None,
+            shortcuts_overlay_visible: false,
+            esc_backtrack_armed: false,
+            esc_backtrack_armed_at: None,
         })
     }
 
@@ -1006,18 +1041,31 @@ impl App {
         }
         if let Some(armed_at) = self.quit_armed_at {
             if armed_at.elapsed() > QUIT_SHORTCUT_TIMEOUT {
-                self.quit_armed = false;
-                self.quit_armed_at = None;
+                self.clear_quit_shortcut();
             }
         }
     }
 
-    fn arm_quit_shortcut(&mut self) {
-        if !self.quit_armed {
-            self.quit_armed = true;
-            self.quit_armed_at = Some(std::time::Instant::now());
-            self.messages
-                .push(Message::system("Press Ctrl+C again to quit."));
+    fn clear_quit_shortcut(&mut self) {
+        self.quit_armed = false;
+        self.quit_armed_key = None;
+        self.quit_armed_at = None;
+    }
+
+    fn quit_shortcut_armed_for(&self, key: QuitShortcutKey) -> bool {
+        self.quit_armed && self.quit_armed_key == Some(key)
+    }
+
+    fn arm_quit_shortcut(&mut self, key: QuitShortcutKey) {
+        let should_announce = !self.quit_armed || self.quit_armed_key != Some(key);
+        self.quit_armed = true;
+        self.quit_armed_key = Some(key);
+        self.quit_armed_at = Some(std::time::Instant::now());
+        if should_announce {
+            self.messages.push(Message::system(format!(
+                "Press {} again to quit.",
+                key.label()
+            )));
             self.scroll_to_bottom();
         }
     }
@@ -1029,6 +1077,165 @@ impl App {
         if self.slash_popup.visible {
             self.slash_popup.close();
         }
+    }
+
+    fn can_ctrl_d_quit(&self) -> bool {
+        self.input.buffer.is_empty()
+            && self.attached_images.is_empty()
+            && self.pending_large_pastes.is_empty()
+            && !self.slash_popup.visible
+            && !self.picker.visible
+            && self.pending_approval.is_none()
+    }
+
+    fn open_transcript_overlay(&mut self) {
+        self.transcript_overlay
+            .get_or_insert_with(TranscriptOverlayState::default);
+        self.shortcuts_overlay_visible = false;
+    }
+
+    fn close_transcript_overlay(&mut self) {
+        self.transcript_overlay = None;
+    }
+
+    fn toggle_shortcuts_overlay(&mut self) {
+        self.shortcuts_overlay_visible = !self.shortcuts_overlay_visible;
+        if self.shortcuts_overlay_visible {
+            self.transcript_overlay = None;
+        }
+    }
+
+    fn clear_esc_backtrack_shortcut(&mut self) {
+        self.esc_backtrack_armed = false;
+        self.esc_backtrack_armed_at = None;
+    }
+
+    fn reset_esc_backtrack_if_expired(&mut self) {
+        if !self.esc_backtrack_armed {
+            return;
+        }
+        if let Some(armed_at) = self.esc_backtrack_armed_at {
+            if armed_at.elapsed() > QUIT_SHORTCUT_TIMEOUT {
+                self.clear_esc_backtrack_shortcut();
+            }
+        }
+    }
+
+    fn can_esc_backtrack(&self) -> bool {
+        !self.is_processing
+            && self.gugugaga_status.is_none()
+            && self.input.buffer.is_empty()
+            && self.attached_images.is_empty()
+            && !self.picker.visible
+            && !self.slash_popup.visible
+            && self.pending_approval.is_none()
+            && self.pending_user_input.is_none()
+            && !self.pending_rename_input
+            && !self.pending_review_custom_input
+            && !self.pending_feedback_note_input
+            && self.transcript_overlay.is_none()
+            && !self.shortcuts_overlay_visible
+    }
+
+    fn previous_user_message_content(&self) -> Option<String> {
+        self.messages.iter().rev().find_map(|msg| match msg.role {
+            MessageRole::User | MessageRole::UserToGugugaga => Some(msg.content.clone()),
+            _ => None,
+        })
+    }
+
+    fn handle_esc_backtrack_shortcut(&mut self) -> bool {
+        self.reset_esc_backtrack_if_expired();
+        if !self.can_esc_backtrack() {
+            return false;
+        }
+
+        if self.esc_backtrack_armed {
+            self.clear_esc_backtrack_shortcut();
+            if let Some(previous) = self.previous_user_message_content() {
+                self.input.set_buffer(&previous);
+            } else {
+                self.messages
+                    .push(Message::system("No previous user message to edit."));
+                self.scroll_to_bottom();
+            }
+            return true;
+        }
+
+        self.esc_backtrack_armed = true;
+        self.esc_backtrack_armed_at = Some(std::time::Instant::now());
+        self.messages
+            .push(Message::system("Press Esc again to edit previous message."));
+        self.scroll_to_bottom();
+        true
+    }
+
+    fn handle_transcript_overlay_input(&mut self, key: &event::KeyEvent) -> bool {
+        let Some(state) = self.transcript_overlay.as_mut() else {
+            return false;
+        };
+
+        let is_ctrl_t = matches!(key.code, crossterm::event::KeyCode::Char('t'))
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL);
+        match key.code {
+            crossterm::event::KeyCode::Esc if key.modifiers.is_empty() => {
+                self.close_transcript_overlay();
+            }
+            _ if is_ctrl_t => {
+                self.close_transcript_overlay();
+            }
+            crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k')
+                if key.modifiers.is_empty() =>
+            {
+                state.scroll_offset = state.scroll_offset.saturating_add(1);
+            }
+            crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j')
+                if key.modifiers.is_empty() =>
+            {
+                state.scroll_offset = state.scroll_offset.saturating_sub(1);
+            }
+            crossterm::event::KeyCode::PageUp => {
+                state.scroll_offset = state.scroll_offset.saturating_add(8);
+            }
+            crossterm::event::KeyCode::PageDown => {
+                state.scroll_offset = state.scroll_offset.saturating_sub(8);
+            }
+            crossterm::event::KeyCode::Home => {
+                state.scroll_offset = usize::MAX;
+            }
+            crossterm::event::KeyCode::End => {
+                state.scroll_offset = 0;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn handle_shortcuts_overlay_input(&mut self, key: &event::KeyEvent) -> bool {
+        if !self.shortcuts_overlay_visible {
+            return false;
+        }
+
+        let is_ctrl_t = matches!(key.code, crossterm::event::KeyCode::Char('t'))
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL);
+        let is_question =
+            matches!(key.code, crossterm::event::KeyCode::Char('?')) && key.modifiers.is_empty();
+        let is_escape =
+            matches!(key.code, crossterm::event::KeyCode::Esc) && key.modifiers.is_empty();
+        if is_escape || is_question {
+            self.shortcuts_overlay_visible = false;
+            return true;
+        }
+        if is_ctrl_t {
+            self.shortcuts_overlay_visible = false;
+            self.open_transcript_overlay();
+            return true;
+        }
+        false
     }
 
     fn next_large_paste_placeholder(&mut self, char_count: usize) -> String {
@@ -1097,19 +1304,31 @@ impl App {
 
         if self.has_composer_draft() {
             self.clear_draft_for_ctrl_c();
-            self.arm_quit_shortcut();
+            self.arm_quit_shortcut(QuitShortcutKey::CtrlC);
             return;
         }
 
-        if self.quit_armed {
+        if self.quit_shortcut_armed_for(QuitShortcutKey::CtrlC) {
             self.should_quit = true;
-            self.quit_armed = false;
-            self.quit_armed_at = None;
+            self.clear_quit_shortcut();
             return;
         }
 
-        self.arm_quit_shortcut();
+        self.arm_quit_shortcut(QuitShortcutKey::CtrlC);
         let _ = self.interrupt_active_work().await;
+    }
+
+    fn handle_ctrl_d_shortcut(&mut self) {
+        self.reset_quit_shortcut_if_expired();
+        if !self.can_ctrl_d_quit() {
+            return;
+        }
+        if self.quit_shortcut_armed_for(QuitShortcutKey::CtrlD) {
+            self.should_quit = true;
+            self.clear_quit_shortcut();
+            return;
+        }
+        self.arm_quit_shortcut(QuitShortcutKey::CtrlD);
     }
 
     async fn handle_input(&mut self, key: event::KeyEvent) {
@@ -1204,13 +1423,53 @@ impl App {
             && key
                 .modifiers
                 .contains(crossterm::event::KeyModifiers::CONTROL);
+        let is_ctrl_d = matches!(key.code, crossterm::event::KeyCode::Char('d'))
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL);
+        let is_ctrl_t = matches!(key.code, crossterm::event::KeyCode::Char('t'))
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL);
+        let is_question =
+            matches!(key.code, crossterm::event::KeyCode::Char('?')) && key.modifiers.is_empty();
         let is_escape = matches!(key.code, crossterm::event::KeyCode::Esc);
         if is_ctrl_c {
             self.handle_ctrl_c_shortcut().await;
             return;
         }
+        if is_ctrl_d {
+            self.handle_ctrl_d_shortcut();
+            return;
+        }
+        if self.handle_transcript_overlay_input(&key) {
+            return;
+        }
+        if self.handle_shortcuts_overlay_input(&key) {
+            return;
+        }
+        if is_ctrl_t && !self.picker.visible {
+            self.open_transcript_overlay();
+            return;
+        }
+        if is_question
+            && !self.picker.visible
+            && !self.slash_popup.visible
+            && !self.has_composer_draft()
+        {
+            self.toggle_shortcuts_overlay();
+            return;
+        }
         if is_escape && self.interrupt_active_work().await {
             return;
+        }
+        if is_escape {
+            if self.handle_esc_backtrack_shortcut() {
+                return;
+            }
+            self.clear_esc_backtrack_shortcut();
+        } else {
+            self.clear_esc_backtrack_shortcut();
         }
 
         let is_shift_tab = matches!(key.code, crossterm::event::KeyCode::BackTab);
@@ -1563,13 +1822,6 @@ impl App {
                     let _ = self.interrupt_active_work().await;
                 }
                 // Otherwise ignore
-            }
-            InputAction::ClearInput => {
-                self.attached_images.clear();
-                self.pending_large_pastes.clear();
-                if self.slash_popup.visible {
-                    self.update_popup_filter();
-                }
             }
             InputAction::Input('/') => {
                 // Check for // (gugugaga) or / (codex)
@@ -3401,18 +3653,6 @@ impl App {
                 }
             }
         }
-    }
-
-    fn collaboration_mode_hint_text(&self) -> Option<String> {
-        if !self.collaboration_modes_enabled() {
-            return None;
-        }
-        self.collaboration_mode.as_deref().map(|mode| {
-            format!(
-                "{} (shift+tab to cycle)",
-                Self::collaboration_mode_title(mode)
-            )
-        })
     }
 
     fn set_collaboration_mode_options(&mut self, options: Vec<String>) {
@@ -6960,8 +7200,10 @@ Make it comprehensive but concise."#;
         let picker = &self.picker;
         let pending_approval = &self.pending_approval;
         let approval_scroll = self.approval_scroll;
+        let transcript_overlay = self.transcript_overlay.clone();
+        let shortcuts_overlay_visible = self.shortcuts_overlay_visible;
+        let collaboration_modes_enabled = self.collaboration_modes_enabled();
         let gugugaga_status = &self.gugugaga_status;
-        let collaboration_mode_hint = self.collaboration_mode_hint_text();
         let elapsed_secs = self.turn_start_time.map(|t| t.elapsed().as_secs_f64());
         let sel_anchor = self.sel_anchor;
         let sel_end = self.sel_end;
@@ -6973,7 +7215,7 @@ Make it comprehensive but concise."#;
         self.terminal.draw(|f| {
             let size = f.area();
 
-            // Main layout: header, content, status, input, help
+            // Main layout: header, content, status, input
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -6981,7 +7223,6 @@ Make it comprehensive but concise."#;
                     Constraint::Min(8),    // Content
                     Constraint::Length(1), // Status (above input)
                     Constraint::Length(4), // Input
-                    Constraint::Length(1), // Help
                 ])
                 .split(size);
 
@@ -7044,31 +7285,17 @@ Make it comprehensive but concise."#;
                 .saturating_sub(scroll_start)
                 .min(inner_h.saturating_sub(1));
             let visible_col = cursor_col.min(inner_w.saturating_sub(1));
-            let cursor_x = main_chunks[3].x + 1 + visible_col as u16;
-            let cursor_y = main_chunks[3].y + 1 + visible_row as u16;
-            f.set_cursor_position((
-                cursor_x.min(main_chunks[3].x + main_chunks[3].width - 2),
-                cursor_y.min(main_chunks[3].y + main_chunks[3].height - 2),
-            ));
-
-            // Help bar
-            if pending_approval.is_some() {
-                // When approval overlay is shown, show minimal hint in help bar
-                let hint =
-                    ratatui::widgets::Paragraph::new(" Approval pending — see overlay above ")
-                        .style(
-                            ratatui::style::Style::default()
-                                .fg(ratatui::style::Color::Yellow)
-                                .bg(ratatui::style::Color::DarkGray),
-                        );
-                f.render_widget(hint, main_chunks[4]);
-            } else {
-                f.render_widget(
-                    HelpBar {
-                        collaboration_mode_hint: collaboration_mode_hint.as_deref(),
-                    },
-                    main_chunks[4],
-                );
+            let overlay_active = pending_approval.is_some()
+                || picker.visible
+                || transcript_overlay.is_some()
+                || shortcuts_overlay_visible;
+            if !overlay_active {
+                let cursor_x = main_chunks[3].x + 1 + visible_col as u16;
+                let cursor_y = main_chunks[3].y + 1 + visible_row as u16;
+                f.set_cursor_position((
+                    cursor_x.min(main_chunks[3].x + main_chunks[3].width - 2),
+                    cursor_y.min(main_chunks[3].y + main_chunks[3].height - 2),
+                ));
             }
 
             // Render picker overlay (on top of everything)
@@ -7079,6 +7306,16 @@ Make it comprehensive but concise."#;
             // Render approval overlay (on top of everything, highest z-order)
             if let Some(approval) = pending_approval {
                 Self::render_approval_overlay(f, size, approval, approval_scroll);
+            }
+
+            // Render transcript overlay (Codex-style Ctrl+T) above normal UI.
+            if let Some(overlay) = transcript_overlay.as_ref() {
+                Self::render_transcript_overlay(f, size, messages, overlay.scroll_offset);
+            }
+
+            // Render shortcuts overlay (toggled by ?) on top.
+            if shortcuts_overlay_visible {
+                Self::render_shortcuts_overlay(f, size, collaboration_modes_enabled);
             }
         })?;
 
@@ -7151,6 +7388,141 @@ Make it comprehensive but concise."#;
 
         let paragraph = Paragraph::new(lines).block(block);
         f.render_widget(paragraph, popup_area);
+    }
+
+    fn render_transcript_overlay(
+        f: &mut Frame,
+        area: Rect,
+        messages: &[Message],
+        scroll_offset: usize,
+    ) {
+        use ratatui::style::{Color, Style};
+
+        if area.width < 12 || area.height < 8 {
+            return;
+        }
+        let overlay_area = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        f.render_widget(Clear, overlay_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Theme::accent())
+            .title_top(Line::styled(
+                " Transcript (Ctrl+T / Esc to close) ",
+                Theme::title(),
+            ));
+        let inner = block.inner(overlay_area);
+        f.render_widget(block, overlay_area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let mut all_lines: Vec<Line> = Vec::new();
+        for msg in messages {
+            all_lines.extend(render_message_lines(msg, inner.width as usize));
+        }
+        if all_lines.is_empty() {
+            all_lines.push(Line::from(Span::styled(
+                "  No transcript yet.",
+                Theme::muted(),
+            )));
+        }
+
+        let total_lines = all_lines.len();
+        let visible_height = inner.height as usize;
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        let actual_scroll = scroll_offset.min(max_scroll);
+        let start = total_lines
+            .saturating_sub(visible_height)
+            .saturating_sub(actual_scroll);
+        let visible: Vec<Line> = all_lines
+            .into_iter()
+            .skip(start)
+            .take(visible_height)
+            .collect();
+        f.render_widget(Paragraph::new(visible), inner);
+
+        if total_lines > visible_height {
+            let indicator = if actual_scroll > 0 && actual_scroll < max_scroll {
+                format!("↑↓ {}/{}", actual_scroll + 1, total_lines)
+            } else if actual_scroll > 0 {
+                format!("↑ {}/{}", actual_scroll + 1, total_lines)
+            } else {
+                format!("↓ {}/{}", actual_scroll + 1, total_lines)
+            };
+            let ind_len = indicator.len() as u16;
+            if inner.width > ind_len + 1 {
+                let ind_area = Rect {
+                    x: inner.x + inner.width - ind_len - 1,
+                    y: inner.y,
+                    width: ind_len,
+                    height: 1,
+                };
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        indicator,
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    ind_area,
+                );
+            }
+        }
+    }
+
+    fn render_shortcuts_overlay(f: &mut Frame, area: Rect, collaboration_modes_enabled: bool) {
+        let mut lines = vec![
+            Line::from("  /  for Codex commands"),
+            Line::from("  // for Gugugaga commands"),
+            Line::from("  Tab  complete command"),
+            Line::from("  Enter  send message"),
+            Line::from("  Ctrl+V / Alt+V  paste image"),
+            Line::from("  Esc  interrupt active work"),
+            Line::from("  Ctrl+C  clear draft, interrupt, then quit"),
+            Line::from("  Ctrl+D  quit when composer is empty"),
+            Line::from("  Ctrl+T  open transcript view"),
+        ];
+        if collaboration_modes_enabled {
+            lines.push(Line::from("  Shift+Tab  change collaboration mode"));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("  ? / Esc  close this panel"));
+
+        let content_h = lines.len() as u16 + 2;
+        let overlay_width = area.width.saturating_sub(8).min(72);
+        let overlay_height = content_h.min(area.height.saturating_sub(4));
+        if overlay_width < 12 || overlay_height < 6 {
+            return;
+        }
+        let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
+        let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
+        let overlay_area = Rect {
+            x,
+            y,
+            width: overlay_width,
+            height: overlay_height,
+        };
+        f.render_widget(Clear, overlay_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Theme::accent())
+            .title_top(Line::styled(
+                " Shortcuts (? / Esc to close) ",
+                Theme::title(),
+            ));
+        let inner = block.inner(overlay_area);
+        f.render_widget(block, overlay_area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let visible: Vec<Line> = lines.into_iter().take(inner.height as usize).collect();
+        f.render_widget(Paragraph::new(visible), inner);
     }
 
     fn render_approval_overlay(
