@@ -62,7 +62,6 @@ pub struct InputState {
     /// Current history index (-1 means current input)
     pub history_index: isize,
     /// Saved current input when browsing history
-    #[allow(dead_code)]
     pub saved_input: String,
     /// Last killed text chunk for Ctrl+Y yank.
     kill_buffer: String,
@@ -267,9 +266,9 @@ impl InputState {
                 InputAction::HistoryNext
             }
 
-            // Up/Down for scrolling (alternate scroll mode converts mouse wheel to arrows)
-            KeyCode::Up => InputAction::HistoryPrev, // Used as scroll in app.rs
-            KeyCode::Down => InputAction::HistoryNext, // Used as scroll in app.rs
+            // Up/Down for history navigation (when allowed by composer state)
+            KeyCode::Up => InputAction::HistoryPrev,
+            KeyCode::Down => InputAction::HistoryNext,
 
             // PageUp/PageDown for faster scrolling
             KeyCode::PageUp => InputAction::ScrollUp,
@@ -435,10 +434,44 @@ impl InputState {
         idx
     }
 
-    #[allow(dead_code)]
-    fn history_prev(&mut self) {
+    fn current_history_entry(&self) -> Option<&str> {
+        if self.history_index < 0 {
+            return None;
+        }
+        let idx = self
+            .history
+            .len()
+            .checked_sub(1 + self.history_index as usize)?;
+        self.history.get(idx).map(|s| s.as_str())
+    }
+
+    fn cursor_at_line_boundary(&self) -> bool {
+        self.cursor == 0 || self.cursor == self.char_count()
+    }
+
+    /// Returns whether Up/Down should navigate history for current input state.
+    ///
+    /// Empty buffer always allows history navigation. For non-empty buffer, this
+    /// requires:
+    /// - currently browsing history, and
+    /// - buffer exactly equals the last recalled history entry, and
+    /// - cursor is at line boundary (start or end).
+    pub fn should_handle_history_navigation(&self) -> bool {
         if self.history.is_empty() {
-            return;
+            return false;
+        }
+        if self.buffer.is_empty() {
+            return true;
+        }
+        if !self.cursor_at_line_boundary() {
+            return false;
+        }
+        matches!(self.current_history_entry(), Some(prev) if prev == self.buffer)
+    }
+
+    pub fn navigate_history_prev(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
         }
 
         if self.history_index == -1 {
@@ -450,20 +483,26 @@ impl InputState {
             let idx = self.history.len() - 1 - self.history_index as usize;
             self.buffer = self.history[idx].clone();
             self.cursor = self.char_count();
+            true
+        } else {
+            false
         }
     }
 
-    #[allow(dead_code)]
-    fn history_next(&mut self) {
+    pub fn navigate_history_next(&mut self) -> bool {
         if self.history_index > 0 {
             self.history_index -= 1;
             let idx = self.history.len() - 1 - self.history_index as usize;
             self.buffer = self.history[idx].clone();
             self.cursor = self.char_count();
+            true
         } else if self.history_index == 0 {
             self.history_index = -1;
             self.buffer = self.saved_input.clone();
             self.cursor = self.char_count();
+            true
+        } else {
+            false
         }
     }
 }
@@ -510,5 +549,33 @@ mod tests {
         state.insert_char('\u{597d}');
         assert_eq!(state.buffer, "hi\u{4f60}\u{597d}");
         assert_eq!(state.cursor, 4);
+    }
+
+    #[test]
+    fn test_history_navigation_empty_buffer() {
+        let mut state = InputState::new();
+        state.history = vec!["first".to_string(), "second".to_string()];
+
+        assert!(state.should_handle_history_navigation());
+        assert!(state.navigate_history_prev());
+        assert_eq!(state.buffer, "second");
+        assert_eq!(state.cursor, 6);
+    }
+
+    #[test]
+    fn test_history_navigation_requires_recalled_entry_when_non_empty() {
+        let mut state = InputState::new();
+        state.history = vec!["hello".to_string()];
+        state.buffer = "draft".to_string();
+        state.cursor = state.buffer.chars().count();
+
+        assert!(!state.should_handle_history_navigation());
+
+        assert!(state.navigate_history_prev());
+        assert_eq!(state.buffer, "hello");
+        assert!(state.should_handle_history_navigation());
+
+        state.insert_char('!');
+        assert!(!state.should_handle_history_navigation());
     }
 }

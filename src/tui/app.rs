@@ -1804,12 +1804,14 @@ impl App {
                 self.scroll_offset = self.scroll_offset.saturating_sub(5);
             }
             InputAction::HistoryPrev => {
-                // Up arrow - scroll up by one line (alternate scroll mode converts wheel to arrows)
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                if self.input.should_handle_history_navigation() {
+                    let _ = self.input.navigate_history_prev();
+                }
             }
             InputAction::HistoryNext => {
-                // Down arrow - scroll down by one line
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                if self.input.should_handle_history_navigation() {
+                    let _ = self.input.navigate_history_next();
+                }
             }
             InputAction::Tab => {
                 self.handle_tab_completion();
