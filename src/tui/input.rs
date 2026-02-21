@@ -147,12 +147,7 @@ impl InputState {
             // Submit
             KeyCode::Enter => {
                 if !self.buffer.is_empty() {
-                    let input = self.buffer.clone();
-                    self.history.push(input.clone());
-                    self.buffer.clear();
-                    self.cursor = 0;
-                    self.history_index = -1;
-                    InputAction::Submit(input)
+                    InputAction::Submit(self.buffer.clone())
                 } else {
                     InputAction::None
                 }
@@ -317,6 +312,18 @@ impl InputState {
 
     /// Clear the current editable input (does not clear history).
     pub fn clear_current_input(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+        self.history_index = -1;
+    }
+
+    /// Commit current buffer as a successful submission:
+    /// add to history and clear editor state.
+    pub fn commit_submission(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        self.history.push(self.buffer.clone());
         self.buffer.clear();
         self.cursor = 0;
         self.history_index = -1;
@@ -510,6 +517,7 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn test_insert_ascii() {
@@ -577,5 +585,21 @@ mod tests {
 
         state.insert_char('!');
         assert!(!state.should_handle_history_navigation());
+    }
+
+    #[test]
+    fn test_enter_does_not_clear_until_commit_submission() {
+        let mut state = InputState::new();
+        state.set_buffer("hello");
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, InputAction::Submit(ref s) if s == "hello"));
+        assert_eq!(state.buffer, "hello");
+        assert!(state.history.is_empty());
+
+        state.commit_submission();
+        assert_eq!(state.buffer, "");
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.history, vec!["hello".to_string()]);
     }
 }

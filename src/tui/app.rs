@@ -396,6 +396,23 @@ enum PendingRequestType {
     Logout,
 }
 
+fn take_pending_request_type(
+    pending_requests: &mut HashMap<u64, PendingRequestType>,
+    request_id: u64,
+) -> Option<PendingRequestType> {
+    pending_requests.remove(&request_id)
+}
+
+fn track_pending_request(
+    pending_request_type: &mut PendingRequestType,
+    pending_requests: &mut HashMap<u64, PendingRequestType>,
+    request_id: u64,
+    request_type: PendingRequestType,
+) {
+    *pending_request_type = request_type.clone();
+    pending_requests.insert(request_id, request_type);
+}
+
 /// Pending approval request from server
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -525,10 +542,10 @@ pub struct App {
     picker: Picker,
     /// What the picker is currently for
     picker_mode: PickerMode,
-    /// Pending request ID
-    pending_request_id: Option<u64>,
     /// Type of pending request
     pending_request_type: PendingRequestType,
+    /// Pending request type keyed by request id for deterministic matching.
+    pending_requests: HashMap<u64, PendingRequestType>,
     /// Request ID counter
     request_counter: u64,
     /// Cached model catalog from latest model/list response
@@ -658,8 +675,8 @@ impl App {
             slash_popup: SlashPopup::new(),
             picker: Picker::new("Select"),
             picker_mode: PickerMode::None,
-            pending_request_id: None,
             pending_request_type: PendingRequestType::None,
+            pending_requests: HashMap::new(),
             request_counter: 100, // Start after other request IDs
             available_models: Vec::new(),
             pending_model_for_reasoning: None,
@@ -1488,11 +1505,13 @@ impl App {
                     if trimmed.eq_ignore_ascii_case("/cancel")
                         || trimmed.eq_ignore_ascii_case("cancel")
                     {
+                        self.input.commit_submission();
                         self.respond_to_user_input_request(&pending, None).await;
                         self.messages.push(Message::system(
                             "Sent empty response for pending user input request.",
                         ));
                     } else {
+                        self.input.commit_submission();
                         self.respond_to_user_input_request(&pending, Some(trimmed))
                             .await;
                         self.messages.push(Message::system(
@@ -1508,6 +1527,7 @@ impl App {
                     if trimmed.eq_ignore_ascii_case("/cancel")
                         || trimmed.eq_ignore_ascii_case("cancel")
                     {
+                        self.input.commit_submission();
                         self.pending_rename_input = false;
                         self.messages.push(Message::system("Rename cancelled."));
                         self.scroll_to_bottom();
@@ -1520,6 +1540,7 @@ impl App {
                         self.scroll_to_bottom();
                         return;
                     }
+                    self.input.commit_submission();
                     self.pending_rename_input = false;
                     self.request_rename(trimmed).await;
                     self.scroll_to_bottom();
@@ -1531,6 +1552,7 @@ impl App {
                     if trimmed.eq_ignore_ascii_case("/cancel")
                         || trimmed.eq_ignore_ascii_case("cancel")
                     {
+                        self.input.commit_submission();
                         self.pending_review_custom_input = false;
                         self.messages
                             .push(Message::system("Custom review request cancelled."));
@@ -1544,6 +1566,7 @@ impl App {
                         self.scroll_to_bottom();
                         return;
                     }
+                    self.input.commit_submission();
                     self.pending_review_custom_input = false;
                     self.request_review_custom(trimmed).await;
                     self.scroll_to_bottom();
@@ -1555,6 +1578,7 @@ impl App {
                     if trimmed.eq_ignore_ascii_case("/cancel")
                         || trimmed.eq_ignore_ascii_case("cancel")
                     {
+                        self.input.commit_submission();
                         self.pending_feedback_note_input = false;
                         self.pending_feedback_classification = None;
                         self.pending_feedback_include_logs = true;
@@ -1582,6 +1606,7 @@ impl App {
                         .take()
                         .unwrap_or_else(|| "other".to_string());
                     let include_logs = self.pending_feedback_include_logs;
+                    self.input.commit_submission();
                     self.pending_feedback_note_input = false;
                     self.pending_feedback_include_logs = true;
                     self.request_feedback_upload(&classification, note, include_logs)
@@ -1603,15 +1628,19 @@ impl App {
                                 self.scroll_to_bottom();
                                 return;
                             }
+                            self.input.commit_submission();
                             self.forward_codex_command(cmd, args).await;
                         }
                         ParsedCommand::Gugugaga(cmd, args) => {
+                            self.input.commit_submission();
                             self.execute_gugugaga_command(cmd, args).await;
                         }
                         ParsedCommand::GugugagaChat(message) => {
+                            self.input.commit_submission();
                             self.send_gugugaga_chat(&message).await;
                         }
                         ParsedCommand::Unknown(name) => {
+                            self.input.commit_submission();
                             self.messages.push(Message::system(format!(
                                 "Unknown command: {}. Use //help for Gugugaga commands.",
                                 name
@@ -1625,6 +1654,7 @@ impl App {
                             .push(Message::system("⏳ Please wait for current processing"));
                         return;
                     }
+                    self.input.commit_submission();
                     let local_images = std::mem::take(&mut self.attached_images);
                     let display_text = if local_images.is_empty() {
                         text.clone()
@@ -2006,8 +2036,12 @@ impl App {
     async fn request_new_thread(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::NewThread;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::NewThread,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "thread/start",
@@ -2032,8 +2066,12 @@ impl App {
     async fn request_status(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::StatusRead;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::StatusRead,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "config/read",
@@ -2663,8 +2701,12 @@ impl App {
 
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::ThreadCompactStart;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::ThreadCompactStart,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "thread/compact/start",
@@ -2691,8 +2733,12 @@ impl App {
 
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::ThreadBackgroundTerminalsClean;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::ThreadBackgroundTerminalsClean,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "thread/backgroundTerminals/clean",
@@ -2712,8 +2758,12 @@ impl App {
     async fn request_debug_config(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::DebugConfigRead;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::DebugConfigRead,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "config/read",
@@ -2741,8 +2791,12 @@ impl App {
 
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::RolloutPathLookup(thread_id);
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::RolloutPathLookup(thread_id),
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "thread/list",
@@ -2767,8 +2821,12 @@ impl App {
 
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::ModelList;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::ModelList,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "model/list",
@@ -2791,8 +2849,12 @@ impl App {
 
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::GugugagaModelList;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::GugugagaModelList,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "model/list",
@@ -2845,8 +2907,12 @@ impl App {
     async fn fetch_skills_list(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::SkillsList;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::SkillsList,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "skills/list",
@@ -3144,8 +3210,12 @@ impl App {
         if let Some(thread_id) = &self.thread_id {
             if let Some(tx) = &self.input_tx {
                 self.request_counter += 1;
-                self.pending_request_id = Some(self.request_counter);
-                self.pending_request_type = PendingRequestType::RenameThread;
+                track_pending_request(
+                    &mut self.pending_request_type,
+                    &mut self.pending_requests,
+                    self.request_counter,
+                    PendingRequestType::RenameThread,
+                );
                 let msg = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "thread/name/set",
@@ -3171,8 +3241,12 @@ impl App {
         if let Some(thread_id) = &self.thread_id {
             if let Some(tx) = &self.input_tx {
                 self.request_counter += 1;
-                self.pending_request_id = Some(self.request_counter);
-                self.pending_request_type = PendingRequestType::ForkThread;
+                track_pending_request(
+                    &mut self.pending_request_type,
+                    &mut self.pending_requests,
+                    self.request_counter,
+                    PendingRequestType::ForkThread,
+                );
                 let msg = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "thread/fork",
@@ -3195,8 +3269,12 @@ impl App {
     async fn request_logout(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::Logout;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::Logout,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "account/logout",
@@ -3261,8 +3339,12 @@ impl App {
     ) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::FeedbackUpload;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::FeedbackUpload,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "feedback/upload",
@@ -3287,8 +3369,12 @@ impl App {
     async fn show_mcp_tools(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::McpServerList;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::McpServerList,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "mcpServerStatus/list",
@@ -3306,8 +3392,12 @@ impl App {
     async fn request_apps_list(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::AppsList;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::AppsList,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "app/list",
@@ -3401,8 +3491,12 @@ impl App {
     async fn open_experimental_picker(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::ConfigRead;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::ConfigRead,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "config/read",
@@ -3432,8 +3526,12 @@ impl App {
 
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::CollabModeList;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::CollabModeList,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "collaborationMode/list",
@@ -3613,8 +3711,12 @@ impl App {
 
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::AgentThreadList;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::AgentThreadList,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "thread/loaded/list",
@@ -3630,8 +3732,12 @@ impl App {
     async fn open_statusline_picker(&mut self) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::StatuslineConfigRead;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::StatuslineConfigRead,
+            );
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "config/read",
@@ -3789,8 +3895,12 @@ Make it comprehensive but concise."#;
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
             let request_id = self.request_counter;
-            self.pending_request_id = Some(request_id);
-            self.pending_request_type = PendingRequestType::ThreadList;
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::ThreadList,
+            );
 
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -3819,9 +3929,12 @@ Make it comprehensive but concise."#;
                         .push(Message::system(format!("Resuming session: {}", item_title)));
                     if let Some(tx) = &self.input_tx {
                         self.request_counter += 1;
-                        self.pending_request_id = Some(self.request_counter);
-                        self.pending_request_type =
-                            PendingRequestType::ThreadResume(item_id.clone());
+                        track_pending_request(
+                            &mut self.pending_request_type,
+                            &mut self.pending_requests,
+                            self.request_counter,
+                            PendingRequestType::ThreadResume(item_id.clone()),
+                        );
                         // Build params with both threadId and path (if available).
                         // The path takes precedence in the app-server, bypassing
                         // the potentially unreliable UUID-based file search.
@@ -4770,30 +4883,25 @@ Make it comprehensive but concise."#;
             if let Some(id) = json.get("id") {
                 // This is a response to a request we made
                 if let Some(req_id) = id.as_u64() {
-                    if self.pending_request_id == Some(req_id) {
-                        self.pending_request_id = None;
+                    if let Some(request_type) =
+                        take_pending_request_type(&mut self.pending_requests, req_id)
+                    {
+                        self.pending_request_type = request_type;
                         self.handle_rpc_response(&json);
                         return;
                     }
                 }
-                // Check for error responses (only for non-pending requests)
+                // Error responses for non-tracked requests (e.g. turn/start failures)
                 if let Some(error) = json.get("error") {
                     let error_msg = error
                         .get("message")
                         .and_then(|m| m.as_str())
                         .unwrap_or("Unknown error");
-                    // Only show error if it seems relevant (not from init)
-                    if self.pending_request_id.is_some() {
-                        self.messages
-                            .push(Message::system(format!("Error: {}", error_msg)));
+
+                    self.messages
+                        .push(Message::system(format!("Error: {}", error_msg)));
+                    if self.is_processing {
                         self.stop_processing();
-                        self.pending_request_id = None;
-                        self.pending_request_type = PendingRequestType::None;
-                        // Close picker if it was open
-                        if self.picker.visible {
-                            self.picker.close();
-                            self.picker_mode = PickerMode::None;
-                        }
                     }
                     return;
                 }
@@ -6632,8 +6740,12 @@ Make it comprehensive but concise."#;
     fn request_thread_read(&mut self, thread_id: String) {
         if let Some(tx) = &self.input_tx {
             self.request_counter += 1;
-            self.pending_request_id = Some(self.request_counter);
-            self.pending_request_type = PendingRequestType::ThreadRead(thread_id.clone());
+            track_pending_request(
+                &mut self.pending_request_type,
+                &mut self.pending_requests,
+                self.request_counter,
+                PendingRequestType::ThreadRead(thread_id.clone()),
+            );
 
             let msg = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -7633,5 +7745,33 @@ impl Drop for App {
             crossterm::event::DisableBracketedPaste
         );
         let _ = self.terminal.show_cursor();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{take_pending_request_type, PendingRequestType};
+    use std::collections::HashMap;
+
+    #[test]
+    fn pending_requests_match_by_id_without_overwrite() {
+        let mut pending = HashMap::new();
+        pending.insert(101, PendingRequestType::StatusRead);
+        pending.insert(102, PendingRequestType::ThreadList);
+
+        let first = take_pending_request_type(&mut pending, 101);
+        assert_eq!(first, Some(PendingRequestType::StatusRead));
+        assert_eq!(pending.get(&102), Some(&PendingRequestType::ThreadList));
+    }
+
+    #[test]
+    fn unknown_response_id_does_not_clear_pending_requests() {
+        let mut pending = HashMap::new();
+        pending.insert(201, PendingRequestType::ModelList);
+        pending.insert(202, PendingRequestType::AppsList);
+
+        let unmatched = take_pending_request_type(&mut pending, 999);
+        assert_eq!(unmatched, None);
+        assert_eq!(pending.len(), 2);
     }
 }
