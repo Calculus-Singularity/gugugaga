@@ -7,16 +7,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, MouseButton, MouseEventKind},
+    event::{self, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
-    Frame, Terminal,
+    Frame, Terminal, TerminalOptions, Viewport,
 };
 use tokio::sync::{mpsc, RwLock};
 
@@ -604,17 +604,6 @@ pub struct App {
     animation: AsciiAnimation,
     /// Trust onboarding context. `Some` = user still needs to choose.
     trust_ctx: Option<crate::trust::TrustContext>,
-
-    // ── Mouse selection state ─────────────────────────────────
-    /// Whether the user is currently drag-selecting with the mouse.
-    selecting: bool,
-    /// Anchor point of the selection (screen row relative to message inner area, col).
-    sel_anchor: Option<(u16, u16)>,
-    /// Current end of the selection (screen row, col).
-    sel_end: Option<(u16, u16)>,
-    /// Rendered line texts cached during draw() for selection copy.
-    /// Index = screen-row relative to the inner message area.
-    rendered_lines: Vec<String>,
     /// The Rect of the inner message area (set each draw frame).
     msg_inner_rect: Rect,
     /// Full transcript overlay state (opened with Ctrl+T).
@@ -639,14 +628,16 @@ impl App {
     ) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture,
-            crossterm::event::EnableBracketedPaste
-        )?;
+        execute!(stdout, crossterm::event::EnableBracketedPaste)?;
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        let (_, term_height) = crossterm::terminal::size().unwrap_or((0, 24));
+        let viewport_height = term_height.saturating_sub(1).max(10);
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(viewport_height),
+            },
+        )?;
 
         Ok(Self {
             terminal,
@@ -713,10 +704,6 @@ impl App {
             },
             animation: AsciiAnimation::new(),
             trust_ctx,
-            selecting: false,
-            sel_anchor: None,
-            sel_end: None,
-            rendered_lines: Vec::new(),
             msg_inner_rect: Rect::default(),
             transcript_overlay: None,
             shortcuts_overlay_visible: false,
@@ -863,9 +850,6 @@ impl App {
                                 let pasted = pasted.replace('\r', "\n");
                                 self.handle_paste_event(pasted);
                             }
-                            Event::Mouse(mouse) => {
-                                self.handle_mouse(mouse);
-                            }
                             _ => {}
                         }
                     }
@@ -874,138 +858,6 @@ impl App {
         }
 
         Ok(())
-    }
-
-    /// Handle mouse events: selection drag, scroll wheel, auto-scroll at edges.
-    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
-        let rect = self.msg_inner_rect;
-        // Ignore if message area hasn't been laid out yet
-        if rect.width == 0 || rect.height == 0 {
-            return;
-        }
-
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(3);
-            }
-            MouseEventKind::ScrollDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(3);
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                // Start selection if click is in the message area
-                if mouse.column >= rect.x
-                    && mouse.column < rect.x + rect.width
-                    && mouse.row >= rect.y
-                    && mouse.row < rect.y + rect.height
-                {
-                    let rel_row = mouse.row - rect.y;
-                    let rel_col = mouse.column - rect.x;
-                    self.selecting = true;
-                    self.sel_anchor = Some((rel_row, rel_col));
-                    self.sel_end = Some((rel_row, rel_col));
-                } else {
-                    // Click outside message area — clear selection
-                    self.selecting = false;
-                    self.sel_anchor = None;
-                    self.sel_end = None;
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if self.selecting {
-                    let rel_row = mouse.row.saturating_sub(rect.y);
-                    let rel_col = mouse.column.saturating_sub(rect.x);
-                    self.sel_end = Some((rel_row.min(rect.height - 1), rel_col));
-
-                    // Auto-scroll when dragging near edges
-                    if mouse.row <= rect.y + 1 {
-                        // Near top edge — scroll up
-                        self.scroll_offset = self.scroll_offset.saturating_add(1);
-                    } else if mouse.row >= rect.y + rect.height - 2 {
-                        // Near bottom edge — scroll down
-                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                    }
-                }
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.selecting {
-                    self.selecting = false;
-                    // Copy selected text to clipboard
-                    if let (Some(anchor), Some(end)) = (self.sel_anchor, self.sel_end) {
-                        let text = self.extract_selected_text(anchor, end);
-                        if !text.is_empty() {
-                            Self::copy_to_clipboard(&text);
-                        }
-                    }
-                    // Keep selection visible (don't clear anchor/end yet)
-                    // It will be cleared on next mouse down
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Extract the text between two selection points from the rendered lines.
-    fn extract_selected_text(&self, anchor: (u16, u16), end: (u16, u16)) -> String {
-        // Normalize so start <= end
-        let (start, finish) = if anchor.0 < end.0 || (anchor.0 == end.0 && anchor.1 <= end.1) {
-            (anchor, end)
-        } else {
-            (end, anchor)
-        };
-
-        let mut result = String::new();
-        for row in start.0..=finish.0 {
-            let idx = row as usize;
-            if idx >= self.rendered_lines.len() {
-                break;
-            }
-            let line = &self.rendered_lines[idx];
-            let chars: Vec<char> = line.chars().collect();
-
-            let col_start = if row == start.0 { start.1 as usize } else { 0 };
-            let col_end = if row == finish.0 {
-                (finish.1 as usize + 1).min(chars.len())
-            } else {
-                chars.len()
-            };
-
-            let selected: String = chars
-                .get(col_start..col_end)
-                .unwrap_or(&[])
-                .iter()
-                .collect();
-            result.push_str(&selected);
-            if row < finish.0 {
-                result.push('\n');
-            }
-        }
-        result
-    }
-
-    /// Copy text to system clipboard (macOS: pbcopy, Linux: xclip/xsel).
-    fn copy_to_clipboard(text: &str) {
-        use std::process::{Command, Stdio};
-        // macOS
-        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-            return;
-        }
-        // Linux fallback: xclip
-        if let Ok(mut child) = Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(Stdio::piped())
-            .spawn()
-        {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-        }
     }
 
     fn image_label_list(count: usize) -> String {
@@ -1796,12 +1648,10 @@ impl App {
                 }
             }
             InputAction::ScrollUp => {
-                // PageUp - scroll up by multiple lines
-                self.scroll_offset = self.scroll_offset.saturating_add(5);
+                // Do not scroll message pane from composer keys.
             }
             InputAction::ScrollDown => {
-                // PageDown - scroll down by multiple lines
-                self.scroll_offset = self.scroll_offset.saturating_sub(5);
+                // Do not scroll message pane from composer keys.
             }
             InputAction::HistoryPrev => {
                 if self.input.should_handle_history_navigation() {
@@ -7207,11 +7057,8 @@ Make it comprehensive but concise."#;
         let collaboration_modes_enabled = self.collaboration_modes_enabled();
         let gugugaga_status = &self.gugugaga_status;
         let elapsed_secs = self.turn_start_time.map(|t| t.elapsed().as_secs_f64());
-        let sel_anchor = self.sel_anchor;
-        let sel_end = self.sel_end;
 
         // These will be filled by the draw closure and written back after
-        let mut captured_lines: Vec<String> = Vec::new();
         let mut captured_rect = Rect::default();
 
         self.terminal.draw(|f| {
@@ -7253,16 +7100,7 @@ Make it comprehensive but concise."#;
             f.render_widget(status, main_chunks[2]);
 
             // Messages (full width, no side panel)
-            let (lines_text, inner_rect) = Self::render_messages(
-                f,
-                main_chunks[1],
-                messages,
-                scroll_offset,
-                sel_anchor,
-                sel_end,
-            );
-            captured_lines = lines_text;
-            captured_rect = inner_rect;
+            captured_rect = Self::render_messages(f, main_chunks[1], messages, scroll_offset);
 
             // Input box
             let input_box = InputBox {
@@ -7322,7 +7160,6 @@ Make it comprehensive but concise."#;
         })?;
 
         // Write back the captured data from the draw closure
-        self.rendered_lines = captured_lines;
         self.msg_inner_rect = captured_rect;
 
         Ok(())
@@ -7747,49 +7584,23 @@ Make it comprehensive but concise."#;
         f.render_widget(footer_para, footer_area);
     }
 
-    /// Render messages with optional selection highlight.
-    /// Returns (rendered_line_texts, inner_rect) for mouse selection support.
+    /// Render messages and return the inner rect used for message layout.
     fn render_messages(
         f: &mut Frame,
         area: Rect,
         messages: &[Message],
         scroll_offset: usize,
-        sel_anchor: Option<(u16, u16)>,
-        sel_end: Option<(u16, u16)>,
-    ) -> (Vec<String>, Rect) {
-        use ratatui::style::{Color, Modifier, Style};
-
+    ) -> Rect {
         // No border — clean layout like Codex
         let inner = area;
         if inner.width == 0 || inner.height == 0 {
-            return (Vec::new(), inner);
+            return inner;
         }
 
         let visible_height = inner.height as usize;
-        let build_lines = |width: usize| -> Vec<Line> {
-            let mut lines = Vec::new();
-            for msg in messages {
-                lines.extend(render_message_lines(msg, width));
-            }
-            lines
-        };
-
-        // First pass uses full width. If content is scrollable, reserve one
-        // dedicated column for the scrollbar and re-wrap for stable geometry.
-        let mut all_lines = build_lines(inner.width as usize);
-        let show_scrollbar = all_lines.len() > visible_height && inner.width > 1;
-        let content_rect = if show_scrollbar {
-            Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width.saturating_sub(1),
-                height: inner.height,
-            }
-        } else {
-            inner
-        };
-        if show_scrollbar {
-            all_lines = build_lines(content_rect.width as usize);
+        let mut all_lines = Vec::new();
+        for msg in messages {
+            all_lines.extend(render_message_lines(msg, inner.width as usize));
         }
 
         // Calculate scroll
@@ -7807,134 +7618,10 @@ Make it comprehensive but concise."#;
             .take(visible_height)
             .collect();
 
-        // Extract plain text for each visible line (for clipboard copy)
-        let line_texts: Vec<String> = visible
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect();
-
-        // Apply selection highlight if there's an active selection
-        let visible = if let (Some(anchor), Some(end)) = (sel_anchor, sel_end) {
-            let (sel_start, sel_finish) =
-                if anchor.0 < end.0 || (anchor.0 == end.0 && anchor.1 <= end.1) {
-                    (anchor, end)
-                } else {
-                    (end, anchor)
-                };
-
-            visible
-                .into_iter()
-                .enumerate()
-                .map(|(i, line)| {
-                    let row = i as u16;
-                    if row >= sel_start.0 && row <= sel_finish.0 {
-                        // This line is (at least partially) selected
-                        let col_start = if row == sel_start.0 {
-                            sel_start.1 as usize
-                        } else {
-                            0
-                        };
-                        let col_end = if row == sel_finish.0 {
-                            sel_finish.1 as usize + 1
-                        } else {
-                            usize::MAX
-                        };
-
-                        // Rebuild spans with selection highlight
-                        let mut new_spans = Vec::new();
-                        let mut col = 0usize;
-                        for span in &line.spans {
-                            let span_len = span.content.chars().count();
-                            let span_end = col + span_len;
-
-                            if span_end <= col_start || col >= col_end {
-                                // Entirely outside selection
-                                new_spans.push(span.clone());
-                            } else if col >= col_start && span_end <= col_end {
-                                // Entirely inside selection
-                                new_spans.push(Span::styled(
-                                    span.content.clone(),
-                                    span.style
-                                        .bg(Color::White)
-                                        .fg(Color::Black)
-                                        .remove_modifier(Modifier::all()),
-                                ));
-                            } else {
-                                // Partially selected — split the span
-                                let chars: Vec<char> = span.content.chars().collect();
-                                let local_start = col_start.saturating_sub(col);
-                                let local_end = col_end.saturating_sub(col).min(span_len);
-
-                                if local_start > 0 {
-                                    let before: String = chars[..local_start].iter().collect();
-                                    new_spans.push(Span::styled(before, span.style));
-                                }
-                                let selected: String =
-                                    chars[local_start..local_end].iter().collect();
-                                new_spans.push(Span::styled(
-                                    selected,
-                                    span.style
-                                        .bg(Color::White)
-                                        .fg(Color::Black)
-                                        .remove_modifier(Modifier::all()),
-                                ));
-                                if local_end < span_len {
-                                    let after: String = chars[local_end..].iter().collect();
-                                    new_spans.push(Span::styled(after, span.style));
-                                }
-                            }
-                            col = span_end;
-                        }
-                        Line::from(new_spans)
-                    } else {
-                        line
-                    }
-                })
-                .collect::<Vec<_>>()
-        } else {
-            visible
-        };
-
         let paragraph = Paragraph::new(visible);
-        f.render_widget(paragraph, content_rect);
+        f.render_widget(paragraph, inner);
 
-        if show_scrollbar {
-            let track_height = inner.height as usize;
-            let thumb_height = (visible_height * track_height / total_lines.max(1))
-                .max(1)
-                .min(track_height);
-            let max_thumb_offset = track_height.saturating_sub(thumb_height);
-            // `actual_scroll` is bottom-based (0 means newest view). Convert it to
-            // top-based offset for thumb positioning.
-            let scroll_from_top = max_scroll.saturating_sub(actual_scroll);
-            let thumb_offset = if max_scroll == 0 {
-                0
-            } else {
-                scroll_from_top.saturating_mul(max_thumb_offset) / max_scroll
-            };
-            let scrollbar_x = inner.x + inner.width - 1;
-            let buffer = f.buffer_mut();
-
-            for i in 0..track_height {
-                let y = inner.y + i as u16;
-                buffer[(scrollbar_x, y)]
-                    .set_symbol("│")
-                    .set_style(Style::default().fg(Color::DarkGray));
-            }
-            for i in thumb_offset..thumb_offset + thumb_height {
-                let y = inner.y + i as u16;
-                buffer[(scrollbar_x, y)]
-                    .set_symbol("█")
-                    .set_style(Style::default().fg(Color::Gray));
-            }
-        }
-
-        (line_texts, content_rect)
+        inner
     }
 }
 
@@ -7943,9 +7630,7 @@ impl Drop for App {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
-            crossterm::event::DisableMouseCapture,
-            crossterm::event::DisableBracketedPaste,
-            LeaveAlternateScreen
+            crossterm::event::DisableBracketedPaste
         );
         let _ = self.terminal.show_cursor();
     }
