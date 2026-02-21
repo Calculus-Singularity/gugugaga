@@ -13,3 +13,19 @@
 GuGuGaGa is a real-time supervision layer for Codex that continuously evaluates agent behavior during live coding sessions and steers execution toward production-grade outcomes. Instead of replacing Codex, it wraps around it to add a second engineering judgment loop: catching risk, quality drift, and weak decisions early, enforcing stronger execution discipline without slowing momentum, preserving critical context across long runs, and keeping model and reasoning behavior predictable so results stay consistent under pressure.
 
 The result is faster delivery with fewer avoidable regressions, cleaner implementation choices, and lower review overhead when projects get complex. GuGuGaGa is built for real codebases and production reliability, turning raw model speed into dependable engineering throughput by combining Codex's generation power with an always-on control system focused on correctness, stability, and sustained quality over time.
+
+## Install
+
+### Unix (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Calculus-Singularity/gugugaga/main/scripts/install.sh | bash
+```
+
+### Windows (PowerShell)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Calculus-Singularity/gugugaga/main/scripts/install.ps1 | iex"
+```
+
+Both installers fetch the latest GitHub release binary and install `gugugaga` to a user-local path.
